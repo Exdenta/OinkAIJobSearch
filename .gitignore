@@ -1,0 +1,17 @@
+.env
+state/
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+bot.log
+
+# Personal / local-only artifacts — never commit
+profile_*.pdf
+profile_*.txt
+resume_*.pdf
+resume_*.txt
+test_write_*
+launchd/
+*.local.yaml
+*.local.json
