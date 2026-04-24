@@ -1,4 +1,4 @@
-# Hryu - Job-Alert Bot in Telegram
+# Hryu - Job Alert Bot in Telegram
 
 ![Welcome screen — orange-hat pig greeting the user in Telegram](assets/screenshots/welcome.png)
 
