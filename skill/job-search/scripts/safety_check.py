@@ -46,6 +46,8 @@ import re
 from typing import Any
 
 from claude_cli import run_p, extract_assistant_text, parse_json_block
+from instrumentation.wrappers import wrapped_run_p
+import forensic
 
 log = logging.getLogger(__name__)
 
@@ -153,7 +155,7 @@ def _ai_verdict(text: str, timeout_s: int = 30) -> dict[str, Any] | None:
     here because the bot will still run the richer prefs parser, which wraps
     the text in clear delimiters)."""
     prompt = _AI_PROMPT.format(text=text[:1200])
-    stdout = run_p(prompt, timeout_s=timeout_s)
+    stdout = wrapped_run_p(None, "safety_check", prompt, timeout_s=timeout_s)
     if not stdout:
         return None
     body = extract_assistant_text(stdout)
@@ -172,21 +174,37 @@ def check_user_input(text: str, *, deep: bool = False, timeout_s: int = 30) -> d
     `deep=True` enables the AI backstop. Default is regex-only because it's
     free and catches the vast majority of adversarial inputs. Turn `deep` on
     in a setting where a false negative is very expensive.
+
+    Forensic-logged: every verdict is appended to `state/forensic_logs/`
+    so post-hoc analysis can answer "why did this input get blocked /
+    cleared" without re-running the classifier.
     """
-    t = (text or "").strip()
-    if not t:
-        return {"verdict": "block", "reason": "empty input", "method": "length"}
-    if len(t) > _MAX_LEN:
-        return {
-            "verdict": "block",
-            "reason": f"input too long ({len(t)} > {_MAX_LEN} chars)",
-            "method": "length",
-        }
-    rx = _regex_verdict(t)
-    if rx is not None:
-        return rx
-    if deep:
-        ai = _ai_verdict(t, timeout_s=timeout_s)
-        if ai is not None:
-            return ai
-    return {"verdict": "ok", "reason": "no injection fingerprint", "method": "clean"}
+    with forensic.step(
+        "safety_check.check_user_input",
+        input={"text_len": len(text or ""), "text_head": (text or "")[:300], "deep": deep},
+    ) as fctx:
+        t = (text or "").strip()
+        if not t:
+            verdict = {"verdict": "block", "reason": "empty input", "method": "length"}
+            fctx.set_output(verdict)
+            return verdict
+        if len(t) > _MAX_LEN:
+            verdict = {
+                "verdict": "block",
+                "reason": f"input too long ({len(t)} > {_MAX_LEN} chars)",
+                "method": "length",
+            }
+            fctx.set_output(verdict)
+            return verdict
+        rx = _regex_verdict(t)
+        if rx is not None:
+            fctx.set_output(rx)
+            return rx
+        if deep:
+            ai = _ai_verdict(t, timeout_s=timeout_s)
+            if ai is not None:
+                fctx.set_output(ai)
+                return ai
+        verdict = {"verdict": "ok", "reason": "no injection fingerprint", "method": "clean"}
+        fctx.set_output(verdict)
+        return verdict

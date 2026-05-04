@@ -14,11 +14,12 @@ volume personal bot, no need for async.
 """
 from __future__ import annotations
 
+import json as _json
 import sqlite3
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Iterable, Iterator
 
 
 SCHEMA = """
@@ -140,10 +141,45 @@ CREATE TABLE IF NOT EXISTS research_runs (
     finished_at    REAL    NOT NULL
 );
 
+-- Per-run enrichment cache. Lets the digest header's "Lower floor" button
+-- replay jobs that were dropped by the score gate during the live run, with
+-- their full enrichment payload (match_score + why_match + key_details)
+-- intact. One row per (chat, run, job). `sent_floor` is NULL until the row
+-- is delivered; on delivery it stores the floor that was active when the
+-- job went out, so re-clicks at the same floor are idempotent.
+CREATE TABLE IF NOT EXISTS digest_run_jobs (
+    chat_id         INTEGER NOT NULL,
+    run_id          INTEGER NOT NULL,
+    job_id          TEXT    NOT NULL,
+    match_score     INTEGER NOT NULL,
+    enrichment_json TEXT,
+    sent_floor      INTEGER,
+    recorded_at     REAL    NOT NULL,
+    PRIMARY KEY (chat_id, run_id, job_id)
+);
+-- Per-user source health. Counts consecutive runs where a source
+-- contributed >0 postings but ALL of them scored 0 in AI enrichment.
+-- Three strikes → `disabled_at` is stamped and the per-user filter in
+-- search_jobs.py drops that source's postings before enrichment on
+-- future runs (cheaper than re-scoring known dead weight). A non-zero
+-- score on any future hit clears the streak; the row stays so the
+-- operator can audit the history. Manually re-enable via
+-- `clear_source_strike(chat_id, source_key)`.
+CREATE TABLE IF NOT EXISTS user_source_strikes (
+    chat_id     INTEGER NOT NULL,
+    source_key  TEXT    NOT NULL,
+    miss_streak INTEGER NOT NULL DEFAULT 0,
+    disabled_at REAL,
+    last_run_id INTEGER,
+    updated_at  REAL    NOT NULL,
+    PRIMARY KEY (chat_id, source_key)
+);
 CREATE INDEX IF NOT EXISTS idx_app_status ON applications(chat_id, status);
 CREATE INDEX IF NOT EXISTS idx_sent_job ON sent_messages(chat_id, job_id);
 CREATE INDEX IF NOT EXISTS idx_profile_builds_chat ON profile_builds(chat_id, built_at DESC);
 CREATE INDEX IF NOT EXISTS idx_research_runs_chat ON research_runs(chat_id, finished_at DESC);
+CREATE INDEX IF NOT EXISTS idx_digest_run_chat ON digest_run_jobs(chat_id, run_id DESC);
+CREATE INDEX IF NOT EXISTS idx_digest_run_age ON digest_run_jobs(recorded_at);
 """
 
 
@@ -157,6 +193,11 @@ class DB:
         with self._conn() as c:
             c.executescript(SCHEMA)
             self._migrate(c)
+            # Monitoring/telemetry tables (pipeline_runs, source_runs,
+            # claude_calls, error_events, ops_toggles). Idempotent — every
+            # statement uses IF NOT EXISTS. See docs/monitoring-plan.md.
+            from telemetry.schema import migrate as _telemetry_migrate
+            _telemetry_migrate(c)
 
     def _migrate(self, c: sqlite3.Connection) -> None:
         """Idempotent schema migrations.
@@ -234,8 +275,19 @@ class DB:
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.path, detect_types=sqlite3.PARSE_DECLTYPES, timeout=15)
+        # WAL + FK enforcement + 30s busy_timeout. Two processes (bot.py +
+        # search_jobs.py) share state/jobs.db; default rollback journal
+        # serializes all readers behind any writer and 15s busy_timeout
+        # produced occasional `database is locked`. WAL lets readers run
+        # alongside a single writer; FK ensures `delete_user` cascades
+        # match their declarations; busy_timeout retries silently for 30s
+        # before raising. PRAGMAs are idempotent — safe per-connection.
+        conn = sqlite3.connect(self.path, detect_types=sqlite3.PARSE_DECLTYPES, timeout=30)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=30000")
         try:
             yield conn
             conn.commit()
@@ -708,17 +760,48 @@ class DB:
             return float(val) if val is not None else None
 
     # ---------- awaiting-state (bot conversational state) ----------
+    #
+    # Some flows need to remember a small JSON-shaped context alongside the
+    # state name (e.g. the skip-reason capture needs the job_id/title/company
+    # the user was reacting to). Rather than adding a parallel column, we
+    # encode `<state>|<json>` into the same TEXT slot. A bare state string
+    # (legacy callers) still parses cleanly because the separator can't appear
+    # inside a state name. `get_awaiting_state` returns just the state name
+    # for backward compatibility; callers needing the payload use
+    # `get_awaiting_state_payload`.
+    _AWAITING_PAYLOAD_SEP = "|"
 
-    def set_awaiting_state(self, chat_id: int, state: str | None) -> None:
+    def set_awaiting_state(
+        self,
+        chat_id: int,
+        state: str | None,
+        payload_json: dict | str | None = None,
+    ) -> None:
         """e.g. 'awaiting_prefs' while the bot expects the next text message to
-        be the user's free-form preferences. Pass None to clear."""
+        be the user's free-form preferences. Pass None to clear.
+
+        When `payload_json` is set (dict or pre-serialized JSON string), it is
+        encoded into the same TEXT column as `state|<json>`. Reads via
+        `get_awaiting_state` strip the payload; reads via
+        `get_awaiting_state_payload` return it parsed.
+        """
+        if state is None:
+            stored: str | None = None
+        elif payload_json is None:
+            stored = state
+        else:
+            if isinstance(payload_json, (dict, list)):
+                blob = _json.dumps(payload_json, ensure_ascii=False)
+            else:
+                blob = str(payload_json)
+            stored = f"{state}{self._AWAITING_PAYLOAD_SEP}{blob}"
         with self._conn() as c:
             c.execute(
                 "UPDATE users SET awaiting_state = ? WHERE chat_id = ?",
-                (state, chat_id),
+                (stored, chat_id),
             )
 
-    def get_awaiting_state(self, chat_id: int) -> str | None:
+    def _read_awaiting_raw(self, chat_id: int) -> str | None:
         with self._conn() as c:
             row = c.execute(
                 "SELECT awaiting_state FROM users WHERE chat_id = ?", (chat_id,),
@@ -726,6 +809,33 @@ class DB:
             if row is None:
                 return None
             return row["awaiting_state"]
+
+    def get_awaiting_state(self, chat_id: int) -> str | None:
+        raw = self._read_awaiting_raw(chat_id)
+        if raw is None:
+            return None
+        sep = self._AWAITING_PAYLOAD_SEP
+        if sep in raw:
+            return raw.split(sep, 1)[0]
+        return raw
+
+    def get_awaiting_state_payload(self, chat_id: int) -> dict | None:
+        """Return the parsed JSON payload bundled with awaiting_state (if any).
+        Returns None when there's no payload or it's malformed."""
+        raw = self._read_awaiting_raw(chat_id)
+        if not raw:
+            return None
+        sep = self._AWAITING_PAYLOAD_SEP
+        if sep not in raw:
+            return None
+        _, _, blob = raw.partition(sep)
+        if not blob:
+            return None
+        try:
+            parsed = _json.loads(blob)
+        except (TypeError, ValueError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
 
     # ---------- jobs ----------
 
@@ -838,6 +948,251 @@ class DB:
                 (chat_id, job_id),
             ).fetchone()
             return row is not None
+
+    # ---------- user_source_strikes (auto-disable dead-weight sources per user) ----------
+
+    def get_disabled_sources(self, chat_id: int) -> set[str]:
+        """Return source_keys auto-disabled for this user (3+ zero-score runs)."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT source_key FROM user_source_strikes "
+                "WHERE chat_id = ? AND disabled_at IS NOT NULL",
+                (chat_id,),
+            ).fetchall()
+            return {r["source_key"] for r in rows}
+
+    def record_source_outcome(
+        self,
+        chat_id: int,
+        run_id: int,
+        source_key: str,
+        max_score: int,
+        threshold: int = 3,
+    ) -> tuple[int, bool]:
+        """Update strike count for one (user, source) after a run.
+
+        Logic:
+          * `max_score > 0` → reset streak to 0, clear `disabled_at`.
+          * `max_score == 0` → increment streak. If streak reaches
+            ``threshold`` and the source isn't already disabled, stamp
+            ``disabled_at = now``.
+
+        Returns ``(new_streak, just_disabled)``. ``just_disabled`` is True
+        only on the run that flipped the source from enabled → disabled,
+        so the caller can log it once.
+        """
+        now = time.time()
+        threshold = max(1, int(threshold))
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT miss_streak, disabled_at FROM user_source_strikes "
+                "WHERE chat_id = ? AND source_key = ?",
+                (chat_id, source_key),
+            ).fetchone()
+            prev_streak = int(row["miss_streak"]) if row else 0
+            prev_disabled = (row["disabled_at"] is not None) if row else False
+
+            if int(max_score) > 0:
+                new_streak = 0
+                new_disabled = None
+                just_disabled = False
+            else:
+                new_streak = prev_streak + 1
+                if new_streak >= threshold:
+                    new_disabled = (row["disabled_at"] if (row and row["disabled_at"]) else now)
+                    just_disabled = (not prev_disabled)
+                else:
+                    new_disabled = None
+                    just_disabled = False
+
+            c.execute(
+                """
+                INSERT INTO user_source_strikes
+                    (chat_id, source_key, miss_streak, disabled_at, last_run_id, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id, source_key) DO UPDATE SET
+                    miss_streak = excluded.miss_streak,
+                    disabled_at = excluded.disabled_at,
+                    last_run_id = excluded.last_run_id,
+                    updated_at  = excluded.updated_at
+                """,
+                (chat_id, source_key, new_streak, new_disabled, int(run_id), now),
+            )
+            return new_streak, just_disabled
+
+    def clear_source_strike(self, chat_id: int, source_key: str) -> None:
+        """Manual re-enable: zero the streak and clear `disabled_at`. Used by
+        operator commands or future per-user UI."""
+        with self._conn() as c:
+            c.execute(
+                """
+                UPDATE user_source_strikes
+                   SET miss_streak = 0,
+                       disabled_at = NULL,
+                       updated_at  = ?
+                 WHERE chat_id = ? AND source_key = ?
+                """,
+                (time.time(), chat_id, source_key),
+            )
+
+    def list_source_strikes(self, chat_id: int) -> list[dict]:
+        """Snapshot of all per-user source health rows for inspection."""
+        with self._conn() as c:
+            rows = c.execute(
+                """
+                SELECT source_key, miss_streak, disabled_at, last_run_id, updated_at
+                  FROM user_source_strikes
+                 WHERE chat_id = ?
+                 ORDER BY (disabled_at IS NULL), source_key
+                """,
+                (chat_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    # ---------- digest_run_jobs (per-run score cache for ⬇/⬆ filter buttons) ----------
+
+    def record_digest_run_jobs(
+        self,
+        chat_id: int,
+        run_id: int,
+        scored_enrichments: dict[str, dict],
+    ) -> int:
+        """Persist every enriched job from a digest run, keyed by (chat, run, job).
+
+        `scored_enrichments` maps job_id → enrichment dict (must carry
+        ``match_score``; may carry ``why_match`` / ``key_details``). The whole
+        dict is stored as JSON so the "Lower floor" callback can resurrect the
+        full per-job card later. Existing rows are overwritten so re-running
+        a digest for the same chat/run produces a clean snapshot.
+
+        Returns rows written.
+        """
+        if not scored_enrichments:
+            return 0
+        now = time.time()
+        rows = []
+        for jid, enr in scored_enrichments.items():
+            try:
+                score = int((enr or {}).get("match_score") or 0)
+            except (TypeError, ValueError):
+                score = 0
+            payload = _json.dumps(enr or {}, ensure_ascii=False) if enr else None
+            rows.append((chat_id, int(run_id), str(jid), score, payload, now))
+        with self._conn() as c:
+            c.executemany(
+                """
+                INSERT INTO digest_run_jobs (chat_id, run_id, job_id, match_score, enrichment_json, sent_floor, recorded_at)
+                VALUES (?, ?, ?, ?, ?, NULL, ?)
+                ON CONFLICT(chat_id, run_id, job_id) DO UPDATE SET
+                    match_score     = excluded.match_score,
+                    enrichment_json = excluded.enrichment_json,
+                    recorded_at     = excluded.recorded_at
+                """,
+                rows,
+            )
+        return len(rows)
+
+    def mark_digest_jobs_sent(
+        self,
+        chat_id: int,
+        run_id: int,
+        job_ids: Iterable[str],
+        floor: int,
+    ) -> int:
+        """Stamp ``sent_floor=floor`` on the listed jobs so subsequent
+        "Lower floor" clicks won't re-send them. No-op for ids without a
+        cached row."""
+        ids = [str(j) for j in job_ids if j]
+        if not ids:
+            return 0
+        floor = max(0, min(5, int(floor)))
+        with self._conn() as c:
+            cur = c.executemany(
+                """
+                UPDATE digest_run_jobs
+                   SET sent_floor = ?
+                 WHERE chat_id = ? AND run_id = ? AND job_id = ?
+                """,
+                [(floor, chat_id, int(run_id), jid) for jid in ids],
+            )
+            return cur.rowcount or 0
+
+    def latest_digest_run_id(self, chat_id: int) -> int | None:
+        """Return the most recent run_id with cached digest rows for this user."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT MAX(run_id) AS rid FROM digest_run_jobs WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchone()
+            return int(row["rid"]) if row and row["rid"] is not None else None
+
+    def unsent_count_at_score(self, chat_id: int, run_id: int, score: int) -> int:
+        """Count cached jobs with ``match_score >= score`` not yet sent.
+
+        Powers the ⬇ button label "⬇ ≥N (+M)" — M must mirror what a click
+        will actually admit. The button semantics are "show me everything I
+        haven't seen at or above this score", so the count must be inclusive
+        upward (a single unsent job at the user's current floor would never
+        appear here — it'd already be in `sent_floor`-stamped state from the
+        live digest, or it's at a score the user already hid).
+        """
+        with self._conn() as c:
+            row = c.execute(
+                """
+                SELECT COUNT(*) AS n
+                  FROM digest_run_jobs
+                 WHERE chat_id = ? AND run_id = ?
+                   AND match_score >= ?
+                   AND sent_floor IS NULL
+                """,
+                (chat_id, int(run_id), int(score)),
+            ).fetchone()
+            return int(row["n"] or 0) if row else 0
+
+    def fetch_unsent_at_score(
+        self,
+        chat_id: int,
+        run_id: int,
+        score: int,
+    ) -> list[tuple[str, int, str | None]]:
+        """Return ``[(job_id, match_score, enrichment_json)]`` rows at or above
+        the given score that haven't been delivered yet. Ordered by job_id
+        for determinism.
+
+        Symmetric with :meth:`unsent_count_at_score`: the count promised on the
+        ⬇ button MUST equal the rows the click admits. Inclusive-upward — a
+        click on "⬇ ≥1" after "⬇ ≥2" replays any score-2 row that happened to
+        slip in between (e.g. enrichment landed late). Already-sent rows are
+        filtered by ``sent_floor IS NULL`` so this is idempotent.
+        """
+        with self._conn() as c:
+            rows = c.execute(
+                """
+                SELECT job_id, match_score, enrichment_json
+                  FROM digest_run_jobs
+                 WHERE chat_id = ? AND run_id = ?
+                   AND match_score >= ?
+                   AND sent_floor IS NULL
+                 ORDER BY job_id
+                """,
+                (chat_id, int(run_id), int(score)),
+            ).fetchall()
+            return [(r["job_id"], int(r["match_score"]), r["enrichment_json"]) for r in rows]
+
+    def purge_digest_run_jobs_older_than(self, max_age_seconds: float) -> int:
+        """Drop cached rows whose `recorded_at` is older than ``max_age_seconds``.
+
+        Returns rows deleted. Called from the daily TTL sweep so the cache
+        never grows unbounded — a 7-day window is generous: by then any
+        digest the user might want to retroactively expand is long gone.
+        """
+        cutoff = time.time() - float(max_age_seconds)
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM digest_run_jobs WHERE recorded_at < ?",
+                (cutoff,),
+            )
+            return cur.rowcount or 0
 
     # ---------- resume_suggestions ----------
 

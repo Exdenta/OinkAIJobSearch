@@ -41,6 +41,16 @@ from pathlib import Path
 from typing import Any, Callable
 
 from claude_cli import run_p, extract_assistant_text, parse_json_block
+from instrumentation.wrappers import wrapped_run_p
+import forensic
+
+
+def _instrumented_run_p(prompt, **kwargs):
+    """Default `_run_p` for `build_profile_sync` — records every call to the
+    `claude_calls` telemetry table under caller='profile_builder'. Tests can
+    still inject a stub via `_run_p=` to avoid burning real CLI calls.
+    """
+    return wrapped_run_p(None, "profile_builder", prompt, **kwargs)
 
 log = logging.getLogger(__name__)
 
@@ -363,7 +373,7 @@ def build_profile_sync(
     *,
     timeout_s: int = DEFAULT_TIMEOUT_S,
     model: str = DEFAULT_MODEL,
-    _run_p: Callable = run_p,    # injected in tests
+    _run_p: Callable = _instrumented_run_p,    # injected in tests
 ) -> BuildResult:
     """Run one Opus call end-to-end. Returns a BuildResult — never raises.
 
@@ -373,81 +383,111 @@ def build_profile_sync(
     prefs_sha1 = sha1_hex(free_text)
     start = time.monotonic()
 
-    prompt = _render_prompt(resume_text, free_text)
-    if not prompt:
-        return BuildResult(
-            status="exception",
-            error="prompt template missing/empty",
+    with forensic.step(
+        "profile_builder.build_profile_sync",
+        input={
+            "resume_chars": len(resume_text or ""),
+            "free_text_chars": len(free_text or ""),
+            "free_text_head": (free_text or "")[:300],
+            "resume_sha1": resume_sha1,
+            "prefs_sha1": prefs_sha1,
+            "model": model,
+            "timeout_s": timeout_s,
+        },
+    ) as fctx:
+        prompt = _render_prompt(resume_text, free_text)
+        if not prompt:
+            fctx.set_output({"status": "exception", "reason": "prompt template missing/empty"})
+            return BuildResult(
+                status="exception",
+                error="prompt template missing/empty",
+                resume_sha1=resume_sha1,
+                prefs_sha1=prefs_sha1,
+                model=model,
+            )
+
+        try:
+            stdout = _run_p(prompt, timeout_s=timeout_s, model=model)
+        except Exception as e:
+            fctx.set_output({"status": "exception", "reason": f"run_p raised: {e!r}"})
+            return BuildResult(
+                status="exception",
+                error=f"run_p raised: {e!r}",
+                elapsed_ms=int((time.monotonic() - start) * 1000),
+                resume_sha1=resume_sha1,
+                prefs_sha1=prefs_sha1,
+                model=model,
+            )
+
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+
+        if stdout is None:
+            fctx.set_output({"status": "cli_missing_or_timeout", "elapsed_ms": elapsed_ms})
+            return BuildResult(
+                status="cli_missing_or_timeout",
+                error="run_p returned None",
+                elapsed_ms=elapsed_ms,
+                resume_sha1=resume_sha1,
+                prefs_sha1=prefs_sha1,
+                model=model,
+            )
+
+        body = extract_assistant_text(stdout)
+        parsed = parse_json_block(body)
+        if parsed is None:
+            fctx.set_output({
+                "status": "parse_error",
+                "elapsed_ms": elapsed_ms,
+                "body_head": (body or "")[:300],
+            })
+            return BuildResult(
+                status="parse_error",
+                error=f"unparseable response (head={body[:200]!r})",
+                elapsed_ms=elapsed_ms,
+                resume_sha1=resume_sha1,
+                prefs_sha1=prefs_sha1,
+                model=model,
+            )
+
+        errs = profile_schema_validate(parsed)
+        if errs:
+            fctx.set_output({
+                "status": "validation_error",
+                "elapsed_ms": elapsed_ms,
+                "errors": errs[:8],
+            })
+            return BuildResult(
+                status="validation_error",
+                error="; ".join(errs)[:500],
+                elapsed_ms=elapsed_ms,
+                resume_sha1=resume_sha1,
+                prefs_sha1=prefs_sha1,
+                model=model,
+            )
+
+        stamped = _stamp_metadata(
+            _clip_profile(parsed),
             resume_sha1=resume_sha1,
             prefs_sha1=prefs_sha1,
             model=model,
+            elapsed_ms=elapsed_ms,
         )
-
-    try:
-        stdout = _run_p(prompt, timeout_s=timeout_s, model=model)
-    except Exception as e:
+        fctx.set_output({
+            "status": "ok",
+            "elapsed_ms": elapsed_ms,
+            "primary_role": stamped.get("primary_role"),
+            "stack_primary": stamped.get("stack_primary"),
+            "min_match_score": stamped.get("min_match_score"),
+            "search_seed_keys": list((stamped.get("search_seeds") or {}).keys()),
+        })
         return BuildResult(
-            status="exception",
-            error=f"run_p raised: {e!r}",
-            elapsed_ms=int((time.monotonic() - start) * 1000),
-            resume_sha1=resume_sha1,
-            prefs_sha1=prefs_sha1,
-            model=model,
-        )
-
-    elapsed_ms = int((time.monotonic() - start) * 1000)
-
-    if stdout is None:
-        # run_p returns None on: missing CLI, timeout, non-zero exit. We can't
-        # distinguish from here, so we class them together — the precise
-        # failure mode is already logged inside claude_cli.
-        return BuildResult(
-            status="cli_missing_or_timeout",
-            error="run_p returned None",
+            status="ok",
+            profile=stamped,
             elapsed_ms=elapsed_ms,
             resume_sha1=resume_sha1,
             prefs_sha1=prefs_sha1,
             model=model,
         )
-
-    body = extract_assistant_text(stdout)
-    parsed = parse_json_block(body)
-    if parsed is None:
-        return BuildResult(
-            status="parse_error",
-            error=f"unparseable response (head={body[:200]!r})",
-            elapsed_ms=elapsed_ms,
-            resume_sha1=resume_sha1,
-            prefs_sha1=prefs_sha1,
-            model=model,
-        )
-
-    errs = profile_schema_validate(parsed)
-    if errs:
-        return BuildResult(
-            status="validation_error",
-            error="; ".join(errs)[:500],
-            elapsed_ms=elapsed_ms,
-            resume_sha1=resume_sha1,
-            prefs_sha1=prefs_sha1,
-            model=model,
-        )
-
-    stamped = _stamp_metadata(
-        _clip_profile(parsed),
-        resume_sha1=resume_sha1,
-        prefs_sha1=prefs_sha1,
-        model=model,
-        elapsed_ms=elapsed_ms,
-    )
-    return BuildResult(
-        status="ok",
-        profile=stamped,
-        elapsed_ms=elapsed_ms,
-        resume_sha1=resume_sha1,
-        prefs_sha1=prefs_sha1,
-        model=model,
-    )
 
 
 # ---------------------------------------------------------------------------

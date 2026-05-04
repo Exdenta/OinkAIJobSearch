@@ -48,6 +48,19 @@ from claude_cli import (
     extract_assistant_text,
     parse_json_block,
 )
+from instrumentation.wrappers import wrapped_run_p_with_tools
+
+
+def _instrumented_run_p_with_tools(prompt, **kwargs):
+    """Default `_run_p_with_tools` for market_research worker + manager calls.
+
+    Records every Claude CLI invocation to the `claude_calls` telemetry table
+    under caller='market_research'. Worker vs manager distinction is lost at
+    this granularity (both share one wrapper) — acceptable trade-off so the
+    existing test-injection seam (`_run_p_with_tools=` kwarg) keeps working.
+    """
+    return wrapped_run_p_with_tools(None, "market_research", prompt, **kwargs)
+
 
 log = logging.getLogger(__name__)
 
@@ -622,7 +635,7 @@ def run_worker(
     ctx: dict[str, str],
     *,
     model: str = DEFAULT_MODEL,
-    _run_p_with_tools: Callable = run_p_with_tools,
+    _run_p_with_tools: Callable = _instrumented_run_p_with_tools,
 ) -> tuple[str, dict | None, str | None]:
     """Run ONE worker end-to-end. Returns (topic, parsed_or_None, error_or_None).
 
@@ -998,7 +1011,7 @@ def synthesize_with_manager(
     *,
     model: str = DEFAULT_MODEL,
     timeout_s: int = DEFAULT_MANAGER_TIMEOUT,
-    _run_p_with_tools: Callable = run_p_with_tools,
+    _run_p_with_tools: Callable = _instrumented_run_p_with_tools,
 ) -> tuple[dict | None, str | None]:
     """Run the manager/synthesizer Opus call. Returns (report, error)."""
     tmpl = _read_prompt("market_research_manager.txt")
@@ -1065,7 +1078,7 @@ def market_research_sync(
     overall_timeout_s: int = DEFAULT_OVERALL_TIMEOUT,
     manager_timeout_s: int = DEFAULT_MANAGER_TIMEOUT,
     progress: Callable[[int, int], None] | None = None,
-    _run_p_with_tools: Callable = run_p_with_tools,
+    _run_p_with_tools: Callable = _instrumented_run_p_with_tools,
 ) -> ResearchRun:
     """Full run: fan out to 10 workers, then synthesize. Never raises."""
     today_iso = time.strftime("%Y-%m-%d", time.gmtime())

@@ -13,6 +13,7 @@ import requests
 
 from dedupe import Job
 from text_utils import clean_snippet, fix_mojibake
+import forensic
 
 log = logging.getLogger(__name__)
 
@@ -29,32 +30,18 @@ WWR_FEEDS = [
 ]
 
 
-def _passes(text: str, filters: dict) -> bool:
-    t = (text or "").lower()
-    req = [k.lower() for k in (filters.get("required_keywords") or []) if k]
-    if any(k not in t for k in req):
-        return False
-    excl = [k.lower() for k in (filters.get("exclude_keywords") or []) if k]
-    if any(k in t for k in excl):
-        return False
-    kws = [k.lower() for k in (filters.get("keywords") or []) if k]
-    if kws and not any(k in t for k in kws):
-        return False
-    return True
-
-
 def _fetch_remoteok(filters: dict) -> list[Job]:
     out: list[Job] = []
+    status_code = None
+    err_payload = None
     try:
         r = requests.get(REMOTEOK_URL, headers=UA, timeout=20)
+        status_code = r.status_code
         r.raise_for_status()
         data = r.json()
         # First element is the metadata ("legal" disclaimer) -- skip it.
+        # No pre-filter — AI scoring downstream is the sole matching gate.
         for item in data[1:]:
-            text = " ".join([item.get("position", ""), item.get("company", ""),
-                             item.get("description", ""), " ".join(item.get("tags", []))])
-            if not _passes(text, filters):
-                continue
             out.append(Job(
                 source="remoteok",
                 external_id=str(item.get("id") or item.get("slug") or item.get("url", "")),
@@ -68,19 +55,29 @@ def _fetch_remoteok(filters: dict) -> list[Job]:
             ))
     except requests.RequestException as e:
         log.error("remoteok fetch failed: %s", e)
+        err_payload = {"class": type(e).__name__, "message": str(e)[:300]}
+    forensic.log_step(
+        "remote_boards._fetch_remoteok",
+        input={"endpoint": REMOTEOK_URL},
+        output={
+            "status_code": status_code,
+            "count": len(out),
+            "sample_titles": [j.title[:80] for j in out[:3]],
+        },
+        error=err_payload,
+    )
     return out
 
 
 def _fetch_remotive(filters: dict) -> list[Job]:
     out: list[Job] = []
+    status_code = None
+    err_payload = None
     try:
         r = requests.get(REMOTIVE_URL, headers=UA, timeout=20)
+        status_code = r.status_code
         r.raise_for_status()
         for item in r.json().get("jobs", []):
-            text = " ".join([item.get("title", ""), item.get("company_name", ""),
-                             item.get("description", ""), " ".join(item.get("tags", []))])
-            if not _passes(text, filters):
-                continue
             out.append(Job(
                 source="remotive",
                 external_id=str(item.get("id")),
@@ -94,18 +91,56 @@ def _fetch_remotive(filters: dict) -> list[Job]:
             ))
     except requests.RequestException as e:
         log.error("remotive fetch failed: %s", e)
+        err_payload = {"class": type(e).__name__, "message": str(e)[:300]}
+    forensic.log_step(
+        "remote_boards._fetch_remotive",
+        input={"endpoint": REMOTIVE_URL},
+        output={
+            "status_code": status_code,
+            "count": len(out),
+            "sample_titles": [j.title[:80] for j in out[:3]],
+        },
+        error=err_payload,
+    )
     return out
 
 
 def _fetch_wwr(filters: dict) -> list[Job]:
+    """Fetch WWR RSS feeds.
+
+    NOTE: feedparser.parse(url) uses Python's stdlib urllib for HTTP, which on
+    some installs (notably python.org macOS builds without
+    `Install Certificates.command` having been run) lacks a CA bundle and
+    fails SSL verification against Cloudflare-fronted hosts like WWR. The
+    symptom is `bozo=True` with a `URLError(SSLCertVerificationError ...)`
+    and zero entries. Workaround: fetch the bytes with `requests` (which
+    uses certifi) and hand them to feedparser. This also matches the pattern
+    used by `_fetch_remoteok` / `_fetch_remotive`.
+    """
     out: list[Job] = []
+    per_feed_counts: list[dict] = []
     for feed_url in WWR_FEEDS:
+        feed_count = 0
+        feed_err = None
+        status_code = None
+        bozo_flag = None
+        bozo_msg = None
+        parsed = None
         try:
-            parsed = feedparser.parse(feed_url, request_headers=UA)
+            r = requests.get(feed_url, headers=UA, timeout=20)
+            status_code = r.status_code
+            r.raise_for_status()
+            parsed = feedparser.parse(r.content)
+            bozo_flag = bool(getattr(parsed, "bozo", 0))
+            if bozo_flag:
+                bozo_msg = repr(getattr(parsed, "bozo_exception", None))[:200]
+                # feedparser is permissive — bozo doesn't always mean unusable.
+                # Log it but continue iterating entries if any landed.
+                log.warning(
+                    "wwr feed %s bozo=True (status=%s): %s",
+                    feed_url, status_code, bozo_msg,
+                )
             for entry in parsed.entries:
-                text = " ".join([entry.get("title", ""), entry.get("summary", "")])
-                if not _passes(text, filters):
-                    continue
                 title = entry.get("title", "")
                 # WWR titles are "Company: Role Title"
                 company, _, role = title.partition(":")
@@ -119,8 +154,29 @@ def _fetch_wwr(filters: dict) -> list[Job]:
                     posted_at=entry.get("published", ""),
                     snippet=clean_snippet(entry.get("summary") or "", max_chars=400),
                 ))
+                feed_count += 1
+        except requests.RequestException as e:
+            log.error("wwr feed %s fetch failed: %s", feed_url, e)
+            feed_err = {"class": type(e).__name__, "message": str(e)[:200]}
         except Exception as e:
-            log.error("wwr feed %s failed: %s", feed_url, e)
+            log.error("wwr feed %s parse failed: %s", feed_url, e)
+            feed_err = {"class": type(e).__name__, "message": str(e)[:200]}
+        per_feed_counts.append({
+            "feed_url": feed_url,
+            "status_code": status_code,
+            "count": feed_count,
+            "bozo": bozo_flag,
+            "bozo_exception": bozo_msg,
+            "error": feed_err,
+        })
+    forensic.log_step(
+        "remote_boards._fetch_wwr",
+        input={"feed_count": len(WWR_FEEDS)},
+        output={
+            "total": len(out),
+            "per_feed": per_feed_counts,
+        },
+    )
     return out
 
 

@@ -13,8 +13,9 @@ matching. The profile is built by an Opus sub-agent from two inputs:
 2. **Free-text `/prefs`** — whatever the user typed into `/prefs` describing
    what they want (role, location, stack, anything).
 
-The profile is the authoritative "what this user wants" record. It replaces
-the old global `config/filters.yaml` per-user overlay.
+The profile is the authoritative "what this user wants" record. The legacy
+global `config/filters.yaml` has been removed entirely — operational defaults
+live in `defaults.DEFAULTS`, and matching is per-user-only.
 
 ## End-to-end flow
 
@@ -146,17 +147,19 @@ picks up the latest inputs.
   User keeps whatever profile they previously had; no data loss.
 - **Schema-invalid profile** → `BuildResult(status="validation_error")`. Same as above.
 - **Unparseable JSON** → `BuildResult(status="parse_error")`. Same as above.
-- **User has no profile yet** → per-user loop inherits `config/filters.yaml`
-  globals; LinkedIn falls back to the single-query global `fetch(filters)` path;
-  web_search uses the base candidate-profile rows from filters.yaml.
+- **User has no profile yet** → per-user loop inherits `defaults.DEFAULTS`
+  (operational config: source toggles, max_per_source, timeouts). LinkedIn
+  returns [] (no global default query exists — needs `search_seeds.linkedin`).
+  web_search runs only when the user has typed `/prefs`.
 
 ## Operator knobs
 
-- `config/filters.yaml` — globals (default LinkedIn query, source toggles,
-  `max_per_source`, timeouts). Profiles override per-user.
-- `ai_build_profile_timeout_s` (filters.yaml) — per-build timeout for the
-  Opus call.
-- `ai_web_search_timeout_s` / `ai_scrape_timeout_s` — timeouts for the
-  web-discovery and curated-boards sub-agents.
+- `defaults.DEFAULTS` (in `skill/job-search/scripts/defaults.py`) — source
+  toggles, `max_per_source`, timeouts, score floor, message format. There is
+  no YAML file; edit this dict to change operational behavior.
+- `ai_build_profile_timeout_s` (env var, read by `profile_builder.py`) —
+  per-build timeout for the Opus call.
+- `ai_web_search_timeout_s` / `ai_scrape_timeout_s` (in `defaults.DEFAULTS`)
+  — timeouts for the web-discovery and curated-boards sub-agents.
 
 No feature flags. No phased rollout. No migration dual-path.

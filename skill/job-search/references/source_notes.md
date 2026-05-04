@@ -32,20 +32,22 @@ Reference material for understanding / debugging each source adapter.
 
 ## Indeed
 
-**Enable at your own risk.** Indeed's Terms of Service restrict automated access.
-This adapter is OFF by default in `config/filters.yaml`.
-
-- **Preferred path**: RSS at `https://<tld>.indeed.com/rss?q=…&l=…&fromage=1`. RSS support has been quietly deprecated in some regions — if the feed returns empty or an error page, your country may not have it anymore.
-- **HTML fallback**: `/jobs?q=…&l=…` — expect to hit challenges (Cloudflare, captcha) within a few dozen requests from the same IP. Not worth building without proxy rotation.
-- **Fields**: `title` looks like "Role - Company - City, ST" — the adapter splits on " - ".
-- **Gotchas**:
-  - Always space queries at least 1 second apart.
-  - If you see 403/503, back off for a day.
+Removed. The legacy adapter relied on a hardcoded global query (`q="frontend
+developer", l="Bilbao, Spain"`) baked into `config/filters.yaml`. With matching
+now per-user-only, there's no equivalent default — Indeed RSS support has also
+been quietly deprecated in many regions. To revive: ship a per-user adapter
+that reads `profile.search_seeds.indeed` (currently unset by the profile
+builder) and add an entry under `defaults.DEFAULTS["sources"]`.
 
 ## LinkedIn
 
 **Enable at your own risk.** LinkedIn's TOS explicitly prohibits scraping, and
-they litigate. This adapter is OFF by default.
+they litigate.
+
+LinkedIn now runs **per-user only** — `linkedin.fetch_for_user(filters, seeds)`
+consumes `profile.search_seeds.linkedin.queries` (up to 3) and returns
+deduplicated results. There is no global LinkedIn query; users without an
+Opus-built profile get no LinkedIn results.
 
 - **Endpoint**: `https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search` — the HTML fragment LinkedIn's own page uses for infinite-scroll. No auth required.
 - **Useful params**:
@@ -55,7 +57,7 @@ they litigate. This adapter is OFF by default.
   - `f_WT=2` — remote only
   - `f_E=2,3,4` — experience level (2=entry, 3=associate, 4=mid-senior, 5=director, 6=executive)
   - `start=0` — pagination offset (cards per page ≈ 25)
-- **Rate limits**: Very aggressive. 429s appear after ~10 rapid requests. Adapter sleeps 1.5s between calls and skips the source for the day on 429.
+- **Rate limits**: Very aggressive. 429s appear after ~10 rapid requests. Adapter sleeps 1.5s between calls and skips the rest of the user's batch on 429.
 - **HTML fragility**: The CSS selectors `li`, `.base-card`, `h3`, `h4`, `.job-search-card__location` are the current (2025) structure. If LinkedIn changes their markup, parsing breaks — fix selectors in `sources/linkedin.py`.
 
 ## Curated boards (AI-delegated): remocate.app / wantapply.com / remoterocketship.com
@@ -74,9 +76,9 @@ dedupe, per-user seen-list) apply as usual.
 
 **Cost:** ~1 Claude prompt per enabled board per run — three at most per day.
 
-**Toggles:** `remocate`, `wantapply`, `remoterocketship` under `sources:` in
-`filters.yaml`. All three are OFF by default. `ai_scrape_timeout_s` (default
-180) caps each sub-process.
+**Toggles:** `remocate`, `wantapply`, `remoterocketship` under
+`defaults.DEFAULTS["sources"]`. All three are OFF by default.
+`ai_scrape_timeout_s` (default 180) caps each sub-process.
 
 **Failure modes (all silent — logged at WARN/ERROR, pipeline continues):**
 - `claude` CLI missing → board skipped.
@@ -110,15 +112,16 @@ anywhere else a web search can reach.
 **Cost:** one `claude -p` invocation per run, which internally issues
 several WebSearch and WebFetch calls. Plan for ~60-120 seconds of wall clock.
 
-**Toggle:** `sources.web_search` in `filters.yaml`. OFF by default — it's
-the most expensive source.
+**Toggle:** `sources.web_search` in `defaults.DEFAULTS`. ON by default —
+gated per-user by whether the profile has `search_seeds.web_search` populated
+or the user typed `/prefs`.
 
 **Timeout:** `ai_web_search_timeout_s` (default 300). Falls back to
 `ai_scrape_timeout_s` when unset.
 
 **Domain exclusion:** The prompt tells the agent to skip the domains
 already covered by dedicated adapters (RemoteOK, Remotive, WeWorkRemotely,
-LinkedIn, Indeed, HackerNews, remocate, wantapply, remoterocketship) so
+LinkedIn, HackerNews, remocate, wantapply, remoterocketship) so
 we don't pay tokens to re-find what other adapters surface for free.
 
 **Failure modes (silent, logged, pipeline continues):**
@@ -131,7 +134,7 @@ we don't pay tokens to re-find what other adapters surface for free.
 1. Drop `my_source.py` in `skill/job-search/scripts/sources/`.
 2. Export `def fetch(filters: dict) -> list[Job]`.
 3. Import it in `search_jobs.py` and add to the `SOURCES` dict.
-4. Add a toggle in `config/filters.yaml` under `sources:`.
+4. Add a toggle under `sources:` in `defaults.DEFAULTS`.
 5. Document quirks here.
 
 ## Debugging a bad run

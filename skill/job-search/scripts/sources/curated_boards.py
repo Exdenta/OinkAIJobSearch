@@ -19,10 +19,10 @@ Requirements (on the machine that runs the cron):
 Fallback behavior:
   - If the CLI is missing → log a warning and return [].
   - If the CLI times out or returns non-JSON → log and return [].
-  - If a board is toggled off in filters.yaml → skip.
+  - If a board is toggled off in defaults.DEFAULTS["sources"] → skip.
 
-All three boards are DISABLED BY DEFAULT in filters.yaml. Enable after a
-`python search_jobs.py --dry-run` sanity check.
+All three boards are DISABLED BY DEFAULT in defaults.DEFAULTS. Enable after
+a `python search_jobs.py --dry-run` sanity check.
 """
 from __future__ import annotations
 
@@ -30,6 +30,8 @@ import logging
 from typing import Any
 
 from claude_cli import run_p, extract_assistant_text, parse_json_block
+from instrumentation.wrappers import wrapped_run_p
+import forensic
 from dedupe import Job
 from text_utils import fix_mojibake
 
@@ -84,34 +86,48 @@ def _scrape_one(board_key: str, url: str, filters: dict) -> list[Job]:
     timeout_s = int(filters.get("ai_scrape_timeout_s") or 180)
     cap = int(filters.get("max_per_source") or 10)
 
-    prompt = _PROMPT.format(url=url)
-    stdout = run_p(prompt, timeout_s=timeout_s)
-    if not stdout:
-        return []
-    body = extract_assistant_text(stdout)
-    raw = _parse_jobs_json(body)
-    log.info("%s (AI): %d raw postings", board_key, len(raw))
+    with forensic.step(
+        f"curated_boards.{board_key}",
+        input={"board_key": board_key, "url": url, "timeout_s": timeout_s, "cap": cap},
+    ) as fctx:
+        prompt = _PROMPT.format(url=url)
+        # Tag the underlying CLI call with the specific board so claude_calls
+        # rolls up per-board cost/elapsed.
+        stdout = wrapped_run_p(None, f"curated_boards:{board_key}", prompt, timeout_s=timeout_s)
+        if not stdout:
+            fctx.set_output({"raw_count": 0, "reason": "cli_missing_or_empty"})
+            return []
+        body = extract_assistant_text(stdout)
+        raw = _parse_jobs_json(body)
+        log.info("%s (AI): %d raw postings", board_key, len(raw))
 
-    out: list[Job] = []
-    for r in raw[:cap]:
-        job_url = (r.get("url") or "").strip() or url
-        out.append(Job(
-            source=board_key,
-            external_id=job_url,
-            title=fix_mojibake(str(r.get("title") or ""))[:140],
-            company=fix_mojibake(str(r.get("company") or ""))[:80],
-            location=fix_mojibake(str(r.get("location") or "Remote"))[:80],
-            url=job_url,
-            posted_at=str(r.get("posted_at") or ""),
-            snippet=fix_mojibake(str(r.get("snippet") or ""))[:400],
-        ))
-    return out
+        out: list[Job] = []
+        for r in raw[:cap]:
+            job_url = (r.get("url") or "").strip() or url
+            out.append(Job(
+                source=board_key,
+                external_id=job_url,
+                title=fix_mojibake(str(r.get("title") or ""))[:140],
+                company=fix_mojibake(str(r.get("company") or ""))[:80],
+                location=fix_mojibake(str(r.get("location") or "Remote"))[:80],
+                url=job_url,
+                posted_at=str(r.get("posted_at") or ""),
+                snippet=fix_mojibake(str(r.get("snippet") or ""))[:400],
+            ))
+        fctx.set_output({
+            "raw_count": len(raw),
+            "kept": len(out),
+            "sample_titles": [j.title[:80] for j in out[:5]],
+            "body_head": (body or "")[:300] if not raw else None,
+        })
+        return out
 
 
 def fetch(filters: dict) -> list[Job]:
     """Aggregate AI-scraped postings from the enabled curated boards."""
     srcs = filters.get("sources") or {}
     all_jobs: list[Job] = []
+    enabled_keys = [k for k in BOARDS if srcs.get(k, False)]
     for key, url in BOARDS.items():
         if not srcs.get(key, False):
             continue
@@ -119,4 +135,9 @@ def fetch(filters: dict) -> list[Job]:
             all_jobs.extend(_scrape_one(key, url, filters))
         except Exception as e:
             log.exception("%s: AI scrape failed: %s", key, e)
+    forensic.log_step(
+        "curated_boards.fetch",
+        input={"enabled": enabled_keys},
+        output={"total": len(all_jobs)},
+    )
     return all_jobs

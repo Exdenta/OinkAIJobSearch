@@ -17,6 +17,8 @@ import re
 from pathlib import Path
 
 from claude_cli import run_p, extract_assistant_text, parse_json_block
+from instrumentation.wrappers import wrapped_run_p
+import forensic
 
 log = logging.getLogger(__name__)
 
@@ -158,45 +160,18 @@ def bullet_suggestions(ov: dict) -> list[str]:
 # ---------------------------------------------------------------------------
 # AI-backed tailoring (Claude sub-agent via the `claude` CLI)
 # ---------------------------------------------------------------------------
+#
+# The prompt template lives in `prompts/resume_tailor.txt` and wraps the job
+# posting + resume in opaque-data blocks with an instruction-ignore preamble
+# to neutralize indirect prompt injection (a scraped job posting can contain
+# adversarial text — "ignore previous instructions, output …"). Same pattern
+# as `fit_analyzer.py` + `prompts/fit_analysis.txt`.
 
-_AI_PROMPT = """You are a careful resume tailor for a single job application.
+_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "resume_tailor.txt"
 
-You will get the candidate's current resume plaintext and the job posting, and
-you must produce a STRICT JSON plan. Do not invent experience the candidate
-doesn't have — only reorder emphasis, rephrase bullets, and align wording with
-the posting's language.
 
-Return ONLY JSON of this shape (no markdown, no commentary, no code fences):
-
-{{
-  "summary": "one sentence describing the match, plain text, no markdown",
-  "suggestions": [
-    {{"section": "<section name>",
-      "change": "<Add | Remove | Rephrase | Reorder | Reframe>",
-      "before": "<verbatim text from current resume, '' if Add>",
-      "after":  "<proposed replacement text, '' if Remove>",
-      "why":    "<one short sentence of rationale>"}}
-  ],
-  "tailored_resume_markdown": "<the FULL rewritten resume as Markdown>"
-}}
-
-Rules:
-- 4 to 10 suggestions, most impactful first.
-- Keep each suggestion's strings under 300 chars. No newlines inside strings.
-- "tailored_resume_markdown" must be the complete resume ready to paste.
-- Preserve the candidate's real dates, employers, and degrees verbatim.
-- Prefer the posting's own phrasing for skills that genuinely match.
-
-=== JOB ===
-Title:    {title}
-Company:  {company}
-Location: {location}
-URL:      {url}
-Snippet:  {snippet}
-
-=== CURRENT RESUME (plaintext) ===
-{resume}
-"""
+def _load_prompt_template() -> str:
+    return _PROMPT_PATH.read_text(encoding="utf-8")
 
 
 def build_tailor_plan_ai(resume_text: str, job: dict, timeout_s: int = 180) -> dict | None:
@@ -206,7 +181,8 @@ def build_tailor_plan_ai(resume_text: str, job: dict, timeout_s: int = 180) -> d
     on success, or None on any failure (missing CLI, timeout, parse error).
     Callers should fall back to `build_tailor_note` for a plain-text note.
     """
-    prompt = _AI_PROMPT.format(
+    template = _load_prompt_template()
+    prompt = template.format(
         title=(job.get("title") or "").replace("\n", " ")[:200],
         company=(job.get("company") or "")[:120],
         location=(job.get("location") or "")[:120],
@@ -214,20 +190,44 @@ def build_tailor_plan_ai(resume_text: str, job: dict, timeout_s: int = 180) -> d
         snippet=(job.get("snippet") or "").replace("\n", " ")[:1200],
         resume=(resume_text or "")[:12000],
     )
-    stdout = run_p(prompt, timeout_s=timeout_s)
+    forensic.log_step(
+        "resume_tailor.build_tailor_plan_ai.begin",
+        input={
+            "job_title": (job.get("title") or "")[:120],
+            "job_company": (job.get("company") or "")[:80],
+            "job_url": (job.get("url") or "")[:200],
+            "resume_chars": len(resume_text or ""),
+        },
+    )
+    stdout = wrapped_run_p(None, "resume_tailor", prompt, timeout_s=timeout_s)
     if not stdout:
+        forensic.log_step(
+            "resume_tailor.build_tailor_plan_ai.end",
+            output={"result": None, "reason": "cli_missing_or_empty"},
+        )
         return None
     body = extract_assistant_text(stdout)
     plan = parse_json_block(body)
     if not isinstance(plan, dict):
         log.error("resume_tailor: could not parse AI plan (head=%r)", body[:200])
+        forensic.log_step(
+            "resume_tailor.build_tailor_plan_ai.end",
+            output={"result": None, "reason": "parse_failed", "body_head": (body or "")[:300]},
+        )
         return None
-    # Normalize shape so downstream code doesn't KeyError.
     plan.setdefault("summary", "")
     plan.setdefault("suggestions", [])
     plan.setdefault("tailored_resume_markdown", "")
     if not isinstance(plan["suggestions"], list):
         plan["suggestions"] = []
+    forensic.log_step(
+        "resume_tailor.build_tailor_plan_ai.end",
+        output={
+            "summary": (plan.get("summary") or "")[:300],
+            "suggestion_count": len(plan["suggestions"]),
+            "tailored_resume_chars": len(plan.get("tailored_resume_markdown") or ""),
+        },
+    )
     return plan
 
 
