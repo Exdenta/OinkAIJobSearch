@@ -23,8 +23,10 @@ Cost:
     inside the sub-agent. Budget ~1-2 minutes of wall-clock.
 
 Toggle:
-  - Disabled by default in filters.yaml (`sources.web_search: false`).
-  - Enable once you've confirmed the `claude` CLI is installed and logged in.
+  - `sources.web_search` in `defaults.DEFAULTS`. ON by default; per-user
+    activation requires either profile.search_seeds.web_search or a /prefs
+    free-text from the user.
+  - Requires the `claude` CLI installed and logged in.
 
 Fallback:
   - CLI missing → log a warning, return [].
@@ -36,10 +38,22 @@ import logging
 from typing import Any
 
 from claude_cli import run_p, extract_assistant_text, parse_json_block
+from instrumentation.wrappers import wrapped_run_p, wrapped_run_p_with_tools
 from dedupe import Job
 from text_utils import fix_mojibake
 
 log = logging.getLogger(__name__)
+
+
+# Tool grants for the discovery sub-agent. WebSearch is required for query
+# discovery; WebFetch lets the agent open promising results to extract title /
+# snippet / company. Without these grants the CLI denies every WebSearch call
+# and the agent returns {"jobs": []} after burning ~15s of context — see the
+# 2026-04 zero-runs incident on chat 169016071 (forensic_logs/log.0.jsonl).
+_ALLOWED_TOOLS = "WebSearch,WebFetch"
+# Belt-and-suspenders: explicitly forbid filesystem / shell access so a
+# successful prompt-injection in the candidate's free-text can't escalate.
+_DISALLOWED_TOOLS = "Bash,Edit,Write,Read"
 
 
 # Domains we already cover with dedicated, cheaper adapters. Tell the sub-agent
@@ -89,6 +103,22 @@ Your mission in this single run:
        - Prefer postings that are remote or in {locations}. Skip postings
          that obviously don't fit (wrong geography, wrong role type).
        - Prefer postings from the last 7 days.
+       - REJECT and skip any URL pointing to a discussion forum, comment
+         thread, social-media post, or developer Q&A site — even if the
+         page mentions an opening. Specifically exclude: reddit.com,
+         news.ycombinator.com, twitter.com, x.com, github.com /issues/
+         and /discussions/ paths, stackoverflow.com, stackexchange.com,
+         medium.com, dev.to, substack.com, quora.com, levels.fyi,
+         discord.com, t.me, and any URL whose path contains
+         /comments/, /discuss/, /threads/, /r/<subreddit>, /forum/, or
+         /topics/. These are NEVER acceptable as a posting URL.
+       - ONLY return URLs that point to a CANONICAL JOB POSTING page on a
+         company career page or ATS (greenhouse.io, lever.co, ashbyhq.com,
+         workable.com, bamboohr.com, personio.jobs, recruitee.com,
+         workday, smartrecruiters.com, or the company's own /careers or
+         /jobs page). If a search hit lands on a discussion thread, follow
+         the link OUT of the thread to the canonical posting and return
+         that URL instead — never the thread URL itself.
 
   4. Return STRICT JSON only — no prose, no markdown, no code fences —
      with this exact shape:
@@ -301,7 +331,17 @@ def fetch(
         user_free_text=user_free_text,
         profile_seeds=profile_seeds,
     )
-    stdout = run_p(prompt, timeout_s=timeout_s)
+    # Use the tool-aware wrapper: WebSearch + WebFetch must be explicitly
+    # allowed or the CLI rejects every tool_use and the agent gives up with
+    # an empty jobs list.
+    stdout = wrapped_run_p_with_tools(
+        None,
+        "web_search",
+        prompt,
+        allowed_tools=_ALLOWED_TOOLS,
+        disallowed_tools=_DISALLOWED_TOOLS,
+        timeout_s=timeout_s,
+    )
     if not stdout:
         log.warning("web_search: `claude` CLI unavailable or errored; returning []")
         return []

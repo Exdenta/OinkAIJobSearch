@@ -30,6 +30,8 @@ from pathlib import Path
 from typing import Any
 
 from claude_cli import run_p, extract_assistant_text, parse_json_block
+from instrumentation.wrappers import wrapped_run_p
+import forensic
 
 log = logging.getLogger(__name__)
 
@@ -167,25 +169,48 @@ def build_fit_analysis_ai(
     should show a concise "couldn't analyze" message in the UI when this
     returns None — the bot continues unharmed.
     """
-    prompt_template = _load_prompt_template()
-    prompt = prompt_template.format(
-        title=(job.get("title") or "").replace("\n", " ")[:_MAX_TITLE_CHARS],
-        company=(job.get("company") or "")[:_MAX_COMPANY_CHARS],
-        location=(job.get("location") or "")[:_MAX_LOC_CHARS],
-        url=(job.get("url") or "")[:_MAX_URL_CHARS],
-        snippet=(job.get("snippet") or "").replace("\n", " ")[:_MAX_SNIPPET_CHARS],
-        resume=(resume_text or "")[:_MAX_RESUME_CHARS],
-    )
-    stdout = run_p(prompt, timeout_s=timeout_s)
-    if not stdout:
-        return None
-    body = extract_assistant_text(stdout)
-    parsed = parse_json_block(body)
-    analysis = _normalize(parsed)
-    if analysis is None:
-        log.error("fit_analyzer: parse/validate failed (head=%r)", (body or "")[:200])
-        return None
-    return analysis
+    with forensic.step(
+        "fit_analyzer.build_fit_analysis_ai",
+        input={
+            "job_title": (job.get("title") or "")[:120],
+            "job_company": (job.get("company") or "")[:80],
+            "job_url": (job.get("url") or "")[:200],
+            "resume_chars": len(resume_text or ""),
+            "resume_sha1": resume_sha1(resume_text or ""),
+        },
+    ) as fctx:
+        prompt_template = _load_prompt_template()
+        prompt = prompt_template.format(
+            title=(job.get("title") or "").replace("\n", " ")[:_MAX_TITLE_CHARS],
+            company=(job.get("company") or "")[:_MAX_COMPANY_CHARS],
+            location=(job.get("location") or "")[:_MAX_LOC_CHARS],
+            url=(job.get("url") or "")[:_MAX_URL_CHARS],
+            snippet=(job.get("snippet") or "").replace("\n", " ")[:_MAX_SNIPPET_CHARS],
+            resume=(resume_text or "")[:_MAX_RESUME_CHARS],
+        )
+        stdout = wrapped_run_p(None, "fit_analyzer", prompt, timeout_s=timeout_s)
+        if not stdout:
+            fctx.set_output({"result": None, "reason": "cli_missing_or_empty"})
+            return None
+        body = extract_assistant_text(stdout)
+        parsed = parse_json_block(body)
+        analysis = _normalize(parsed)
+        if analysis is None:
+            log.error("fit_analyzer: parse/validate failed (head=%r)", (body or "")[:200])
+            fctx.set_output({
+                "result": None,
+                "reason": "parse_or_validate_failed",
+                "body_head": (body or "")[:300],
+            })
+            return None
+        fctx.set_output({
+            "verdict": analysis.get("verdict"),
+            "fit_score": analysis.get("fit_score"),
+            "headline": (analysis.get("headline") or "")[:200],
+            "strength_count": len(analysis.get("strengths") or []),
+            "gap_count": len(analysis.get("gaps") or []),
+        })
+        return analysis
 
 
 # ---------- MDv2 renderer ----------

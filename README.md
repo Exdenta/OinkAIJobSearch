@@ -2,8 +2,9 @@
 
 ![Welcome screen — orange-hat pig greeting the user in Telegram](assets/screenshots/welcome.png)
 
-A daily job-posting digest + interactive Telegram bot. Scrapes LinkedIn, Indeed,
-HackerNews "Who is Hiring", and remote-focused boards; filters by your criteria;
+A daily job-posting digest + interactive Telegram bot. Scrapes LinkedIn,
+HackerNews "Who is Hiring", and remote-focused boards; filters per-user via
+an Opus-built profile (resume + free-text /prefs);
 sends each new posting as its own Telegram message with inline buttons; tracks
 which roles you've applied to; and can produce a "tailored resume note" for any
 posting on demand.
@@ -52,8 +53,6 @@ FindJobs/
 ├── README.md
 ├── .env                      ← TELEGRAM_BOT_TOKEN, OPERATOR_CONTACT (gitignored)
 ├── .env.example
-├── config/
-│   └── filters.yaml          ← job-search criteria
 ├── docs/
 │   ├── PRIVACY.md            ← privacy policy published with the bot
 │   ├── per-user-profile-plan.md
@@ -103,7 +102,7 @@ FindJobs/
 
 ```bash
 pip install --break-system-packages \
-    requests pyyaml feedparser beautifulsoup4 python-dotenv pdfplumber
+    requests feedparser beautifulsoup4 python-dotenv pdfplumber
 ```
 
 ### 2. Put your bot token in `.env`
@@ -264,7 +263,7 @@ Deletion: to reset a user, `DELETE FROM users WHERE chat_id=?` and drop their
 
 - **Add a source**: drop `my_source.py` into `skill/job-search/scripts/sources/`,
   expose `fetch(filters) -> list[Job]`, register in `search_jobs.py:SOURCES`,
-  add a toggle in `filters.yaml:sources`.
+  add a toggle in `defaults.py:DEFAULTS["sources"]`.
 - **Change button behavior**: edit `telegram_client.py::job_keyboard` and the
   callback dispatcher in `bot.py::handle_callback`.
 - **Upgrade resume tailoring to a real LLM rewrite**: replace

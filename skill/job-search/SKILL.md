@@ -1,6 +1,6 @@
 ---
 name: job-search
-description: Runs the daily job-alert pipeline. Scrapes LinkedIn, Indeed, HackerNews "Who is Hiring", and remote-focused boards, filters by the user's criteria in config/filters.yaml, deduplicates via the SQLite database, and posts new postings to Telegram with inline buttons (Applied / Not applied / Tailor my resume). Use whenever the user says "run job search", "check for new jobs", or the scheduled task fires.
+description: Runs the daily job-alert pipeline. Scrapes LinkedIn (per-user), HackerNews "Who is Hiring", and remote-focused boards; matches each posting against each user's Opus-built profile via a Haiku score gate; deduplicates via SQLite; posts new postings to Telegram with inline buttons (Applied / Not applied / Tailor my resume). Use whenever the user says "run job search", "check for new jobs", or the scheduled task fires.
 ---
 
 # job-search skill
@@ -21,9 +21,9 @@ This skill is only responsible for the **scheduled digest**. Don't touch the bot
 ## What to do
 
 1. **Sanity checks.** Confirm these files exist relative to the project root:
-   - `config/filters.yaml`
    - `.env` with `TELEGRAM_BOT_TOKEN` set (chat IDs come from the DB now)
    - `skill/job-search/scripts/search_jobs.py`
+   - `skill/job-search/scripts/defaults.py` (operational defaults — sources, timeouts, score floor)
 
 2. **Check there's a registered user.** Query the DB:
    ```bash
@@ -44,24 +44,24 @@ This skill is only responsible for the **scheduled digest**. Don't touch the bot
    - How many Telegram messages were sent.
    - Any source errors (e.g. LinkedIn 429) — mention but don't fail the run.
 
-5. **Don't spam on empty days.** If `message.quiet_if_empty: true` is set in the config and a user has 0 new postings, skip sending them anything.
+5. **Don't spam on empty days.** If `message.quiet_if_empty: true` is set in `defaults.DEFAULTS` and a user has 0 new postings, skip sending them anything.
 
 ## Common failure modes
 
-- **`ModuleNotFoundError`** — run `pip install --break-system-packages requests pyyaml feedparser beautifulsoup4 python-dotenv pdfplumber`.
+- **`ModuleNotFoundError`** — run `pip install --break-system-packages requests feedparser beautifulsoup4 python-dotenv pdfplumber`.
 - **`no such table: users`** — DB schema hasn't been created. The first bot or search run auto-creates it; if not, ensure `state/` is writable.
 - **401 from Telegram** — token revoked; stop and tell the user to update `.env`.
 - **400 "chat not found"** — user is in the DB but has blocked the bot. Either delete that user row or ignore that exit code on their message.
-- **429 from LinkedIn/Indeed** — skip that source for today, mention in report.
+- **429 from LinkedIn** — skip that user's per-user LinkedIn batch for today, mention in report.
 
 ## Files you may edit
 
-- `config/filters.yaml` when the user asks to change criteria.
+- `skill/job-search/scripts/defaults.py` when the user asks to change operator-level toggles (sources, timeouts, default score floor, message format). Per-user matching criteria live on the user's profile (`/prefs` and the Opus profile builder) — don't bake them in here.
 
 ## Files you must NOT modify during a run
 
 - `.env` (credentials)
-- anything under `skill/job-search/scripts/`
+- anything under `skill/job-search/scripts/` other than `defaults.py`
 - `state/jobs.db` except via the scripts themselves
 
 ## Related docs

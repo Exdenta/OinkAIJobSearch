@@ -21,8 +21,8 @@ preferences, then emit three things:
 Design decisions:
   - This is now the ONLY matching gate. The old keyword/regex post_filter in
     search_jobs.py has been neutered — Claude holistically decides using the
-    resume + the user's preference dict. filters.yaml's title_must_match /
-    title_exclude / keywords / exclude_keywords fields are NOT consulted.
+    resume + the user's preference dict. The legacy keyword/title/locations
+    fields (formerly in `config/filters.yaml`, now removed) are NOT consulted.
   - Smallest model (Haiku) per operator instruction. Cheap + fast enough to
     run on every fetched posting from every source (LinkedIn, HN, remoteok,
     remotive, weworkremotely, curated boards, web_search).
@@ -46,10 +46,21 @@ import logging
 from typing import Any
 
 from claude_cli import run_p, extract_assistant_text, parse_json_block, SMALLEST_MODEL
+from instrumentation.wrappers import wrapped_run_p
 from dedupe import Job
 from text_utils import fix_mojibake
 
 log = logging.getLogger(__name__)
+
+
+# Per-batch failure reasons surfaced in forensic logs and at the call site.
+# Kept as plain string sentinels (not Enum) so they appear verbatim in the
+# JSONL forensic stream and are grep-friendly.
+_BATCH_OK = "ok"
+_BATCH_CLI_MISSING = "cli_missing"      # wrapped_run_p returned None
+_BATCH_EMPTY_RESULT = "empty_result"    # CLI envelope had result="" — Haiku produced no JSON
+_BATCH_PARSE_ERROR = "parse_error"      # body wasn't a JSON object / no `results` list
+_BATCH_PARTIAL = "partial"              # results parsed but fewer verdicts than postings sent
 
 
 _PROMPT = """You are a careful job-match analyst working for ONE candidate.
@@ -210,10 +221,34 @@ def enrich_jobs_ai(
     prefs_for_prompt = _prefs_for_prompt(projected_prefs)
 
     out: dict[str, dict] = {}
-    # Build chunks
-    for start in range(0, len(jobs), max_jobs_per_call):
-        chunk = jobs[start:start + max_jobs_per_call]
-        out.update(_enrich_one_chunk(chunk, resume_text, timeout_s, prefs_for_prompt))
+    # Build chunks. We assemble all chunk slices up front so the per-batch
+    # forensic lines carry a stable batch_idx (1-indexed) and total count —
+    # downstream analysis can immediately spot "batch 2 of 4 returned
+    # 0 verdicts" without reconstructing chunk boundaries.
+    chunks: list[list[Job]] = [
+        jobs[start:start + max_jobs_per_call]
+        for start in range(0, len(jobs), max_jobs_per_call)
+    ]
+    total_batches = len(chunks)
+    failed_batches = 0
+    for idx, chunk in enumerate(chunks, start=1):
+        verdicts, reason = _enrich_one_chunk(
+            chunk, resume_text, timeout_s, prefs_for_prompt,
+            batch_idx=idx, total_batches=total_batches,
+            allow_split_retry=True,
+        )
+        out.update(verdicts)
+        if reason != _BATCH_OK:
+            failed_batches += 1
+    # Loud, structured summary so the operator can tell apart
+    # "Claude scored every job 0" (real signal) from "a batch was lost".
+    if failed_batches:
+        log.warning(
+            "enrich_jobs_ai: %d/%d batch(es) failed silently — verdicts only "
+            "from %d/%d batches",
+            failed_batches, total_batches,
+            total_batches - failed_batches, total_batches,
+        )
     return out
 
 
@@ -271,7 +306,40 @@ def _enrich_one_chunk(
     resume_text: str,
     timeout_s: int,
     prefs_for_prompt: dict,
-) -> dict[str, dict]:
+    *,
+    batch_idx: int = 1,
+    total_batches: int = 1,
+    allow_split_retry: bool = True,
+    _retry_depth: int = 0,
+) -> tuple[dict[str, dict], str]:
+    """Enrich one chunk. Returns (verdicts_by_external_id, failure_reason).
+
+    failure_reason is one of:
+      _BATCH_OK            — all postings got a verdict back
+      _BATCH_CLI_MISSING   — CLI unavailable / wrapped_run_p returned None
+      _BATCH_EMPTY_RESULT  — CLI succeeded but result text was empty (Haiku
+                             produced 0 chars of assistant text — the exact
+                             failure mode that lost 25 jobs in pipeline_run #12)
+      _BATCH_PARSE_ERROR   — response didn't parse as a JSON object with `results`
+      _BATCH_PARTIAL       — results parsed but fewer verdicts than postings
+
+    On failure (_CLI_MISSING / _EMPTY_RESULT / _PARSE_ERROR), if
+    `allow_split_retry` is True and the chunk has >=2 jobs, we split it in
+    half and retry each half once. This gives us a cheap second chance at
+    the model: a 25-job prompt is most likely to hit Haiku's empty-output
+    glitch, two 12-job prompts are far less so.
+
+    On _BATCH_PARTIAL (Haiku returned valid JSON but skipped some IDs —
+    seen consistently on full 25-job batches in the 2026-05-02 cron run,
+    one missing verdict per user per batch 4/5), we do a TARGETED re-ask:
+    we build a fresh prompt containing only the missing jobs and call
+    once more. Cheaper than splitting (we don't re-score the 24 we got)
+    and recovers what's actually a flaky-LLM omission rather than a
+    prompt-size problem.
+
+    All retries are bounded to a single attempt (_retry_depth==0 → 1) so
+    a systematic failure can't fan out forever.
+    """
     briefs = [_job_to_brief(j) for j in chunk]
     prompt = _PROMPT.format(
         resume=(resume_text or "")[:12000],
@@ -281,35 +349,170 @@ def _enrich_one_chunk(
     # Smallest Claude model for matching — operator instruction. Every source
     # (LinkedIn, HN, remote boards, curated boards, web_search) flows through
     # this one call, so cheapest tier is the whole point.
-    stdout = run_p(prompt, timeout_s=timeout_s, model=SMALLEST_MODEL)
-    if not stdout:
-        log.warning("enrich_jobs_ai: CLI unavailable — skipping enrichment for %d jobs", len(chunk))
-        return {}
-    body = extract_assistant_text(stdout)
-    data = parse_json_block(body)
-    if not isinstance(data, dict):
-        log.error("enrich_jobs_ai: response wasn't a JSON object (head=%r)", body[:200])
-        return {}
-    results = data.get("results")
-    if not isinstance(results, list):
-        log.error("enrich_jobs_ai: response missing `results` list")
-        return {}
+    stdout = wrapped_run_p(None, "job_enrich", prompt, timeout_s=timeout_s, model=SMALLEST_MODEL)
 
-    valid_ids = {j.external_id for j in chunk}
+    reason = _BATCH_OK
     out: dict[str, dict] = {}
-    for r in results:
-        if not isinstance(r, dict):
-            continue
-        ext_id = str(r.get("id") or "").strip()
-        if not ext_id or ext_id not in valid_ids:
-            continue
-        out[ext_id] = {
-            "match_score": _normalize_score(r.get("match_score")),
-            "why_match": fix_mojibake(str(r.get("why_match") or "").strip())[:280],
-            "key_details": _normalize_details(r.get("key_details")),
-        }
-    log.info("enrich_jobs_ai: enriched %d/%d jobs", len(out), len(chunk))
-    return out
+    body_head = ""
+
+    if stdout is None:
+        reason = _BATCH_CLI_MISSING
+        log.warning(
+            "enrich_jobs_ai: batch %d/%d CLI unavailable — %d jobs at risk",
+            batch_idx, total_batches, len(chunk),
+        )
+    else:
+        body = extract_assistant_text(stdout)
+        body_head = (body or "")[:200]
+        # extract_assistant_text falls back to the raw envelope when no
+        # non-empty result/content/text/message field is present, so we
+        # also need the explicit "envelope.result was empty" check.
+        # That is the failure mode observed in claude_calls #23 / run #12.
+        is_envelope_empty = _is_empty_result_envelope(stdout)
+        if is_envelope_empty:
+            reason = _BATCH_EMPTY_RESULT
+            log.error(
+                "enrich_jobs_ai: batch %d/%d returned empty result text — "
+                "%d jobs at risk (head=%r)",
+                batch_idx, total_batches, len(chunk), body_head,
+            )
+        else:
+            data = parse_json_block(body)
+            if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+                reason = _BATCH_PARSE_ERROR
+                log.error(
+                    "enrich_jobs_ai: batch %d/%d response missing `results` list "
+                    "(head=%r)",
+                    batch_idx, total_batches, body_head,
+                )
+            else:
+                valid_ids = {j.external_id for j in chunk}
+                for r in data["results"]:
+                    if not isinstance(r, dict):
+                        continue
+                    ext_id = str(r.get("id") or "").strip()
+                    if not ext_id or ext_id not in valid_ids:
+                        continue
+                    out[ext_id] = {
+                        "match_score": _normalize_score(r.get("match_score")),
+                        "why_match": fix_mojibake(str(r.get("why_match") or "").strip())[:280],
+                        "key_details": _normalize_details(r.get("key_details")),
+                    }
+                if len(out) < len(chunk):
+                    reason = _BATCH_PARTIAL
+
+    missing_count = len(chunk) - len(out)
+
+    # Per-batch forensic line. One line per batch keeps the JSONL log
+    # easy to scan: `grep enrich_jobs_ai.batch` shows the run's batch
+    # outcomes at a glance.
+    try:
+        from forensic import log_step as _flog
+        _flog(
+            "enrich_jobs_ai.batch",
+            input={
+                "batch_idx": batch_idx,
+                "total_batches": total_batches,
+                "batch_size": len(chunk),
+                "retry_depth": _retry_depth,
+            },
+            output={
+                "verdicts_returned": len(out),
+                "missing_count": missing_count,
+                "failure_reason": reason,
+                "body_head": body_head,
+            },
+        )
+    except Exception:
+        log.debug("enrich_jobs_ai.batch forensic emit failed; continuing",
+                  exc_info=True)
+
+    # Retry path: split the chunk in half and try each half once. We only
+    # split-retry on failure modes that suggest a transient model/CLI issue
+    # (empty / parse-error / CLI missing) — for these, a smaller prompt is
+    # most likely to succeed.
+    retryable = {_BATCH_CLI_MISSING, _BATCH_EMPTY_RESULT, _BATCH_PARSE_ERROR}
+    if reason in retryable and allow_split_retry and len(chunk) >= 2 and _retry_depth == 0:
+        mid = len(chunk) // 2
+        left, right = chunk[:mid], chunk[mid:]
+        log.info(
+            "enrich_jobs_ai: retrying batch %d/%d (reason=%s) by splitting "
+            "%d jobs into %d + %d",
+            batch_idx, total_batches, reason, len(chunk), len(left), len(right),
+        )
+        for sub_chunk in (left, right):
+            sub_out, _ = _enrich_one_chunk(
+                sub_chunk, resume_text, timeout_s, prefs_for_prompt,
+                batch_idx=batch_idx, total_batches=total_batches,
+                allow_split_retry=False,
+                _retry_depth=_retry_depth + 1,
+            )
+            out.update(sub_out)
+        # Re-classify after retry: if the splits recovered every job we
+        # promote to OK; if some are still missing we leave the original
+        # reason so the orchestrator counts this batch as failed but the
+        # caller still sees whatever verdicts came back.
+        if len(out) >= len(chunk):
+            reason = _BATCH_OK
+
+    # Targeted re-ask path for partial batches. Empirically (forensic logs
+    # 2026-05-02 cron run), Haiku consistently drops exactly 1 verdict
+    # when handed full 25-job batches — every user, every batch-of-25 with
+    # full payload. Splitting the whole chunk would re-spend tokens on the
+    # 24 jobs we already scored; instead we re-ask ONLY for the missing
+    # external_ids. Capped at 1 retry (allow_split_retry==True &&
+    # _retry_depth==0) so a deterministic poison pill can't fan out.
+    if (
+        reason == _BATCH_PARTIAL
+        and allow_split_retry
+        and _retry_depth == 0
+        and len(out) < len(chunk)
+    ):
+        missing_jobs = [j for j in chunk if j.external_id not in out]
+        log.info(
+            "enrich_jobs_ai: re-asking batch %d/%d for %d missing verdict(s) "
+            "(targeted retry, partial batch)",
+            batch_idx, total_batches, len(missing_jobs),
+        )
+        recovered, _ = _enrich_one_chunk(
+            missing_jobs, resume_text, timeout_s, prefs_for_prompt,
+            batch_idx=batch_idx, total_batches=total_batches,
+            allow_split_retry=False,
+            _retry_depth=_retry_depth + 1,
+        )
+        out.update(recovered)
+        if len(out) >= len(chunk):
+            reason = _BATCH_OK
+
+    log.info(
+        "enrich_jobs_ai: enriched %d/%d jobs (batch %d/%d, reason=%s)",
+        len(out), len(chunk), batch_idx, total_batches, reason,
+    )
+    return out, reason
+
+
+def _is_empty_result_envelope(stdout: str) -> bool:
+    """True iff the CLI envelope JSON has `result=""` (and no fallback text).
+
+    Mirrors `extract_assistant_text` but explicitly returns True when every
+    candidate field is absent or empty — the case where the assistant
+    produced no usable text. Conservative: any parse failure returns False
+    so callers fall through to the parse_json_block path.
+    """
+    s = (stdout or "").strip()
+    if not s:
+        return False
+    try:
+        envelope = json.loads(s)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(envelope, dict):
+        return False
+    for key in ("result", "content", "text", "message"):
+        val = envelope.get(key)
+        if isinstance(val, str) and val.strip():
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------

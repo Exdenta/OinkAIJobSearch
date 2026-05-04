@@ -53,6 +53,8 @@ from telegram_client import (             # noqa: E402
     render_suggestions_mdv2,
     clean_data_menu_keyboard,
     clean_data_confirm_keyboard,
+    digest_header_keyboard,
+    send_per_job_digest,
     CLEAN_DATA_KINDS,
 )
 from user_profile import (                # noqa: E402
@@ -66,6 +68,10 @@ import profile_builder as _profile_builder  # noqa: E402
 import onboarding as _onboarding            # noqa: E402
 import pig_stickers as _pigs                # noqa: E402
 import fit_analyzer as _fit                 # noqa: E402
+from telemetry import MonitorStore          # noqa: E402
+from instrumentation import error_capture  # noqa: E402
+from ops.commands import handle_operator_command as _ops_handle_command  # noqa: E402
+from ops.alerts import deliver_alert as _ops_deliver_alert  # noqa: E402
 import json as _json
 import shutil as _shutil
 
@@ -80,6 +86,18 @@ PROJECT_ROOT = HERE.parent.parent.parent
 STATE_DIR = PROJECT_ROOT / os.environ.get("STATE_DIR", "state")
 USERS_DIR = STATE_DIR / "users"
 DB_PATH = STATE_DIR / "jobs.db"
+
+# Lazy MonitorStore singleton — the operator-command shim and any future
+# instrumentation hookups read this. First call constructs it; the DB
+# instance is reused thereafter.
+_STORE: MonitorStore | None = None
+
+
+def _get_store(db: DB) -> MonitorStore:
+    global _STORE
+    if _STORE is None:
+        _STORE = MonitorStore(db)
+    return _STORE
 
 
 # Pig mascot — sprinkled into celebratory / conversational moments (welcome
@@ -176,6 +194,48 @@ def _show_settings_menu(tg: TelegramClient, db: DB, chat_id: int) -> None:
 
 STATE_AWAITING_PREFS = "awaiting_prefs"
 STATE_AWAITING_RESEARCH_LOCATION = "awaiting_research_location"
+# Set after the user taps "🚫 Not applied" on a job card. The bot then asks
+# them why this posting didn't fit; the next text message becomes free-text
+# feedback that `skip_feedback.apply_skip_feedback` parses into profile
+# exclusions. Gated behind SKIP_FEEDBACK_ENABLED so the prompt is opt-in
+# during the rollout.
+STATE_AWAITING_SKIP_REASON = "awaiting_skip_reason"
+
+# Opt-in flag for the skip-reason follow-up prompt. Default OFF so existing
+# users don't suddenly get an extra question after every skip; ramp by setting
+# SKIP_FEEDBACK_ENABLED=1 in the bot's environment.
+def _skip_feedback_enabled() -> bool:
+    return os.environ.get("SKIP_FEEDBACK_ENABLED", "0") not in ("0", "false", "False", "")
+
+
+# Prompt for the skip-reason capture flow. We use Telegram's `ForceReply`
+# markup so the user's input field auto-focuses with a placeholder hint —
+# a regular ReplyKeyboardMarkup would REPLACE the user's keyboard with
+# just "✕ Cancel", hiding the text input and confusing the user (the
+# screenshot bug from 2026-04-30). With ForceReply they see their own
+# typing keyboard + a clear "type your reason here" placeholder.
+SKIP_REASON_PROMPT_MDV2 = (
+    "❓ *Why didn't this fit?*\n\n"
+    + mdv2_escape(
+        "Tell me in plain English (role / stack / location / seniority / "
+        "company / anything else). An AI will parse your reply, update your "
+        "profile, and your NEXT digest will filter similar postings out "
+        "automatically. Send "
+    )
+    + "`skip`"
+    + mdv2_escape(" to dismiss this question.")
+)
+
+# Inline keyboard with a Skip button beneath the "Why?" prompt. Telegram
+# does NOT allow combining `force_reply` and `inline_keyboard` on the same
+# message, so we pick the inline button — it's tappable and visible right
+# below the prompt, which the user explicitly asked for. Trade-off: input
+# field doesn't auto-focus; user taps the message box to type. Acceptable
+# UX since the prompt body says "Type a short reason in the message box
+# below" so the input action is signposted.
+SKIP_REASON_INLINE_KB: dict = {
+    "inline_keyboard": [[{"text": "✕ Skip", "callback_data": "sr:skip"}]],
+}
 
 
 # URL where the full privacy policy is hosted. If you haven't published
@@ -270,6 +330,16 @@ def user_dir(chat_id: int) -> Path:
 # ---------- handlers ----------
 
 def handle_command(tg: TelegramClient, db: DB, chat_id: int, text: str, user: dict) -> None:
+    # Operator-command shim runs first. For the OPERATOR_CHAT_ID it handles
+    # /health, /stats, /alerts, /runlog and short-circuits the rest of the
+    # dispatcher. For every other chat it returns False (silent ghost) and
+    # the regular dispatcher below runs as usual. Note: /stats overlaps with
+    # the legacy `_show_admin_stats` path — operator-mode wins.
+    try:
+        if _ops_handle_command(tg, _get_store(db), chat_id, text):
+            return
+    except Exception:
+        log.exception("operator-command shim raised; falling through")
     cmd = text.split()[0].lower()
     if cmd == "/start":
         db.upsert_user(
@@ -369,6 +439,128 @@ def _ask_min_score(tg: TelegramClient, db: DB, chat_id: int) -> None:
         _min_score_prompt_mdv2(current),
         reply_markup=min_score_keyboard(current=current),
     )
+
+
+def _handle_filter_button(
+    tg: TelegramClient,
+    db: DB,
+    cb: dict,
+    chat_id: int,
+    msg_id: int,
+    payload: str,
+) -> None:
+    """Dispatch the ⬇ / ⬆ digest-header buttons.
+
+    Payload shapes:
+      ``lwr:<run_id>:<new_floor>`` — replay cached unsent jobs with score
+        ≥ new_floor for this run (inclusive-upward, matches the (+M) on the
+        button), append to chat (no new header), and persist new_floor onto
+        the user profile so the next digest also uses it.
+      ``rse:<new_floor>`` — only update profile.min_match_score; the in-chat
+        digest is unchanged.
+    """
+    cb_id = cb["id"]
+    parts = (payload or "").split(":")
+    if not parts or not parts[0]:
+        tg.answer_callback(cb_id, "Invalid filter button.")
+        return
+    sub = parts[0]
+
+    if sub == "rse":
+        try:
+            new_floor = int(parts[1])
+        except (IndexError, ValueError):
+            tg.answer_callback(cb_id, "Invalid floor.")
+            return
+        new_floor = max(0, min(5, new_floor))
+        profile = profile_from_json(db.get_user_profile(chat_id))
+        db.set_user_profile(chat_id, profile_to_json(set_min_match_score(profile, new_floor)))
+        try:
+            kb = digest_header_keyboard(run_id=None, current_floor=new_floor, lower_count=0)
+            tg.edit_reply_markup(chat_id, msg_id, kb or {"inline_keyboard": []})
+        except Exception:
+            log.debug("flt:rse edit_reply_markup failed; continuing", exc_info=True)
+        tg.answer_callback(cb_id, f"Next digest will use ≥{new_floor}/5")
+        return
+
+    if sub == "lwr":
+        try:
+            run_id = int(parts[1])
+            new_floor = int(parts[2])
+        except (IndexError, ValueError):
+            tg.answer_callback(cb_id, "Invalid filter button.")
+            return
+        new_floor = max(0, min(5, new_floor))
+        cached = db.fetch_unsent_at_score(chat_id, run_id, new_floor)
+        if not cached:
+            tg.answer_callback(cb_id, "No more postings at that score.")
+            return
+        jobs: list[Job] = []
+        enrichments: dict[str, dict] = {}
+        for jid, score, enr_json in cached:
+            job_row = db.get_job(jid)
+            j = _row_to_job(job_row)
+            if j is None:
+                continue
+            try:
+                enr = _json.loads(enr_json) if enr_json else {"match_score": score}
+            except (TypeError, ValueError):
+                enr = {"match_score": score}
+            if not isinstance(enr, dict):
+                enr = {"match_score": score}
+            jobs.append(j)
+            enrichments[jid] = enr
+        if not jobs:
+            tg.answer_callback(cb_id, "Postings expired from cache.")
+            return
+
+        sent_ids: list[str] = []
+        def _on_sent_replay(mid, j, _cid=chat_id, _sink=sent_ids):
+            db.log_sent(_cid, mid, j.job_id)
+            _sink.append(j.job_id)
+
+        # Replay cards inherit the same snippet config as the live digest;
+        # callers can flip these via env if they ever need to.
+        cfg = {"message": {"include_snippet": True, "snippet_chars": 240}}
+        try:
+            send_per_job_digest(
+                tg, chat_id, jobs, cfg,
+                on_sent=_on_sent_replay,
+                enrichments=enrichments,
+                min_score=new_floor,
+                run_id=run_id,
+                skip_header=True,
+            )
+        except Exception:
+            log.exception("flt:lwr replay failed")
+            tg.answer_callback(cb_id, "Replay failed — see logs.")
+            return
+
+        if sent_ids:
+            try:
+                db.mark_digest_jobs_sent(chat_id, run_id, sent_ids, floor=new_floor)
+            except Exception:
+                log.debug("mark_digest_jobs_sent failed; continuing", exc_info=True)
+
+        profile = profile_from_json(db.get_user_profile(chat_id))
+        db.set_user_profile(chat_id, profile_to_json(set_min_match_score(profile, new_floor)))
+
+        try:
+            next_lower = (
+                db.unsent_count_at_score(chat_id, run_id, new_floor - 1)
+                if new_floor > 0 else 0
+            )
+            kb = digest_header_keyboard(
+                run_id=run_id, current_floor=new_floor, lower_count=next_lower,
+            )
+            tg.edit_reply_markup(chat_id, msg_id, kb or {"inline_keyboard": []})
+        except Exception:
+            log.debug("flt:lwr edit_reply_markup failed; continuing", exc_info=True)
+
+        tg.answer_callback(cb_id, f"Lowered to ≥{new_floor}/5 — added {len(sent_ids)}")
+        return
+
+    tg.answer_callback(cb_id, "Unknown filter button.")
 
 
 def _apply_min_score(tg: TelegramClient, db: DB, cb: dict, chat_id: int, msg_id: int,
@@ -1027,6 +1219,131 @@ def _save_prefs_from_text(tg: TelegramClient, db: DB, chat_id: int, text: str) -
         log.exception("save_prefs: profile rebuild enqueue failed for chat=%s", chat_id)
 
 
+# ---------- skip-reason capture flow ----------
+
+# Tokens accepted in lieu of an actual reason. Includes the literal Cancel
+# button label so a user tapping ✕ Cancel mid-prompt is treated as "no
+# feedback" rather than a real reason. (BTN_CANCEL is also short-circuited
+# by the global cancel handler in _dispatch — this list is the in-state
+# safety net for legacy keyboard variants.)
+_SKIP_REASON_CANCEL_TOKENS = {"skip", "/skip", "cancel", "/cancel"}
+
+
+def _is_skip_reason_cancel(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return True
+    if t.lower() in _SKIP_REASON_CANCEL_TOKENS:
+        return True
+    # Match the "✕ Cancel" / "✖️ Cancel" reply-keyboard buttons.
+    if t == BTN_CANCEL:
+        return True
+    if _LEGACY_BUTTONS.get(t) == "cancel":
+        return True
+    return False
+
+
+def _handle_skip_reason_text(
+    tg: TelegramClient, db: DB, chat_id: int, text: str,
+) -> None:
+    """Process the user's free-text reply to "Why didn't this fit?".
+
+    Contract:
+      • `skip` / Cancel → clear state, no feedback recorded.
+      • `safety_check` block → reject + clear state, never reach Claude.
+      • Else → import skip_feedback (sibling-agent module) and call
+        apply_skip_feedback with the captured job_context payload. Surface
+        the returned summary to the user. Always clear state on the way out.
+
+    The job context comes from the JSON payload bundled with the awaiting
+    state row (`db.get_awaiting_state_payload`). If the payload is missing
+    we treat it as a stale prompt — clear state silently and bail.
+    """
+    payload = db.get_awaiting_state_payload(chat_id) or {}
+
+    # Fast-path: user opted out.
+    if _is_skip_reason_cancel(text):
+        db.set_awaiting_state(chat_id, None)
+        tg.send_message(
+            chat_id,
+            mdv2_escape("Got it, no feedback recorded."),
+            reply_markup=REPLY_KEYBOARD,
+        )
+        return
+
+    # Boundary safety screen — same gate as /prefs / /marketresearch. The
+    # reason text will be foregrounded in a Claude call inside
+    # skip_feedback, so injection attempts must not slip past this layer.
+    verdict = check_user_input(text)
+    if verdict.get("verdict") == "block":
+        db.set_awaiting_state(chat_id, None)
+        reason = str(verdict.get("reason") or "prompt-injection fingerprint")
+        tg.send_message(
+            chat_id,
+            mdv2_escape(
+                f"🛡️ I couldn't use that as feedback — it looked like a {reason}. "
+                "No worries, the job is still skipped. Try a plain reason next time "
+                "(role/stack/location/seniority)."
+            ),
+            reply_markup=REPLY_KEYBOARD,
+        )
+        log.info("skip-reason rejected by safety_check for chat %s: %s (method=%s)",
+                 chat_id, reason, verdict.get("method"))
+        return
+
+    # Hand off to the sibling-agent module. Imported lazily so this file
+    # stays importable even when skip_feedback isn't on disk yet.
+    summary_text = ""
+    added_lists: dict = {}
+    err: Exception | None = None
+    try:
+        import skip_feedback  # noqa: WPS433 — intentional lazy import
+        result = skip_feedback.apply_skip_feedback(db, chat_id, payload, text) or {}
+        if not isinstance(result, dict):
+            result = {}
+        summary_text = str(result.get("summary") or "").strip()
+        added_lists = {
+            k: v for k, v in result.items() if k.startswith("added_")
+        }
+    except Exception as e:  # pragma: no cover — defensive
+        err = e
+        log.exception("apply_skip_feedback failed for chat=%s", chat_id)
+
+    db.set_awaiting_state(chat_id, None)
+
+    if err is not None:
+        tg.send_message(
+            chat_id,
+            mdv2_escape(
+                "Thanks — I noted that. (Couldn't update your profile from it "
+                "automatically, but the job is still skipped.)"
+            ),
+            reply_markup=REPLY_KEYBOARD,
+        )
+    else:
+        body = "✅ " + (summary_text or "Got it — feedback recorded.")
+        tg.send_message(chat_id, mdv2_escape(body), reply_markup=REPLY_KEYBOARD)
+
+    try:
+        import forensic as _forensic
+        _forensic.log_step(
+            "bot.skip_reason_received",
+            input={
+                "chat_id": chat_id,
+                "job_id": payload.get("job_id"),
+                "reason_chars": len(text or ""),
+            },
+            output={
+                "summary": summary_text,
+                "added_lists": added_lists,
+                "error": str(err) if err else None,
+            },
+            chat_id=chat_id if isinstance(chat_id, int) else None,
+        )
+    except Exception:
+        pass
+
+
 def _send_applied_list(tg: TelegramClient, db: DB, chat_id: int) -> None:
     rows = db.applied_jobs(chat_id)
     if not rows:
@@ -1214,11 +1531,67 @@ def handle_callback(tg: TelegramClient, db: DB, cb: dict) -> None:
     message = cb.get("message") or {}
     chat_id = message.get("chat", {}).get("id")
     msg_id = message.get("message_id")
+    # Inner error_capture so callback-path bugs are fingerprinted under
+    # `where='handle_callback'` rather than the broader `bot._dispatch`.
+    # Re-raises after recording — outer _dispatch wrap keeps the bot alive.
+    _store = _get_store(db)
+    with error_capture(
+        _store,
+        where="handle_callback",
+        chat_id=chat_id,
+        alert_sink=lambda env, _tg=tg, _s=_store: _ops_deliver_alert(_tg, _s, env),
+    ):
+        return _handle_callback_inner(tg, db, cb, cb_id, data, message, chat_id, msg_id)
+
+
+def _handle_callback_inner(
+    tg: TelegramClient, db: DB, cb: dict, cb_id, data, message, chat_id, msg_id,
+) -> None:
     if not chat_id or not msg_id or ":" not in data:
         tg.answer_callback(cb_id, "Invalid button.")
         return
 
     kind, payload = data.split(":", 1)
+
+    # Explicit Skip button under the "Why didn't this fit?" prompt. Handle
+    # BEFORE the stale-prompt guard so we can send the user a confirmation
+    # toast + delete the prompt rather than just silently clearing state.
+    if kind == "sr" and payload == "skip":
+        try:
+            db.set_awaiting_state(chat_id, None)
+        except Exception:
+            pass
+        try:
+            tg.delete_message(chat_id, msg_id)
+        except Exception:
+            log.debug("sr:skip — delete_message failed; continuing", exc_info=True)
+        try:
+            tg.answer_callback(cb_id, "Got it, no feedback recorded.")
+        except Exception:
+            pass
+        try:
+            import forensic as _forensic
+            _forensic.log_step(
+                "bot.skip_reason_received",
+                input={"chat_id": chat_id, "via": "skip_button"},
+                output={"action": "user_canceled_via_button"},
+                chat_id=chat_id,
+            )
+        except Exception:
+            pass
+        return
+
+    # Stale-prompt guard for the skip-reason flow: if the user is parked in
+    # STATE_AWAITING_SKIP_REASON and now taps another inline button (a job
+    # action, settings, etc.) instead of typing a reason, treat that as an
+    # implicit cancel and continue with the action they did press. Mirrors
+    # the wizard escape pattern in _dispatch.
+    try:
+        if db.get_awaiting_state(chat_id) == STATE_AWAITING_SKIP_REASON:
+            db.set_awaiting_state(chat_id, None)
+    except Exception:
+        # Reading awaiting_state should never break callback handling.
+        pass
 
     # Onboarding wizard callbacks — delegate to the onboarding module. The
     # wizard owns its own state machine; this bot just forwards the button
@@ -1288,6 +1661,17 @@ def handle_callback(tg: TelegramClient, db: DB, cb: dict) -> None:
         _cancel_clean_data(tg, cb, chat_id, msg_id)
         return
 
+    # Digest-header filter buttons (`flt:lwr:<run>:<floor>` and `flt:rse:<floor>`).
+    # ⬇ "Lower" replays cached jobs at exactly the new floor for the same run
+    #   and persists the new floor onto the user's profile for future digests.
+    # ⬆ "Raise" only updates the profile floor — past digest contents are
+    #   already on the chat and not retroactively trimmed (Telegram doesn't
+    #   support deleting other people's messages, but more importantly the
+    #   user might still want to scroll back through them).
+    if kind == "flt":
+        _handle_filter_button(tg, db, cb, chat_id, msg_id, payload)
+        return
+
     job_id = payload
     row = db.get_job(job_id)
     job = _row_to_job(row)
@@ -1311,12 +1695,122 @@ def handle_callback(tg: TelegramClient, db: DB, cb: dict) -> None:
         tg.answer_callback(cb_id, "Marked as applied ✅")
 
     elif kind == "n":  # not applied / skipped
+        # We always persist the "skipped" status FIRST — that write is what
+        # keeps the job from re-appearing in tomorrow's digest via
+        # JobStore.filter_new_for(). Whatever happens to the message in the
+        # UI after that is purely cosmetic.
+        #
+        # UX split based on whether the skip-reason capture flow is on:
+        #
+        #  • SKIP_FEEDBACK_ENABLED=1 → MORPH the job card into the
+        #    "Why didn't this fit?" prompt in place. No new message; the
+        #    chat order stays stable and the user reads the question
+        #    exactly where the offending card was. The existing `sr:skip`
+        #    handler deletes this same message_id when the user opts out,
+        #    so the card disappears either way.
+        #
+        #  • SKIP_FEEDBACK_ENABLED unset → no question to ask, so just
+        #    DELETE the card (default) or fall back to the strikethrough
+        #    keyboard when deletion is blocked (>48h, SKIP_DELETES_MESSAGE=0).
         db.set_application_status(chat_id, job_id, "skipped")
+
+        morphed = False
+        deleted = False
+        reason = "edit_fallback"
+        feedback_on = _skip_feedback_enabled()
+
+        if feedback_on:
+            payload = {
+                "job_id": job_id,
+                "title": job.title or "",
+                "company": job.company or "",
+                "source": job.source or "",
+                "url": job.url or "",
+                "snippet": (job.snippet or "")[:600],
+            }
+            try:
+                db.set_awaiting_state(chat_id, STATE_AWAITING_SKIP_REASON, payload)
+            except Exception as e:
+                log.warning("set_awaiting_state failed: %s", e)
+                feedback_on = False  # treat as disabled — no prompt to render
+
+        if feedback_on:
+            try:
+                tg.edit_message_text(
+                    chat_id, msg_id,
+                    SKIP_REASON_PROMPT_MDV2,
+                    reply_markup=SKIP_REASON_INLINE_KB,
+                )
+                morphed = True
+                reason = "morphed_in_place"
+            except Exception as e:
+                # Edit failed (e.g. message too old, or test fake without
+                # edit_message_text). Fall back to legacy: send the prompt
+                # as a NEW message and delete the card. State is already
+                # set, so the next text reply still routes to the
+                # skip-reason handler.
+                log.debug("skip-reason morph failed; sending as new message: %s", e)
+                try:
+                    tg.send_message(
+                        chat_id,
+                        SKIP_REASON_PROMPT_MDV2,
+                        reply_markup=SKIP_REASON_INLINE_KB,
+                    )
+                except Exception as e2:
+                    log.warning("skip-reason new-message fallback also failed: %s", e2)
+                    try:
+                        db.set_awaiting_state(chat_id, None)
+                    except Exception:
+                        pass
+
+            try:
+                import forensic as _forensic
+                _forensic.log_step(
+                    "bot.skip_reason_prompted",
+                    input={
+                        "chat_id": chat_id,
+                        "job_id": job_id,
+                        "title": (job.title or ""),
+                        "source": (job.source or ""),
+                        "via": "card_morph" if morphed else "new_message",
+                    },
+                    chat_id=chat_id if isinstance(chat_id, int) else None,
+                )
+            except Exception:
+                pass
+
+        if not morphed:
+            delete_enabled = os.environ.get("SKIP_DELETES_MESSAGE", "1") not in ("0", "false", "False", "")
+            if delete_enabled:
+                deleted = tg.delete_message(chat_id, msg_id)
+                reason = "ok" if deleted else "edit_fallback"
+            if not deleted:
+                try:
+                    tg.edit_reply_markup(
+                        chat_id, msg_id,
+                        job_keyboard(job_id, applied_status="skipped", url=job.url or None),
+                    )
+                except Exception as e:
+                    log.warning("edit markup failed: %s", e)
+
         try:
-            tg.edit_reply_markup(chat_id, msg_id, job_keyboard(job_id, applied_status="skipped", url=job.url or None))
-        except Exception as e:
-            log.warning("edit markup failed: %s", e)
-        tg.answer_callback(cb_id, "Hidden from future digests 🚫")
+            import forensic as _forensic
+            _forensic.log_step(
+                "bot.skip_message_deleted",
+                input={"chat_id": chat_id, "job_id": job_id, "message_id": msg_id},
+                output={"deleted": deleted, "morphed": morphed, "reason": reason},
+                chat_id=chat_id if isinstance(chat_id, int) else None,
+            )
+        except Exception:
+            pass
+
+        if morphed:
+            toast = "Tell me why?"
+        elif deleted:
+            toast = "✕ Removed"
+        else:
+            toast = "Hidden from future digests 🚫"
+        tg.answer_callback(cb_id, toast)
 
     elif kind == "fit":  # Analyze fit — evaluate alignment & gaps, no rewrite
         user = db.get_user(chat_id)
@@ -1374,6 +1868,21 @@ def handle_callback(tg: TelegramClient, db: DB, cb: dict) -> None:
 _RESEARCH_LOCKS: dict[int, threading.Lock] = {}
 _RESEARCH_LOCKS_GUARD = threading.Lock()
 
+# Global cap on concurrent /marketresearch runs ACROSS users. One run is 10
+# Opus workers + a manager — N parallel runs = N×11 Opus calls competing for
+# one Anthropic API key, which trips 429s and burns the operator's quota.
+# Default 2 (raise via env if you have headroom). Bounded so excess release()
+# raises rather than silently incrementing past the cap.
+_MAX_CONCURRENT_RESEARCH = max(1, int(os.environ.get("MAX_CONCURRENT_RESEARCH", "2")))
+_RESEARCH_GLOBAL_SEM = threading.BoundedSemaphore(_MAX_CONCURRENT_RESEARCH)
+
+# Per-user cooldown after a completed run. /marketresearch is expensive
+# (~$0.50–$1 surrogate per run, 25–40 min wall clock); a single user
+# triggering it on a loop drains the operator's budget. Default 1 hour.
+_RESEARCH_COOLDOWN_SECONDS = max(0, int(os.environ.get("RESEARCH_COOLDOWN_SECONDS", "3600")))
+_LAST_RESEARCH_FINISHED: dict[int, float] = {}
+_LAST_RESEARCH_LOCK = threading.Lock()
+
 
 def _research_lock(chat_id: int) -> threading.Lock:
     with _RESEARCH_LOCKS_GUARD:
@@ -1381,6 +1890,23 @@ def _research_lock(chat_id: int) -> threading.Lock:
         if lk is None:
             lk = _RESEARCH_LOCKS[chat_id] = threading.Lock()
         return lk
+
+
+def _research_cooldown_remaining(chat_id: int) -> int:
+    """Seconds until this user can run /marketresearch again. 0 = ready."""
+    if _RESEARCH_COOLDOWN_SECONDS <= 0:
+        return 0
+    with _LAST_RESEARCH_LOCK:
+        last = _LAST_RESEARCH_FINISHED.get(chat_id)
+    if not last:
+        return 0
+    elapsed = int(time.time() - last)
+    return max(0, _RESEARCH_COOLDOWN_SECONDS - elapsed)
+
+
+def _mark_research_finished(chat_id: int) -> None:
+    with _LAST_RESEARCH_LOCK:
+        _LAST_RESEARCH_FINISHED[chat_id] = time.time()
 
 
 def _has_real_profile(profile: dict | None) -> bool:
@@ -1513,12 +2039,41 @@ def _save_research_location_and_kick(
 
     db.set_awaiting_state(chat_id, None)
 
+    # Per-user cooldown gate. Same user can't burn /marketresearch back-to-back.
+    cooldown_left = _research_cooldown_remaining(chat_id)
+    if cooldown_left > 0:
+        mins = (cooldown_left + 59) // 60
+        tg.send_message(
+            chat_id,
+            mdv2_escape(
+                f"⏳ /marketresearch is rate-limited per user. Try again in "
+                f"~{mins} minute(s). One run is 10 Opus subagents — the cap "
+                "keeps the operator's API budget intact."
+            ),
+            reply_markup=REPLY_KEYBOARD,
+        )
+        return
+
     lock = _research_lock(chat_id)
     if not lock.acquire(blocking=False):
         tg.send_message(
             chat_id,
             mdv2_escape(
                 "⏳ A research run is already in progress — check back in ~25-40 min."
+            ),
+            reply_markup=REPLY_KEYBOARD,
+        )
+        return
+
+    # Global concurrent-run cap across ALL users. Protects the operator's
+    # single Anthropic API key from 10*N parallel Opus calls.
+    if not _RESEARCH_GLOBAL_SEM.acquire(blocking=False):
+        lock.release()
+        tg.send_message(
+            chat_id,
+            mdv2_escape(
+                f"⏳ {_MAX_CONCURRENT_RESEARCH} research runs are already "
+                "active across users. Try again in ~25-40 minutes."
             ),
             reply_markup=REPLY_KEYBOARD,
         )
@@ -1537,6 +2092,10 @@ def _save_research_location_and_kick(
     except Exception:
         log.exception("market_research: placeholder send failed for chat=%s", chat_id)
         lock.release()
+        try:
+            _RESEARCH_GLOBAL_SEM.release()
+        except ValueError:
+            pass
         return
 
     threading.Thread(
@@ -1803,6 +2362,14 @@ def _run_market_research_work(
             lock.release()
         except Exception:
             pass
+        # Release the global concurrency slot so the next queued user can run.
+        # BoundedSemaphore.release() raises ValueError on excess release —
+        # swallow defensively so a buggy caller never crashes the worker.
+        try:
+            _RESEARCH_GLOBAL_SEM.release()
+        except ValueError:
+            pass
+        _mark_research_finished(chat_id)
 
 
 # ---------- fit-analysis helpers ----------
@@ -2131,11 +2698,30 @@ def main() -> int:
             time.sleep(5)
             continue
 
+        store = _get_store(db)
         for upd in updates:
             offset = upd["update_id"] + 1
+            # Extract chat_id best-effort for the alert envelope; tolerate any
+            # update shape (callback_query, message, edited_message).
             try:
-                _dispatch(tg, db, upd)
+                upd_chat_id = (
+                    (upd.get("callback_query") or {}).get("message", {}).get("chat", {}).get("id")
+                    or (upd.get("message") or {}).get("chat", {}).get("id")
+                    or (upd.get("edited_message") or {}).get("chat", {}).get("id")
+                )
             except Exception:
+                upd_chat_id = None
+            try:
+                with error_capture(
+                    store,
+                    where="bot._dispatch",
+                    chat_id=upd_chat_id,
+                    alert_sink=lambda env, _tg=tg, _store=store: _ops_deliver_alert(_tg, _store, env),
+                ):
+                    _dispatch(tg, db, upd)
+            except Exception:
+                # error_capture already recorded + alerted; this just keeps the
+                # main loop alive (mirrors prior behavior).
                 log.exception("update handler crashed; continuing")
 
     log.info("Bot stopped cleanly.")
@@ -2164,13 +2750,24 @@ def _dispatch(tg: TelegramClient, db: DB, upd: dict) -> None:
     # button and the legacy "✖️ Cancel" label to avoid stranding users on
     # cached keyboards.
     if text == BTN_CANCEL or _LEGACY_BUTTONS.get(text) == "cancel":
-        if db.get_awaiting_state(chat_id):
+        prior_state = db.get_awaiting_state(chat_id)
+        if prior_state:
             db.set_awaiting_state(chat_id, None)
-            tg.send_message(
-                chat_id,
-                f"{PIG}  " + mdv2_escape("Cancelled."),
-                reply_markup=REPLY_KEYBOARD,
-            )
+            # Skip-reason has its own copy ("no feedback recorded") — the
+            # generic "Cancelled." is too cold for a flow we just nudged
+            # the user into. Other states keep the existing message.
+            if prior_state == STATE_AWAITING_SKIP_REASON:
+                tg.send_message(
+                    chat_id,
+                    mdv2_escape("Got it, no feedback recorded."),
+                    reply_markup=REPLY_KEYBOARD,
+                )
+            else:
+                tg.send_message(
+                    chat_id,
+                    f"{PIG}  " + mdv2_escape("Cancelled."),
+                    reply_markup=REPLY_KEYBOARD,
+                )
         else:
             tg.send_message(
                 chat_id,
@@ -2221,6 +2818,19 @@ def _dispatch(tg: TelegramClient, db: DB, upd: dict) -> None:
             # …fall through to normal dispatch below.
         else:
             _save_research_location_and_kick(tg, db, chat_id, text)
+            return
+    elif state == STATE_AWAITING_SKIP_REASON:
+        # Stale-prompt guard mirroring the prefs/research escape: any main-menu
+        # button or slash-command silently cancels the awaiting-skip-reason
+        # state and lets the regular dispatcher handle whatever the user did
+        # ask for. Cancel button was already handled above (BTN_CANCEL).
+        escape_labels = {BTN_CHECK_NOW, BTN_MY_APPS, BTN_PROFILE,
+                         BTN_RESEARCH, BTN_SETTINGS} | set(_LEGACY_BUTTONS.keys())
+        if text in escape_labels or text.startswith("/"):
+            db.set_awaiting_state(chat_id, None)
+            # …fall through to normal dispatch below.
+        else:
+            _handle_skip_reason_text(tg, db, chat_id, text)
             return
 
     # --- NEW REPLY-KEYBOARD BUTTONS ---

@@ -8,19 +8,14 @@ LinkedIn's `guest_jobs` endpoint returns search results without requiring auth:
 Each card is an <li class="result-card">. We parse the first page only and rely
 on LinkedIn's `f_TPR=r86400` (past-24h) filter to keep things fresh.
 
-Two entry points:
-  - `fetch(filters)`: global single-query path, reads `filters["linkedin"]`
-    from config/filters.yaml. This runs once per pipeline pass and produces
-    the baseline LinkedIn results shared across all users.
-  - `fetch_for_user(filters, user_seeds)`: per-user path — runs up to 3
-    queries from `user_seeds["queries"]` (derived from the user's profile),
-    dedupes by URL, caps at `max_per_source`. Falls back to `fetch(filters)`
-    when `user_seeds` is empty, so users without LinkedIn seeds still get
-    the global pass.
+Single entry point: `fetch_for_user(filters, user_seeds)` — per-user path that
+runs up to 3 queries from `user_seeds["queries"]` (derived from the profile),
+dedupes by URL, caps at `max_per_source`. Returns [] when the profile has no
+LinkedIn seeds (no global fallback — there's no shared default query).
 
 NOTE: LinkedIn's TOS prohibits automated scraping. Use this only for personal,
-low-volume, non-commercial purposes, and don't hammer the endpoint. Disabled
-by default in config/filters.yaml.
+low-volume, non-commercial purposes, and don't hammer the endpoint. Toggle
+via `defaults.DEFAULTS["sources"]["linkedin"]`.
 """
 from __future__ import annotations
 
@@ -32,6 +27,7 @@ from bs4 import BeautifulSoup
 
 from dedupe import Job
 from text_utils import fix_mojibake
+import forensic
 
 log = logging.getLogger(__name__)
 
@@ -53,17 +49,6 @@ MAX_USER_QUERIES = 3
 # Polite pause between back-to-back LinkedIn requests. Kept as a named
 # constant so tests can monkeypatch it.
 PACE_SECONDS = 1.5
-
-
-def _passes(text: str, filters: dict) -> bool:
-    t = (text or "").lower()
-    req = [k.lower() for k in (filters.get("required_keywords") or []) if k]
-    if any(k not in t for k in req):
-        return False
-    excl = [k.lower() for k in (filters.get("exclude_keywords") or []) if k]
-    if any(k in t for k in excl):
-        return False
-    return True
 
 
 def _one_search(
@@ -95,25 +80,39 @@ def _one_search(
         "f_TPR": f_TPR or "r86400",
         "start": 0,
     }
-    # Remote preference → LinkedIn's `f_WT=2` filter. Accept "require"
-    # (config/filters.yaml) and "remote" (profile enum) so both call sites
-    # map to the same LinkedIn parameter.
+    # Remote preference → LinkedIn's `f_WT=2` filter. Accepts "remote" from
+    # the profile enum (and the legacy "require" alias for safety).
     if (remote or "").lower() in ("require", "remote"):
         params["f_WT"] = "2"
 
     out: list[Job] = []
+    status_code = None
+    cards_count = 0
+    err_payload = None
+    body_head = None
+    rate_limited = False
     try:
         resp = requests.get(SEARCH, params=params, headers=UA, timeout=20)
+        status_code = resp.status_code
         if resp.status_code == 429:
             log.warning("linkedin: rate-limited (429) on q=%r, skipping", q)
-            # Surface the 429 through an empty return — caller sees zero
-            # and, if it's running multiple queries, should probably stop
-            # early. We raise a sentinel instead of returning [] so the
-            # caller can distinguish "rate-limited" from "no results".
+            rate_limited = True
+            body_head = (resp.text or "")[:300]
+            forensic.log_step(
+                "linkedin._one_search",
+                input={"q": q, "geo": geo, "f_TPR": f_TPR, "remote": remote},
+                output={
+                    "status_code": status_code,
+                    "rate_limited": True,
+                    "body_head": body_head,
+                    "count": 0,
+                },
+            )
             raise _RateLimited()
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
         cards = soup.select("li") or soup.select("div.base-card")
+        cards_count = len(cards)
         for card in cards:
             if len(out) >= cap_remaining:
                 break
@@ -129,9 +128,7 @@ def _one_search(
             title = (title_el.get_text(strip=True) if title_el else a.get_text(strip=True))
             company = company_el.get_text(strip=True) if company_el else ""
             location = loc_el.get_text(strip=True) if loc_el else ""
-            blob = " ".join([title, company, location])
-            if not _passes(blob, filters):
-                continue
+            # No pre-filter — AI scoring downstream is the sole matching gate.
             seen_urls.add(url)
             out.append(Job(
                 source="linkedin",
@@ -143,51 +140,33 @@ def _one_search(
                 posted_at="",
                 snippet="",
             ))
+        # Capture body head when 200 but ZERO results — strong signal for
+        # selector rot or an empty search. Cheap to log on a per-query basis.
+        if not out and resp.text:
+            body_head = (resp.text or "")[:500]
     except _RateLimited:
         raise
     except requests.RequestException as e:
         log.error("linkedin fetch failed (q=%r): %s", q, e)
+        err_payload = {"class": type(e).__name__, "message": str(e)[:300]}
+    if not rate_limited:
+        forensic.log_step(
+            "linkedin._one_search",
+            input={"q": q, "geo": geo, "f_TPR": f_TPR, "remote": remote, "cap_remaining": cap_remaining},
+            output={
+                "status_code": status_code,
+                "cards_seen": cards_count,
+                "count": len(out),
+                "sample_titles": [j.title[:80] for j in out[:3]],
+                "body_head_on_zero": body_head,
+            },
+            error=err_payload,
+        )
     return out
 
 
 class _RateLimited(Exception):
     """Sentinel: LinkedIn returned 429 for this request."""
-
-
-def fetch(filters: dict) -> list[Job]:
-    """Global single-query fetch — reads `filters["linkedin"]` (q/geo/f_TPR).
-
-    This is the baseline LinkedIn pass that runs once per pipeline run and
-    feeds every user. Per-user queries are run separately via
-    `fetch_for_user` using each profile's stored seeds.
-    """
-    cfg = filters.get("linkedin") or {}
-    q = cfg.get("q") or ""
-    geo = cfg.get("geo") or ""
-    f_TPR = cfg.get("f_TPR") or "r86400"
-    if not q:
-        log.info("linkedin: no query configured, skipping")
-        return []
-
-    cap = int(filters.get("max_per_source") or 10)
-    seen_urls: set[str] = set()
-    try:
-        jobs = _one_search(
-            q=q,
-            geo=geo,
-            f_TPR=f_TPR,
-            remote=str(filters.get("remote") or ""),
-            cap_remaining=cap,
-            filters=filters,
-            seen_urls=seen_urls,
-        )
-    except _RateLimited:
-        return []
-    # Keep the polite pause even for the single-query path so callers that
-    # invoke both fetch() and another adapter in quick succession don't
-    # hammer LinkedIn with a second unrelated request immediately.
-    time.sleep(PACE_SECONDS)
-    return jobs
 
 
 def fetch_for_user(filters: dict, user_seeds: dict | None) -> list[Job]:
@@ -209,9 +188,9 @@ def fetch_for_user(filters: dict, user_seeds: dict | None) -> list[Job]:
       * stop early on rate-limit so we don't burn the next query slot for
         nothing.
 
-    If `user_seeds` is None / missing / has no usable queries, we fall back
-    to the single-query global `fetch(filters)` path so users without a
-    built profile still get LinkedIn results.
+    If `user_seeds` is None / missing / has no usable queries, returns []
+    — there's no global default query to fall back to. Users get LinkedIn
+    results only after the Opus profile builder has produced search seeds.
     """
     queries = []
     if isinstance(user_seeds, dict):
@@ -230,8 +209,8 @@ def fetch_for_user(filters: dict, user_seeds: dict | None) -> list[Job]:
                 })
 
     if not queries:
-        log.debug("linkedin: no user_seeds provided, falling back to global fetch()")
-        return fetch(filters)
+        log.debug("linkedin: no user_seeds provided, returning []")
+        return []
 
     cap = int(filters.get("max_per_source") or 10)
     remote = str(filters.get("remote") or "")

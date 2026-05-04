@@ -172,8 +172,8 @@ def _job_haystack(j: Job) -> str:
 # ---------------------------------------------------------------------------
 # The profile carries a rich structure (keyword clusters, per-source search
 # seeds, ideal-fit paragraph, …) but for filter-evaluation purposes we only
-# care about the projection onto the flat slot names used by filters.yaml
-# and the post-filter gate. This projection is intentionally conservative:
+# care about the projection onto a flat slot dict (the legacy filters.yaml
+# field names) consumed by the post-filter gate. This projection is conservative:
 # we never invent a constraint the user didn't state.
 
 def project_to_prefs(profile: dict[str, Any] | None) -> dict[str, Any]:
