@@ -5,13 +5,16 @@ LinkedIn's `guest_jobs` endpoint returns search results without requiring auth:
     https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search
         ?keywords=...&location=...&f_TPR=r86400&start=0
 
-Each card is an <li class="result-card">. We parse the first page only and rely
-on LinkedIn's `f_TPR=r86400` (past-24h) filter to keep things fresh.
+Each card is an <li class="result-card">. We rely on LinkedIn's `f_TPR=r86400`
+(past-24h) filter to keep things fresh, and walk a small page sequence
+(start=0, then 10, 25) per query when page 1 doesn't fill the per-query budget.
 
 Single entry point: `fetch_for_user(filters, user_seeds)` — per-user path that
-runs up to 3 queries from `user_seeds["queries"]` (derived from the profile),
-dedupes by URL, caps at `max_per_source`. Returns [] when the profile has no
-LinkedIn seeds (no global fallback — there's no shared default query).
+runs up to `MAX_USER_QUERIES` (3) queries from `user_seeds["queries"]`. Each
+query gets its OWN budget of `PER_QUERY_CAP` postings (no shared total cap —
+that legacy behavior starved later queries). Queries are reordered via
+`_diversify_geo` so consecutive ones hit distinct geos. Dedupes by URL across
+queries AND pages. Returns [] when the profile has no LinkedIn seeds.
 
 NOTE: LinkedIn's TOS prohibits automated scraping. Use this only for personal,
 low-volume, non-commercial purposes, and don't hammer the endpoint. Toggle
@@ -42,9 +45,25 @@ UA = {
 SEARCH = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
 
 # Cap the number of per-user queries we'll run in one pass. LinkedIn is
-# rate-sensitive, and the profile schema already limits the builder to 3
-# entries — we enforce it here too in case the profile JSON was hand-edited.
-MAX_USER_QUERIES = 3
+# rate-sensitive; we enforce a hard cap here so a hand-edited profile
+# can't run away. 5 queries × 3 pages = 15 HTTP requests per user — still
+# well under LinkedIn's anonymous rate limit when paced.
+MAX_USER_QUERIES = 5
+
+# Per-query cap: each profile query runs independently up to this many
+# postings. Total jobs returned by `fetch_for_user` is bounded by
+# `MAX_USER_QUERIES * PER_QUERY_CAP`, NOT a single shared `max_per_source`
+# ceiling — that legacy behavior caused query 1 to saturate the budget and
+# starve queries 2..N (e.g. "frontend Spain" took the whole 12, "vue Germany"
+# never executed). Setting it to 10 matches the LinkedIn page size so a
+# single page per query fills it; pagination kicks in only when fewer than
+# this many results come back from page 1.
+PER_QUERY_CAP = 30
+
+# How many additional pages to try per query when page 1 is short of
+# `PER_QUERY_CAP`. LinkedIn returns 25 cards per page, so 2 extra pages
+# yields up to 75 candidates per query while keeping request count modest.
+PAGINATION_STARTS = (10, 25)
 
 # Polite pause between back-to-back LinkedIn requests. Kept as a named
 # constant so tests can monkeypatch it.
@@ -60,6 +79,7 @@ def _one_search(
     cap_remaining: int,
     filters: dict,
     seen_urls: set[str],
+    start: int = 0,
 ) -> list[Job]:
     """Run ONE LinkedIn search page and parse it into Job records.
 
@@ -70,6 +90,8 @@ def _one_search(
     `cap_remaining` is how many MORE jobs we're allowed to emit; the caller
     tracks the running total across queries. Callers also pass in the
     `seen_urls` set so duplicates across queries collapse in one place.
+
+    `start` is the LinkedIn paging offset (0, 10, 25, ...). Page 1 = 0.
     """
     if cap_remaining <= 0 or not q:
         return []
@@ -78,7 +100,7 @@ def _one_search(
         "keywords": q,
         "location": geo or "",
         "f_TPR": f_TPR or "r86400",
-        "start": 0,
+        "start": int(start),
     }
     # Remote preference → LinkedIn's `f_WT=2` filter. Accepts "remote" from
     # the profile enum (and the legacy "require" alias for safety).
@@ -169,6 +191,33 @@ class _RateLimited(Exception):
     """Sentinel: LinkedIn returned 429 for this request."""
 
 
+def _diversify_geo(queries: list[dict]) -> list[dict]:
+    """Reorder queries so consecutive entries hit different `geo` values.
+
+    The previous ordering sometimes ran two queries against the same geo
+    back-to-back (e.g. Spain frontend Q1, Spain remote Q2), which deduped
+    heavily and starved the Q3 geo. We greedy-pick each next query so its
+    geo differs from the one just chosen — preserving the original order
+    among queries with the same geo, but interleaving across distinct geos.
+    """
+    if len(queries) <= 1:
+        return list(queries)
+    remaining = list(queries)
+    out: list[dict] = []
+    last_geo: str | None = None
+    while remaining:
+        # Prefer a query whose geo differs from `last_geo`; fall back to the
+        # head of the list if every remaining entry shares the same geo.
+        pick_idx = next(
+            (i for i, q in enumerate(remaining) if q.get("geo") != last_geo),
+            0,
+        )
+        chosen = remaining.pop(pick_idx)
+        out.append(chosen)
+        last_geo = chosen.get("geo")
+    return out
+
+
 def fetch_for_user(filters: dict, user_seeds: dict | None) -> list[Job]:
     """Per-user LinkedIn fetch — runs up to 3 queries shaped by the profile.
 
@@ -176,23 +225,28 @@ def fetch_for_user(filters: dict, user_seeds: dict | None) -> list[Job]:
 
         {"queries": [{"q": "...", "geo": "...", "f_TPR": "r86400"}, ...]}
 
-    For each query we run one LinkedIn search page, collect matching cards,
-    and fold them into the combined result. We:
+    For each query we run a small page sequence, collect matching cards,
+    and fold them into the combined result. Behavior:
 
       * enforce a hard cap of `MAX_USER_QUERIES` (3) queries;
-      * cap the TOTAL postings across all queries at `filters['max_per_source']`
-        — not per query — so a high-volume primary query doesn't starve the
-        secondary ones AND an overeager seed set can't balloon the digest;
-      * dedupe on URL across queries;
+      * each query gets its OWN budget of `PER_QUERY_CAP` postings — no
+        shared total cap. Q1 saturating the budget no longer starves Q2/Q3;
+      * if page 1 returns fewer than `PER_QUERY_CAP` unique results, walk
+        `PAGINATION_STARTS` (start=10, then start=25) until the budget fills
+        or LinkedIn runs out of results;
+      * `_diversify_geo` reorders queries so the i-th query's geo differs
+        from the (i-1)-th when possible — keeps each geo's first page fresh
+        (LinkedIn dedups same-geo searches heavily);
+      * dedupe on URL across queries AND pages;
       * sleep `PACE_SECONDS` between requests (but NOT after the final one);
-      * stop early on rate-limit so we don't burn the next query slot for
-        nothing.
+      * stop early on rate-limit — within a query we abort that query's
+        pagination; across queries we abort the whole batch.
 
     If `user_seeds` is None / missing / has no usable queries, returns []
     — there's no global default query to fall back to. Users get LinkedIn
     results only after the Opus profile builder has produced search seeds.
     """
-    queries = []
+    queries: list[dict] = []
     if isinstance(user_seeds, dict):
         raw_queries = user_seeds.get("queries") or []
         if isinstance(raw_queries, list):
@@ -212,35 +266,47 @@ def fetch_for_user(filters: dict, user_seeds: dict | None) -> list[Job]:
         log.debug("linkedin: no user_seeds provided, returning []")
         return []
 
-    cap = int(filters.get("max_per_source") or 10)
+    queries = _diversify_geo(queries)
     remote = str(filters.get("remote") or "")
     seen_urls: set[str] = set()
     combined: list[Job] = []
+    request_idx = 0
 
-    for idx, query in enumerate(queries):
-        remaining = cap - len(combined)
-        if remaining <= 0:
-            break
-        try:
-            batch = _one_search(
-                q=query["q"],
-                geo=query["geo"],
-                f_TPR=query["f_TPR"],
-                remote=remote,
-                cap_remaining=remaining,
-                filters=filters,
-                seen_urls=seen_urls,
+    for q_idx, query in enumerate(queries):
+        per_query_total = 0
+        # Page sequence: start=0 always, then PAGINATION_STARTS if budget
+        # not yet filled. Stops as soon as a page returns 0 (no more results).
+        for start in (0, *PAGINATION_STARTS):
+            remaining = PER_QUERY_CAP - per_query_total
+            if remaining <= 0:
+                break
+            if request_idx > 0:
+                time.sleep(PACE_SECONDS)
+            request_idx += 1
+            try:
+                batch = _one_search(
+                    q=query["q"],
+                    geo=query["geo"],
+                    f_TPR=query["f_TPR"],
+                    remote=remote,
+                    cap_remaining=remaining,
+                    filters=filters,
+                    seen_urls=seen_urls,
+                    start=start,
+                )
+            except _RateLimited:
+                log.warning("linkedin: rate-limited on query %d/%d (start=%d), aborting batch",
+                            q_idx + 1, len(queries), start)
+                return combined
+            combined.extend(batch)
+            per_query_total += len(batch)
+            log.info(
+                "linkedin[user]: query %d/%d %r @ %r start=%d → %d jobs (q-total %d, run-total %d)",
+                q_idx + 1, len(queries), query["q"], query["geo"],
+                start, len(batch), per_query_total, len(combined),
             )
-        except _RateLimited:
-            log.warning("linkedin: rate-limited on query %d/%d, stopping batch",
-                        idx + 1, len(queries))
-            break
-        combined.extend(batch)
-        log.info("linkedin[user]: query %d/%d %r @ %r → %d jobs (total %d)",
-                 idx + 1, len(queries), query["q"], query["geo"],
-                 len(batch), len(combined))
-        # Pace between requests, but not after the final one.
-        if idx + 1 < len(queries):
-            time.sleep(PACE_SECONDS)
+            # Empty page → no point trying further offsets for this query.
+            if not batch:
+                break
 
     return combined

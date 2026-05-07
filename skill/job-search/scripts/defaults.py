@@ -53,17 +53,16 @@ DEFAULTS: dict = {
         "builtin":           True,   # US-heavy tech HTML scrape
         "impactpool":        True,   # UN/NGO HTML — researcher-friendly
         "devex":             True,   # International dev — Claude CLI (paywall workaround)
+        "justjoinit":        True,   # Polish/CEE tech JSON API — frontend-heavy
+        "nofluffjobs":       True,   # Polish/CEE tech JSON API — salary-mandatory
     },
 
     # How many hours back to look. HN threads are softened ×30 internally.
     "max_age_hours":  48,
-    "max_per_source": 12,
-    # Bumped 40 → 120 after adding 5 new sources (reliefweb, euraxess,
-    # un_careers, math_ku_phd, ub_doctoral). Old 40-cap truncated user_pool
-    # before reliefweb/euraxess/linkedin reached the enrich step. With 8
-    # global + 1 per-user adapters at 12 each, 120 leaves headroom + the
-    # AI score gate is the actual filter.
-    "max_total":      120,
+    "max_per_source": 36,
+    # Headroom: 23 SOURCES × 36 + 90 linkedin + 36 web_search ≈ 954 ceiling.
+    # 1200 leaves room for adding 1-2 more sources before this needs another bump.
+    "max_total":      1200,
 
     # AI enrichment — single Haiku call per user per run scores every fetched
     # posting against resume + preferences. The sole matching gate.

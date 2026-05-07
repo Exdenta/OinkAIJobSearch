@@ -94,6 +94,157 @@ For each posting, you must:
      where role, stack, seniority, location/remote, AND language all line up.
      Do not inflate scores to be nice.
 
+     LOCATION PENALTY: after scoring on role/stack/seniority fit, if the
+     posting's effective location is OUTSIDE the candidate's stated
+     `locations` list, SUBTRACT 2 from the score (floor at 0). This is
+     a hard subtraction — apply it after the role/stack score is
+     decided, not as a vague consideration. Apply this BEFORE returning
+     the final score in the JSON.
+
+     Location matching rules:
+       - If `locations` is empty or contains "any" → no penalty.
+       - If the posting is fully remote AND the candidate's `remote` field
+         is "any" or "remote" → treat as matching, no penalty.
+       - Macro-regions in the candidate's `locations` cover countries:
+           "europe" / "eu" → all EU member states + UK + Norway +
+                              Switzerland + Iceland + Liechtenstein.
+           "emea"          → Europe + Middle East + Africa.
+           "north america" → US + Canada + Mexico.
+           "latam"         → Mexico + Central + South America.
+           "apac"          → Asia-Pacific.
+       - A country/city in the posting matches if it's listed verbatim in
+         `locations` OR if it falls under a macro-region listed there.
+       - Hybrid postings: use the office country. Onsite postings: use the
+         office city/country. Multi-country postings: match if ANY listed
+         office is inside the candidate's locations.
+
+     Examples:
+       - Candidate locations=["spain","europe","eu"], remote="any". Posting:
+         onsite London → London is in Europe → no penalty.
+       - Same candidate. Posting: onsite San Francisco, no remote → SF is
+         not in Europe/EU/Spain → SUBTRACT 2.
+       - Same candidate. Posting: fully remote, US-based company → remote
+         + candidate accepts remote → no penalty.
+       - Candidate locations=["bilbao","spain"], remote="onsite". Posting:
+         onsite Madrid → Madrid is in Spain → no penalty.
+       - Same candidate. Posting: onsite Berlin → Berlin not in
+         locations (no "europe"/"eu") → SUBTRACT 2.
+
+     LANGUAGE PENALTY (per-level CEFR gap): subtract 1 point per CEFR
+     level the candidate is BELOW the posting's required level for the
+     working language. Floor at 0.
+
+     CEFR ordering (numeric, for the gap math):
+       A1=1, A2=2, B1=3, B2=4, C1=5, C2=6, Native=7
+     gap = max(0, required_level - candidate_level)
+     subtract = gap   (so each level below the bar costs 1 point)
+
+     Identifying the REQUIRED language + level for a posting:
+       - Look at posting body/title: "all classes taught in French",
+         "fluency in German required", "C2-level Spanish", "must be
+         native-level Polish speaker", "Spanish-language working
+         environment", or the posting is itself written entirely in a
+         non-English language as the working language of the role.
+       - If the posting names a language but no explicit level:
+           * "fluent" / "fluency" / "native" / "near-native"  → C2
+           * "professional" / "professional working"          → C1
+           * "advanced"                                       → C1
+           * "working knowledge" / "conversational"           → B2
+           * "basic"                                          → A2
+           * If the posting is BODY-LANGUAGE in non-English (e.g. a
+             Spanish-language listing) → treat as C1 required for that
+             language.
+           * If posting only says "English required" with no level → C1.
+       - If posting is multilingual ("English OR French"): pick the
+         language with the SMALLEST gap for the candidate (best of).
+       - If posting language requirement is genuinely ambiguous, do not
+         apply the language penalty.
+
+     Identifying the candidate's LEVEL for that language:
+       - Read the resume's languages section / inline language mentions.
+         Recognise CEFR markers (A1/A2/B1/B2/C1/C2), as well as
+         "native", "bilingual", "fluent" (= C2), "professional"/"working
+         proficiency" (= C1), "intermediate" (= B1), "basic" (= A2),
+         and explicit certificate names (DELF C1, Goethe B2, etc.).
+       - The candidate's `language` field in preferences, if non-empty,
+         lists the language(s) they prefer to work in — assume C2 for
+         each unless the resume says otherwise.
+       - If the candidate did NOT list the required language at all,
+         treat their level as A1 (numeric 1).
+       - English: if the resume is written in English OR lists English
+         anywhere, assume at least B2 unless the resume's languages
+         section gives a higher explicit level.
+
+     Examples:
+       - Posting "All classes taught in French (C2 required)". Resume:
+         "French — A2". A2=2, C2=6 → gap=4 → SUBTRACT 4.
+       - Posting "fluent German required". Resume: "German — B1". Implied
+         level C2=6, candidate B1=3 → gap=3 → SUBTRACT 3.
+       - Posting "C1 English required". Resume: "English — C2".
+         C2≥C1 → gap=0 → no penalty.
+       - Spanish-language posting (no English mentioned). Resume lists
+         no Spanish at all → A1=1 vs implied C1=5 → gap=4 → SUBTRACT 4.
+       - Posting "English OR French at professional level". Candidate:
+         "English — C2, French — A2". English path: C2 vs C1 → gap=0;
+         French path: A2 vs C1 → gap=3. Take min = 0 → no penalty.
+       - Posting "native-level Polish". Resume has no Polish → A1=1
+         vs Native=7 → gap=6 → SUBTRACT 6 (floor at 0 still applies).
+
+     SENIORITY PENALTY (per-level gap above target): subtract 1 point
+     per seniority step the posting sits ABOVE the candidate's target
+     level. Floor at 0. One-directional — postings BELOW the candidate's
+     target (e.g. an intern posting for a mid candidate) are not
+     penalized here (they may still earn 0 elsewhere via role mismatch).
+
+     Seniority ordering (numeric, for the gap math):
+       intern/internship       = 0
+       junior / entry-level    = 1
+       associate               = 2
+       mid / middle / regular  = 3
+       senior                  = 4
+       lead / staff            = 5
+       principal               = 6
+       director                = 7
+       vp / head / chief / c-level = 8
+     gap = max(0, posting_level - candidate_target_level)
+     subtract = gap
+
+     Identifying the candidate's TARGET level:
+       - Read `target_levels` from the preferences block. If it lists
+         multiple, take the HIGHEST listed (e.g. ["mid","middle"] → 3).
+       - If empty or "any" → no penalty.
+
+     Identifying the posting's seniority level:
+       - Title prefix is the strongest signal: "Senior Frontend" → 4,
+         "Staff Engineer" → 5, "Principal Engineer" → 6, "Lead Frontend"
+         → 5, "Director of Engineering" → 7, "VP Engineering" → 8.
+       - "Junior" / "Entry" / "Associate" titles map per the table.
+       - If title has no seniority prefix and the body says "5+ years
+         required" → senior (4); "3-5 years" → mid (3); "8+" → staff/
+         lead (5); "10+" / "principal" → 6.
+       - If posting genuinely doesn't signal level (no title prefix,
+         no years requirement, no level callout) → assume mid (3) and
+         apply no penalty if candidate target ≥ mid.
+
+     Examples:
+       - Candidate target=mid (3). Posting "Senior Frontend Engineer"
+         → senior=4 → gap=1 → SUBTRACT 1.
+       - Candidate target=mid (3). Posting "Staff Software Engineer"
+         → staff=5 → gap=2 → SUBTRACT 2.
+       - Candidate target=mid (3). Posting "Principal Engineer"
+         → principal=6 → gap=3 → SUBTRACT 3.
+       - Candidate target=mid (3). Posting "Frontend Developer
+         (3-5 years)" → mid=3 → gap=0 → no penalty.
+       - Candidate target=mid (3). Posting "Junior React Developer"
+         → junior=1 → gap=0 (one-directional, below target ignored).
+       - Candidate target=senior (4). Posting "Staff Engineer"
+         → staff=5 → gap=1 → SUBTRACT 1.
+
+     Order of application: role/stack score → LOCATION PENALTY (-2 if
+     location off) → LANGUAGE PENALTY (-1 per CEFR level gap) →
+     SENIORITY PENALTY (-1 per level above target) → final score
+     (floor at 0, ceiling at 5).
+
   2. Write `why_match`: ONE or TWO sentences, max 240 chars, that name
      specific overlaps with this candidate's resume AND preferences (e.g.
      "React + TS + Storybook overlap; Bilbao remote-friendly, matches

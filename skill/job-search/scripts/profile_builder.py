@@ -84,8 +84,8 @@ _MAX_RESUME_CHARS = 8000   # the resume fed into the prompt is clipped
 _MAX_TITLE_TOKEN = 40
 _MAX_LINKEDIN_Q = 80
 _MAX_SEED_PHRASE = 120
-_MAX_LINKEDIN_QUERIES = 3
-_MAX_SEED_PHRASES = 8
+_MAX_LINKEDIN_QUERIES = 5
+_MAX_SEED_PHRASES = 12
 
 # Location of the external prompt file.
 _PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "profile_builder.txt"
