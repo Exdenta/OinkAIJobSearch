@@ -157,23 +157,6 @@ CREATE TABLE IF NOT EXISTS digest_run_jobs (
     recorded_at     REAL    NOT NULL,
     PRIMARY KEY (chat_id, run_id, job_id)
 );
--- Per-user source health. Counts consecutive runs where a source
--- contributed >0 postings but ALL of them scored 0 in AI enrichment.
--- Three strikes → `disabled_at` is stamped and the per-user filter in
--- search_jobs.py drops that source's postings before enrichment on
--- future runs (cheaper than re-scoring known dead weight). A non-zero
--- score on any future hit clears the streak; the row stays so the
--- operator can audit the history. Manually re-enable via
--- `clear_source_strike(chat_id, source_key)`.
-CREATE TABLE IF NOT EXISTS user_source_strikes (
-    chat_id     INTEGER NOT NULL,
-    source_key  TEXT    NOT NULL,
-    miss_streak INTEGER NOT NULL DEFAULT 0,
-    disabled_at REAL,
-    last_run_id INTEGER,
-    updated_at  REAL    NOT NULL,
-    PRIMARY KEY (chat_id, source_key)
-);
 CREATE INDEX IF NOT EXISTS idx_app_status ON applications(chat_id, status);
 CREATE INDEX IF NOT EXISTS idx_sent_job ON sent_messages(chat_id, job_id);
 CREATE INDEX IF NOT EXISTS idx_profile_builds_chat ON profile_builds(chat_id, built_at DESC);
@@ -948,106 +931,6 @@ class DB:
                 (chat_id, job_id),
             ).fetchone()
             return row is not None
-
-    # ---------- user_source_strikes (auto-disable dead-weight sources per user) ----------
-
-    def get_disabled_sources(self, chat_id: int) -> set[str]:
-        """Return source_keys auto-disabled for this user (3+ zero-score runs)."""
-        with self._conn() as c:
-            rows = c.execute(
-                "SELECT source_key FROM user_source_strikes "
-                "WHERE chat_id = ? AND disabled_at IS NOT NULL",
-                (chat_id,),
-            ).fetchall()
-            return {r["source_key"] for r in rows}
-
-    def record_source_outcome(
-        self,
-        chat_id: int,
-        run_id: int,
-        source_key: str,
-        max_score: int,
-        threshold: int = 3,
-    ) -> tuple[int, bool]:
-        """Update strike count for one (user, source) after a run.
-
-        Logic:
-          * `max_score > 0` → reset streak to 0, clear `disabled_at`.
-          * `max_score == 0` → increment streak. If streak reaches
-            ``threshold`` and the source isn't already disabled, stamp
-            ``disabled_at = now``.
-
-        Returns ``(new_streak, just_disabled)``. ``just_disabled`` is True
-        only on the run that flipped the source from enabled → disabled,
-        so the caller can log it once.
-        """
-        now = time.time()
-        threshold = max(1, int(threshold))
-        with self._conn() as c:
-            row = c.execute(
-                "SELECT miss_streak, disabled_at FROM user_source_strikes "
-                "WHERE chat_id = ? AND source_key = ?",
-                (chat_id, source_key),
-            ).fetchone()
-            prev_streak = int(row["miss_streak"]) if row else 0
-            prev_disabled = (row["disabled_at"] is not None) if row else False
-
-            if int(max_score) > 0:
-                new_streak = 0
-                new_disabled = None
-                just_disabled = False
-            else:
-                new_streak = prev_streak + 1
-                if new_streak >= threshold:
-                    new_disabled = (row["disabled_at"] if (row and row["disabled_at"]) else now)
-                    just_disabled = (not prev_disabled)
-                else:
-                    new_disabled = None
-                    just_disabled = False
-
-            c.execute(
-                """
-                INSERT INTO user_source_strikes
-                    (chat_id, source_key, miss_streak, disabled_at, last_run_id, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(chat_id, source_key) DO UPDATE SET
-                    miss_streak = excluded.miss_streak,
-                    disabled_at = excluded.disabled_at,
-                    last_run_id = excluded.last_run_id,
-                    updated_at  = excluded.updated_at
-                """,
-                (chat_id, source_key, new_streak, new_disabled, int(run_id), now),
-            )
-            return new_streak, just_disabled
-
-    def clear_source_strike(self, chat_id: int, source_key: str) -> None:
-        """Manual re-enable: zero the streak and clear `disabled_at`. Used by
-        operator commands or future per-user UI."""
-        with self._conn() as c:
-            c.execute(
-                """
-                UPDATE user_source_strikes
-                   SET miss_streak = 0,
-                       disabled_at = NULL,
-                       updated_at  = ?
-                 WHERE chat_id = ? AND source_key = ?
-                """,
-                (time.time(), chat_id, source_key),
-            )
-
-    def list_source_strikes(self, chat_id: int) -> list[dict]:
-        """Snapshot of all per-user source health rows for inspection."""
-        with self._conn() as c:
-            rows = c.execute(
-                """
-                SELECT source_key, miss_streak, disabled_at, last_run_id, updated_at
-                  FROM user_source_strikes
-                 WHERE chat_id = ?
-                 ORDER BY (disabled_at IS NULL), source_key
-                """,
-                (chat_id,),
-            ).fetchall()
-            return [dict(r) for r in rows]
 
     # ---------- digest_run_jobs (per-run score cache for ⬇/⬆ filter buttons) ----------
 

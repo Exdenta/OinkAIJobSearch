@@ -48,6 +48,8 @@ from sources import (                                      # noqa: E402
     eures, infojobs, tecnoempleo, ai_jobs_net, jobs_ac_uk,
     academicpositions, ikerbasque, wellfound, ycombinator_was, wttj,
     builtin, impactpool, devex,
+    # EU frontend-focused sources (added 2026-05-06).
+    justjoinit, nofluffjobs,
 )
 from telemetry import MonitorStore                         # noqa: E402
 from instrumentation import pipeline_run, source_run, error_capture  # noqa: E402
@@ -101,6 +103,8 @@ SOURCES = {
     "builtin":          builtin,          # US tech HTML
     "impactpool":       impactpool,       # UN/NGO HTML (researcher-friendly)
     "devex":            devex,            # International dev (Claude CLI)
+    "justjoinit":       justjoinit,       # Polish/CEE tech JSON API
+    "nofluffjobs":      nofluffjobs,      # Polish/CEE tech JSON API
     # `linkedin` and `web_search` are PER-USER only (run inside the recipient
     # loop with profile.search_seeds), so they're deliberately absent here.
 }
@@ -401,35 +405,6 @@ def run(dry_run: bool = False, only_chat: int | None = None) -> int:
                 user_pool = post_filter(jobs_raw, effective)
                 log.info("User %s: post_filter %d → %d", chat_id, len(jobs_raw), len(user_pool))
 
-                # Auto-disabled sources: drop postings whose source has hit
-                # the zero-score strike threshold for THIS user. Saves the
-                # enrichment-token cost on dead-weight (e.g. an MLOps user
-                # has no use for academic-research feeds, so after 3 runs
-                # of 0-score returns we stop spending Haiku tokens on them).
-                #
-                # PAUSED: filter is gated on `SOURCE_STRIKES_FILTER_ON=1` (default
-                # OFF). Strike RECORDING continues elsewhere so the data is
-                # current when the filter is re-enabled — only the actual
-                # exclusion is paused. Flip the env var back to "1" when ready
-                # to resume auto-pruning.
-                strikes_filter_on = os.environ.get("SOURCE_STRIKES_FILTER_ON", "").strip() in ("1", "true", "True")
-                if strikes_filter_on:
-                    try:
-                        disabled_for_user = db.get_disabled_sources(chat_id)
-                    except Exception:
-                        log.debug("get_disabled_sources failed; treating none as disabled",
-                                  exc_info=True)
-                        disabled_for_user = set()
-                    if disabled_for_user:
-                        before_skip = len(user_pool)
-                        user_pool = [j for j in user_pool if j.source not in disabled_for_user]
-                        skipped = before_skip - len(user_pool)
-                        if skipped:
-                            log.info(
-                                "User %s: skipped %d postings from auto-disabled sources %s",
-                                chat_id, skipped, sorted(disabled_for_user),
-                            )
-
                 # -------- per-user LinkedIn fetch --------
                 li_seeds = ((profile or {}).get("search_seeds") or {}).get("linkedin")
                 li_enabled = bool((effective.get("sources") or {}).get("linkedin", False))
@@ -620,83 +595,6 @@ def run(dry_run: bool = False, only_chat: int | None = None) -> int:
                         db.record_digest_run_jobs(chat_id, pctx.run_id, enrichments_by_job_id)
                     except Exception:
                         log.debug("record_digest_run_jobs failed; continuing", exc_info=True)
-
-                # Per-source strike accounting. A source earns a strike for
-                # this user only when ALL of these hold:
-                #   1. it contributed ≥1 job to the user's pool this run, AND
-                #   2. ≥1 of those jobs received a REAL enrichment score
-                #      (i.e. Haiku actually returned a verdict — not a None
-                #      from a dropped batch), AND
-                #   3. the max real score across those jobs is 0.
-                #
-                # Why the "real score" gate: a fetch that succeeded but had
-                # its Haiku batch silently fail returns score=None for every
-                # job in that batch. Counting that as a strike would punish
-                # the source for an LLM/network blip rather than off-target
-                # content. Same logic protects against transient fetch
-                # outages — if `fetch()` itself fails (raises / blocked /
-                # 403 / timeout), the source contributes 0 jobs to
-                # `user_jobs` and never appears in `by_source` below, so it
-                # cannot accumulate strikes from connectivity issues.
-                #
-                # Three strikes → auto-disable for this user; next run drops
-                # the source's postings before enrichment to save tokens.
-                try:
-                    strike_threshold = int(os.environ.get("SOURCE_STRIKE_THRESHOLD") or 3)
-                except (TypeError, ValueError):
-                    strike_threshold = 3
-                strike_threshold = max(1, strike_threshold)
-                if enrichments_by_job_id and user_jobs:
-                    by_source: dict[str, int] = {}
-                    for j in user_jobs:
-                        enr = enrichments_by_job_id.get(j.job_id)
-                        if not enr:
-                            # Enrichment missing entirely (batch failure /
-                            # parse error). Don't penalize the source for
-                            # an LLM hiccup.
-                            continue
-                        raw = enr.get("match_score")
-                        if raw is None:
-                            # Score not provided — same defensive skip.
-                            continue
-                        try:
-                            s = int(raw)
-                        except (TypeError, ValueError):
-                            continue
-                        prev = by_source.get(j.source, -1)
-                        if s > prev:
-                            by_source[j.source] = s
-                    for src, max_score in by_source.items():
-                        try:
-                            new_streak, just_disabled = db.record_source_outcome(
-                                chat_id, pctx.run_id, src, max_score,
-                                threshold=strike_threshold,
-                            )
-                        except Exception:
-                            log.debug("record_source_outcome failed for %s/%s",
-                                      chat_id, src, exc_info=True)
-                            continue
-                        if just_disabled:
-                            log.warning(
-                                "User %s: source '%s' AUTO-DISABLED after %d "
-                                "consecutive zero-score runs (threshold=%d)",
-                                chat_id, src, new_streak, strike_threshold,
-                            )
-                            try:
-                                forensic.log_step(
-                                    "source.auto_disabled",
-                                    input={
-                                        "chat_id": chat_id,
-                                        "source_key": src,
-                                        "miss_streak": new_streak,
-                                        "threshold": strike_threshold,
-                                    },
-                                    output={"disabled": True},
-                                    chat_id=chat_id,
-                                    run_id=pctx.run_id,
-                                )
-                            except Exception:
-                                log.debug("forensic emit failed", exc_info=True)
 
                 enriched_count = len(enrichments_by_job_id)
                 user_min_score = int((profile or {}).get("min_match_score") or 0)

@@ -1527,12 +1527,12 @@ def _sort_key_with_enrichments(job: Job, enrichments: dict[str, dict]) -> tuple:
     """Build a deterministic sort key honoring match score, freshness,
     source tier, and finally job_id as a stable tie-break.
 
-    Used with ``sorted(...)`` (ascending). Under ascending order:
-      * higher match_score sorts LAST  (None → -1 sinks to the front)
-      * fresher posted_at sorts LAST   (lex compare on ISO YYYY-MM-DD…)
-      * lower source-tier number sorts LAST → we negate so smaller tier
-        (web_search=0) becomes larger negative-tier (0) and lands later
-      * job_id ascending — purely for determinism
+    Used with ``sorted(..., reverse=True)``. Under descending order:
+      * higher match_score sorts FIRST (None → -1 sinks to the back)
+      * fresher posted_at sorts FIRST  (lex compare on ISO YYYY-MM-DD…)
+      * lower source-tier number sorts FIRST → we negate so smaller tier
+        (web_search=0) becomes larger negative-tier (0) and lands first
+      * job_id descending — purely for determinism
     """
     enr = enrichments.get(job.job_id) or {}
     raw_score = enr.get("match_score")
@@ -1542,14 +1542,14 @@ def _sort_key_with_enrichments(job: Job, enrichments: dict[str, dict]) -> tuple:
         score = -1
     posted_at = job.posted_at or ""
     tier = SOURCE_TIER.get((job.source or "").lower(), SOURCE_TIER_DEFAULT)
-    # Negate tier so ascending sort puts low-numbered (better) tiers LAST.
+    # Negate tier so descending sort puts low-numbered (better) tiers FIRST.
     return (score, posted_at, -tier, job.job_id)
 
 
 def _sort_key_no_enrichments(job: Job) -> tuple:
     """Fallback sort key when AI enrichment is missing.
 
-    Priority (best LAST under ascending sort):
+    Priority (best FIRST under descending sort):
       source tier → posted_at → job_id.
     """
     tier = SOURCE_TIER.get((job.source or "").lower(), SOURCE_TIER_DEFAULT)
@@ -1560,16 +1560,15 @@ def sort_jobs_for_digest(
     jobs: list[Job],
     enrichments: dict[str, dict] | None,
 ) -> list[Job]:
-    """Return ``jobs`` ordered for the digest feed — best LAST.
+    """Return ``jobs`` ordered for the digest feed — best FIRST.
 
-    See ``send_per_job_digest`` docstring for the UX rationale (Telegram
-    renders newest-at-bottom, so the highest-priority job should be the
-    last message sent so it lands closest to the user's gaze). The order
-    is fully deterministic given the same ``(jobs, enrichments)``.
+    Highest match_score sends first so it appears at the top of the
+    chat (oldest message), then progressively lower-scoring jobs follow.
+    Order is fully deterministic given the same ``(jobs, enrichments)``.
     """
     if enrichments:
-        return sorted(jobs, key=lambda j: _sort_key_with_enrichments(j, enrichments))
-    return sorted(jobs, key=_sort_key_no_enrichments)
+        return sorted(jobs, key=lambda j: _sort_key_with_enrichments(j, enrichments), reverse=True)
+    return sorted(jobs, key=_sort_key_no_enrichments, reverse=True)
 
 
 def send_per_job_digest(
@@ -1603,11 +1602,11 @@ def send_per_job_digest(
     wants a handful. Default behavior (``None``) is unchanged — every job
     that survives upstream filtering is sent.
 
-    Sort order (best-LAST UX choice — see below):
+    Sort order (best-FIRST):
       Priority when ``enrichments`` is present:
-        1. match_score DESC (5 first when reading the chat top-down; ``None``
-           is treated as -1 so Haiku batch failures sink to the bottom of the
-           priority list — they don't crash and don't mis-sort).
+        1. match_score DESC (5 first; ``None`` is treated as -1 so Haiku
+           batch failures sink to the bottom — they don't crash and don't
+           mis-sort).
         2. posted_at DESC (fresher first).
         3. SOURCE_TIER (web_search > linkedin > euraxess > reliefweb >
            remotive > remoteok > weworkremotely > hackernews > others).
@@ -1617,16 +1616,9 @@ def send_per_job_digest(
       Fallback when ``enrichments`` is None or empty:
         SOURCE_TIER → posted_at DESC → job_id.
 
-    UX RATIONALE — best-LAST:
-      Telegram renders the newest message at the BOTTOM of the chat,
-      right above the input box where the user's gaze starts when they
-      open the conversation. If we send strongest-first, the best match
-      scrolls to the TOP of the chat — furthest from the eye and only
-      reachable via an explicit scroll-up. Sending strongest-LAST means
-      the just-arrived message (what the user sees first on open) IS the
-      best match. This matches the mental model "what just appeared =
-      what to look at first." So we sort ASCENDING by the relevance
-      keys: worst sent first, best sent last.
+    Highest-score job sends first → appears at the TOP of the chat
+    (oldest message in the digest run). Subsequent lower-score jobs
+    follow underneath.
 
     Calls `on_sent` after every successful send so the caller can persist the
     message_id → job_id mapping in the DB.
@@ -1656,19 +1648,17 @@ def send_per_job_digest(
     snip_chars = int(msg_cfg.get("snippet_chars", 240))
     enrichments = enrichments or {}
 
-    # Sort once — best-LAST so the strongest job is the most recent
-    # message in the chat (closest to the input box, most visible).
-    # See docstring above for why ascending = best-last.
+    # Sort once — best-FIRST so the strongest job is the first message
+    # sent (top of the chat in the digest run).
     sort_mode = "with_enrichments" if enrichments else "fallback"
     jobs = sort_jobs_for_digest(list(jobs), enrichments or None)
 
-    # Optional truncation: keep only the top-N strongest matches. Because
-    # we sort ascending (worst → best), "top" lives at the END of the
-    # list. Slice from the right so the best-N survive.
+    # Optional truncation: keep only the top-N strongest matches. Sort is
+    # descending (best → worst), so "top" lives at the HEAD of the list.
     truncated_from: int | None = None
     if top_n is not None and top_n > 0 and len(jobs) > top_n:
         truncated_from = len(jobs)
-        jobs = jobs[-top_n:]
+        jobs = jobs[:top_n]
 
     # Lazy import — telegram_client is loaded by search_jobs which already
     # imports forensic; this keeps the dependency one-way and tolerates
@@ -1876,7 +1866,7 @@ def send_per_job_digest(
                 "forum_url_count": forum_url_count,
                 "header_sent": not skip_header,
                 "sort_mode": sort_mode,
-                "sort_direction": "best_last",
+                "sort_direction": "best_first",
                 "top_n": top_n,
                 "truncated_from": truncated_from,
             },

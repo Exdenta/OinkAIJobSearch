@@ -107,21 +107,78 @@ DERIVATION RULES
 7. `title_must_match` — at least one of these substrings must appear in a
    job's TITLE for it to pass. Build this from primary_role's common
    variants AND one or two top stack_primary names that frequently appear
-   in titles (e.g. "react", "vue", "python"). Lowercase. 5-12 items.
-   Example for a React frontend mid:
-     ["frontend","front-end","front end","react","ui engineer","ui developer","web developer"]
+   in titles (e.g. "react", "vue", "python"). Lowercase. 5-15 items.
 
-8. `title_exclude` — title VETO. Build mechanically from:
-     - Role-family antonyms. For each entry in target_levels, exclude every
-       level that's strictly HIGHER:
-         junior → no extras
-         mid    → ["senior","staff","principal","lead","head","director","vp","manager"]
-         senior → ["staff","principal","lead","head","director","vp"]
-     - Adjacent role families the candidate is NOT targeting. For a frontend
-       dev: ["backend","back-end","back end","data engineer","devops","sre",
-             "qa engineer","security engineer","ios","android","mobile"]
-     - Explicit user_description vetoes.
-   15-30 items. All lowercase.
+   IMPORTANT — broaden by role family. Real postings rarely echo CV
+   jargon; build the gate from the role NAMES recruiters actually write,
+   not the discipline names from the resume. For each role family below,
+   ALWAYS include the umbrella role nouns (officer, coordinator, etc.)
+   alongside the specialty:
+
+     - Tech/engineering:  primary_role variants + 1-2 stack tokens.
+       e.g. ["frontend","front-end","front end","react","vue",
+             "ui engineer","ui developer","web developer"]
+
+     - Research/academic: include UMBRELLA TITLES that recruiters use,
+       not just resume jargon. Example for a qualitative researcher:
+       ["researcher","research","research assistant","research associate",
+        "research analyst","research officer","postdoctoral","postdoc",
+        "fellow","lecturer","teaching associate","scientific assistant"]
+
+     - NGO/policy/development: postings use operational nouns. Example:
+       ["officer","programme officer","project officer","field officer",
+        "specialist","consultant","analyst","policy analyst",
+        "coordinator","monitoring evaluation","m&e specialist",
+        "research analyst","programme manager"]
+
+     - Design/creative: ["designer","ux","ui","product designer",
+        "visual designer","brand","creative"]
+
+     - Ops/business:    ["operations","program manager","project manager",
+        "analyst","specialist","strategist"]
+
+   Mix umbrella + specialty so a job titled "Programme Officer — Migration"
+   passes for an anthropology researcher even though the title doesn't say
+   "researcher".
+
+8. `title_exclude` — title VETO. Build from:
+     - Role-family antonyms. Adjacent role families the candidate is NOT
+       targeting (for a frontend dev: backend/data/devops/sre/qa/security/
+       ios/android/mobile).
+
+     - Management-track exclusions ONLY when the candidate is an IC at
+       mid/senior level: include ["director","vp","head","cto","cio",
+       "chief"]. Add "manager" only if the role family treats "manager"
+       as people-management (engineering, design, ops). For NGO/research,
+       "Programme Manager" / "Research Manager" are typically hands-on IC
+       leads — DO NOT blanket-exclude "manager" there.
+
+     - Seniority-level filtering — DO NOT blanket-exclude "senior" /
+       "staff" / "principal" / "lead". These tokens have role-family-
+       specific meanings:
+         * Engineering: "senior" / "staff" / "principal" usually mean
+           more responsibility. For a mid candidate, exclude
+           ["staff","principal","lead"]. "Senior" only if the user
+           explicitly says they don't want senior IC roles.
+         * Research/academic: "senior researcher" / "senior fellow" =
+           mid-career IC. DO NOT exclude.
+         * NGO/policy/development: "senior officer" / "senior analyst" =
+           career step, not management. DO NOT exclude.
+         * Design/creative: same as engineering — exclude ["staff",
+           "principal","lead"] for mid.
+       When unsure, leave seniority tokens out of the exclude list and
+       let the AI scorer downgrade overshoots.
+
+     - Wrong-discipline researcher tokens for a research candidate:
+       ["ux researcher","user researcher","market researcher",
+        "quantitative researcher","quant"] — these are different
+       professions despite the shared "researcher" word.
+
+     - Explicit user_description vetoes (verbatim).
+
+   12-25 items. All lowercase. Err toward UNDER-excluding when uncertain
+   — wrongly-excluded jobs vanish silently; wrongly-included ones get
+   downscored by the AI gate.
 
 9. `exclude_keywords` — body-level veto. Fold in:
      - stack_antipatterns (repeat them here so they hit body text, not just
@@ -165,30 +222,61 @@ DERIVATION RULES
 18. `min_match_score` — default 0. If user_description says something like
     "only strong matches", set 3; "only great matches", set 4.
 
-19. `search_seeds.linkedin.queries` — up to 3 entries. Each `q` is a
+19. `search_seeds.linkedin.queries` — up to 5 entries. Each `q` is a
     short, LinkedIn-UI-shaped phrase (NOT a boolean query). Each `geo` is
     a LinkedIn-recognizable region name (e.g. "Spain", "European Union",
-    "United Kingdom", "Germany", "United States"). `f_TPR` is always
-    "r86400" (past 24h). Build queries that combine:
-      a. primary_role + top stack_primary item in the candidate's main geo
-      b. primary_role + remote-mode hint in a wider region
-      c. (optional 3rd) a stack_secondary angle if it opens up supply
-    Example for a Vue frontend mid in Bilbao, remote-EU preferred:
-      [
-        {{"q":"frontend vue developer","geo":"Spain","f_TPR":"r86400"}},
-        {{"q":"react typescript remote","geo":"European Union","f_TPR":"r86400"}},
-        {{"q":"nuxt frontend","geo":"Germany","f_TPR":"r86400"}}
-      ]
+    "United Kingdom", "Germany", "Belgium", "Netherlands", "Ireland",
+    "Poland", "United States"). `f_TPR` is always "r86400" (past 24h).
+
+    Diversify GEOS across the 5 queries so they don't dedupe each other
+    (LinkedIn over-deduplicates same-region searches). Pick five
+    DIFFERENT regions when possible. Cover the candidate's primary geo
+    + 1-2 macro EU regions + 1-2 specific English-speaking EU hubs
+    (UK / Ireland / Netherlands / Germany / Poland depending on stack).
+
+    Construct each `q` using vocabulary recruiters write, NOT resume
+    jargon. By role family:
+
+      - Tech/engineering — primary_role variant + a top stack token:
+        a. primary_role + top stack_primary in candidate's main geo
+        b. primary_role + remote/region hint in a wider region
+        c. (optional) stack_secondary angle in a different geo
+        Example (Vue frontend mid, Bilbao):
+          [
+            {{"q":"frontend vue developer","geo":"Spain","f_TPR":"r86400"}},
+            {{"q":"react typescript remote","geo":"European Union","f_TPR":"r86400"}},
+            {{"q":"nuxt frontend","geo":"Germany","f_TPR":"r86400"}}
+          ]
+
+      - Research/academic — operational role + thematic specialty + geo:
+        Use nouns recruiters use (researcher, fellow, postdoc, lecturer,
+        analyst, assistant) NOT discipline names (ethnography,
+        ethnomethodology, discourse analysis). Example for a migration/
+        peace-studies anthropologist:
+          [
+            {{"q":"research officer migration","geo":"European Union","f_TPR":"r86400"}},
+            {{"q":"postdoctoral researcher anthropology","geo":"United Kingdom","f_TPR":"r86400"}},
+            {{"q":"policy analyst peace conflict","geo":"Belgium","f_TPR":"r86400"}}
+          ]
+
+      - NGO/policy/development — operational role + thematic + geo:
+          [
+            {{"q":"programme officer migration","geo":"Belgium","f_TPR":"r86400"}},
+            {{"q":"policy analyst climate","geo":"Netherlands","f_TPR":"r86400"}},
+            {{"q":"M&E specialist humanitarian","geo":"European Union","f_TPR":"r86400"}}
+          ]
 
 20. `search_seeds.web_search.seed_phrases` — 5-8 items. Each is a short
     search-engine query (lowercase, no boolean operators needed; the
     WebSearch agent handles those). Mix:
-      - 2 generic: "<primary_role> <top stack> <region or remote>"
-      - 2 stack-specific variations
+      - 2 generic: "<role variant> <top stack/specialty> <region or remote>"
+      - 2 specialty variations widening the role NAME (use synonyms a
+        recruiter would use — see role-family table in rule 7)
       - 2-4 `site:<ats>` targeted — use ATS domains from the allowlist
         AND that are actually popular in the candidate's region (e.g.
         personio.de for Germany/EU, greenhouse.io/lever.co for US + EU).
-    Example for the same candidate:
+
+    Tech example (Vue frontend mid, Bilbao):
       [
         "remote vue 2 frontend engineer europe",
         "mid level typescript frontend spain",
@@ -196,6 +284,18 @@ DERIVATION RULES
         "react mid level remote EU",
         "site:greenhouse.io vue frontend europe",
         "site:ashbyhq.com react typescript remote"
+      ]
+
+    Research/NGO example (migration researcher, Bilbao):
+      [
+        "qualitative researcher migration europe",
+        "programme officer migration NGO brussels",
+        "postdoctoral fellow anthropology remote eu",
+        "policy analyst peace conflict spain",
+        "M&E specialist humanitarian remote europe",
+        "research officer ngo eu",
+        "site:workable.com research officer migration",
+        "site:teamtailor.com programme officer NGO europe"
       ]
 
 21. `search_seeds.web_search.ats_domains` — ONLY from this allowlist:
@@ -229,9 +329,9 @@ HARD CONSTRAINTS (the parser checks these)
  - All strings in list fields other than `exclude_companies` MUST be
    lowercase.
  - `title_must_match` and `title_exclude` strings must be ≤ 40 chars each.
- - `search_seeds.linkedin.queries` length ≤ 3.
+ - `search_seeds.linkedin.queries` length ≤ 5.
  - Each `search_seeds.linkedin.queries[i].q` ≤ 80 chars.
- - `search_seeds.web_search.seed_phrases` length ≤ 8, each ≤ 120 chars.
+ - `search_seeds.web_search.seed_phrases` length ≤ 12, each ≤ 120 chars.
  - `search_seeds.web_search.ats_domains` MUST be a subset of the allowlist
    in rule 21.
  - Do NOT invent companies in `exclude_companies`.
@@ -349,6 +449,66 @@ Output:
     }}
   }},
   "free_text": "remote US only. Backend Python. No EM or director roles. Must list salary."
+}}
+
+Example C — qualitative researcher mid, Bilbao, NGO/academic/policy:
+
+Input resume mentions: 5 years, MA Anthropology, fieldwork in migration and
+peace studies, qualitative interviews, ethnography, discourse analysis,
+research assistant + research associate roles at universities and an NGO.
+Bilbao-based, fluent EN/ES, working FR.
+User description: "Mid-level researcher in NGO, academic, or policy
+contexts. Migration, peace, conflict, sustainability themes. Open to
+programme officer, field officer, M&E, postdoc, lecturer, consultant
+titles. EU/EMEA, remote OK. Prefer English-language roles."
+
+Output:
+{{
+  "schema_version": 2,
+  "ideal_fit_paragraph": "Mid-level qualitative researcher role in an NGO, academic, or policy organisation working on migration, peace and conflict, or sustainability themes. Open to programme officer, project officer, M&E specialist, postdoctoral fellow, lecturer, or consultant titles in any EU country including remote, with English as the working language.",
+  "primary_role": "qualitative researcher",
+  "target_levels": ["mid", "middle"],
+  "years_experience": 5,
+  "stack_primary": ["qualitative research", "ethnography", "interviews", "fieldwork", "migration studies", "peace and conflict studies", "mixed methods"],
+  "stack_secondary": ["participatory research", "discourse analysis", "policy analysis", "monitoring and evaluation", "needs assessment", "academic writing"],
+  "stack_adjacent": ["report writing", "stakeholder engagement", "focus groups", "thematic analysis"],
+  "stack_antipatterns": ["quantitative finance", "ux research", "user research", "market research"],
+  "title_must_match": ["researcher", "research", "research assistant", "research associate", "research officer", "research analyst", "policy analyst", "postdoctoral", "postdoc", "fellow", "lecturer", "programme officer", "project officer", "field officer", "consultant", "monitoring evaluation", "m&e specialist"],
+  "title_exclude": ["director", "head", "vp", "chief", "ux researcher", "user researcher", "market researcher", "quantitative researcher", "quant", "data engineer", "software engineer", "developer", "sales", "marketing"],
+  "exclude_keywords": ["quantitative finance", "market research", "ux research", "user research", "bootcamp", "unpaid"],
+  "exclude_companies": [],
+  "locations": ["bilbao", "basque", "euskadi", "spain", "europe", "eu", "emea"],
+  "remote": "any",
+  "time_zone_band": "UTC-1..UTC+3",
+  "salary_min_usd": 0,
+  "drop_if_salary_unknown": false,
+  "language": "english",
+  "max_age_hours": 0,
+  "min_match_score": 1,
+  "search_seeds": {{
+    "linkedin": {{
+      "queries": [
+        {{"q": "research officer migration", "geo": "European Union", "f_TPR": "r86400"}},
+        {{"q": "postdoctoral researcher anthropology", "geo": "United Kingdom", "f_TPR": "r86400"}},
+        {{"q": "policy analyst peace conflict", "geo": "Belgium", "f_TPR": "r86400"}}
+      ]
+    }},
+    "web_search": {{
+      "seed_phrases": [
+        "qualitative researcher migration europe",
+        "programme officer migration NGO brussels",
+        "postdoctoral fellow anthropology remote eu",
+        "policy analyst peace conflict spain",
+        "M&E specialist humanitarian remote europe",
+        "research officer NGO eu",
+        "site:workable.com research officer migration",
+        "site:teamtailor.com programme officer NGO europe"
+      ],
+      "ats_domains": ["greenhouse.io", "lever.co", "workable.com", "teamtailor.com", "smartrecruiters.com"],
+      "focus_notes": "Prefer NGO, academic, and policy research roles in EU timezones touching migration, peace, conflict, or sustainability. Open to programme/project officer, M&E, postdoc, fellow, lecturer, consultant titles. De-prioritize UX/user/market research and quantitative finance roles. Senior IC titles (senior researcher, senior fellow) are acceptable — only management-track titles (director, head, VP) should be skipped."
+    }}
+  }},
+  "free_text": "Mid-level researcher in NGO, academic, or policy contexts. Migration, peace, conflict, sustainability themes. Open to programme officer, field officer, M&E, postdoc, lecturer, consultant titles. EU/EMEA, remote OK. Prefer English-language roles."
 }}
 
 END OF INSTRUCTIONS. Produce the JSON output now.
