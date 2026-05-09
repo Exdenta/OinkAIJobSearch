@@ -24,6 +24,7 @@ single-consumer).
 """
 from __future__ import annotations
 
+import datetime
 import logging
 import os
 import signal
@@ -389,6 +390,8 @@ def handle_command(tg: TelegramClient, db: DB, chat_id: int, text: str, user: di
         _rebuild_profile(tg, db, chat_id)
     elif cmd in ("/marketresearch", "/research", "/mr"):
         _start_market_research(tg, db, chat_id)
+    elif cmd in ("/clicks", "/myclicks", "/views"):
+        _send_recent_clicks(tg, db, chat_id)
     elif cmd in ("/cleardata", "/reset", "/mydata", "/wipe"):
         _ask_clean_data(tg, db, chat_id)
     elif cmd in ("/privacy", "/privacypolicy", "/datapolicy"):
@@ -1363,6 +1366,41 @@ def _send_applied_list(tg: TelegramClient, db: DB, chat_id: int) -> None:
     tg.send_message(chat_id, "\n".join(lines))
 
 
+def _send_recent_clicks(tg: TelegramClient, db: DB, chat_id: int) -> None:
+    """Show the last ~20 'View posting' clicks for this user with totals."""
+    rows = db.list_posting_clicks(chat_id, limit=20)
+    total = db.count_posting_clicks(chat_id)
+    week_ago = time.time() - 7 * 86400
+    last_week = db.count_posting_clicks(chat_id, since=week_ago)
+    if not rows:
+        if not os.environ.get("REDIRECT_BASE_URL", "").strip():
+            tg.send_plain(
+                chat_id,
+                "Click tracking is disabled (no REDIRECT_BASE_URL configured). "
+                "Ask the operator to enable it.",
+            )
+        else:
+            tg.send_plain(chat_id, "No View-posting clicks recorded yet.")
+        return
+    header = (
+        "🔗 *"
+        + mdv2_escape(f"View-posting clicks — last week: {last_week}, total: {total}")
+        + "*"
+    )
+    lines = [header, ""]
+    for r in rows:
+        title = mdv2_escape((r.get("title") or "(deleted job)")[:80])
+        company = mdv2_escape((r.get("company") or "")[:40])
+        when = datetime.datetime.fromtimestamp(r["clicked_at"]).strftime("%m-%d %H:%M")
+        sep = mdv2_escape(" — ")
+        url = (r.get("url") or "").replace("(", "\\(").replace(")", "\\)")
+        if url:
+            lines.append(f"• `{when}` [{title}]({url}){sep}{company}")
+        else:
+            lines.append(f"• `{when}` {title}{sep}{company}")
+    tg.send_message(chat_id, "\n".join(lines))
+
+
 # -- Per-process profile-builder queue. Lazily initialized on first trigger
 # -- so importing bot.py for tests/tools doesn't spin up background threads.
 _PROFILE_QUEUE: _profile_builder.ProfileBuilderQueue | None = None
@@ -1686,7 +1724,7 @@ def _handle_callback_inner(
             # We can't easily edit text + markup in one call for markdown; use
             # editMessageReplyMarkup which keeps the original text intact and just
             # flips the button state.
-            tg.edit_reply_markup(chat_id, msg_id, job_keyboard(job_id, applied_status="applied", url=job.url or None))
+            tg.edit_reply_markup(chat_id, msg_id, job_keyboard(job_id, applied_status="applied", url=job.url or None, chat_id=chat_id))
         except Exception as e:
             log.warning("edit markup failed: %s", e)
         # Small celebration for hitting apply — fail-soft if no sticker
@@ -1788,7 +1826,7 @@ def _handle_callback_inner(
                 try:
                     tg.edit_reply_markup(
                         chat_id, msg_id,
-                        job_keyboard(job_id, applied_status="skipped", url=job.url or None),
+                        job_keyboard(job_id, applied_status="skipped", url=job.url or None, chat_id=chat_id),
                     )
                 except Exception as e:
                     log.warning("edit markup failed: %s", e)
@@ -2677,6 +2715,15 @@ def main() -> int:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     db = DB(DB_PATH)
     tg = TelegramClient(token=token)
+
+    # View-posting redirect server. No-op when REDIRECT_BASE_URL or
+    # REDIRECT_HMAC_SECRET are unset; log the click + 302 to the posting
+    # otherwise. Daemon-threaded so it dies with the bot.
+    try:
+        from redirect_server import start_redirect_server
+        start_redirect_server(db)
+    except Exception:
+        log.exception("redirect_server: failed to start; continuing without it")
 
     log.info("Bot started. Polling for updates…")
     running = True

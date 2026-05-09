@@ -705,6 +705,94 @@ def _url_is_real_posting(url: str, job_source: str) -> tuple[bool, str]:
     return (True, "ok")
 
 
+# ---------- web_search liveness verification (LLM-backed) ----------
+#
+# The web_search source (Claude open-web subagent) periodically surfaces
+# stale Ashby/Greenhouse/Lever postings — Google still has them indexed
+# even after the role closed. The HTTP HEAD-based liveness gate above
+# can't catch these: ATS SPAs return 200 with an empty `<title>Jobs</title>`
+# regardless of whether the posting is open. The age gate only helps when
+# `posted_at` is populated.
+#
+# This gate runs ONLY for `source == "web_search"` postings that survived
+# every cheaper gate (age, HEAD liveness, forum). It spawns a Claude
+# subprocess with WebFetch + WebSearch and asks the agent to decide:
+#   - "open"    — page shows Apply / role is on company's current board.
+#   - "closed"  — page says position closed / not on current board.
+#   - "unknown" — page is empty/blocked, web search inconclusive.
+#
+# Drop on "closed". Pass on "open". Skip on "unknown" (NEVER drop on
+# uncertainty). Set WEB_SEARCH_VERIFY_OFF=1 to disable the gate.
+
+WEB_SEARCH_VERIFY_OFF: bool = os.environ.get("WEB_SEARCH_VERIFY_OFF", "").strip() not in (
+    "", "0", "false", "False",
+)
+WEB_SEARCH_VERIFY_TIMEOUT_S: int = _env_int("WEB_SEARCH_VERIFY_TIMEOUT_S", 90)
+
+
+def _web_search_listing_still_open(
+    job: Job, timeout_s: int = WEB_SEARCH_VERIFY_TIMEOUT_S,
+) -> tuple[bool | None, str]:
+    """Decide whether a web_search-sourced posting is still accepting
+    applications.
+
+    Returns ``(True, "ok")`` if the agent confirms the listing is open,
+    ``(False, "closed:<short reason>")`` if the agent says closed, and
+    ``(None, "unknown:<short reason>")`` on any uncertainty (CLI missing,
+    timeout, parse failure, agent unsure). Callers must treat ``None`` as
+    "skip / let through" — we never drop a posting on uncertainty alone.
+    """
+    if not (job.url or "").strip():
+        return (None, "unknown:no_url")
+    try:
+        from claude_cli import run_p_with_tools, extract_assistant_text, parse_json_block
+    except ImportError:
+        return (None, "unknown:claude_cli_import")
+
+    prompt = (
+        "You are verifying whether a job posting is still accepting "
+        "applications.\n\n"
+        "1. Use WebFetch on the URL below.\n"
+        "2. If the page renders empty or as a JS-only SPA shell (common "
+        "for Ashby / Greenhouse / Lever), use WebSearch to look for the "
+        "same role on the company's current careers page or a reputable "
+        "job board, and decide from that.\n\n"
+        f"URL: {job.url}\n"
+        f"Title: {(job.title or '')[:200]}\n"
+        f"Company: {(job.company or '')[:120]}\n\n"
+        "Pick exactly ONE verdict:\n"
+        "  open    — page has an Apply button OR the role is on the "
+        "company's current job board.\n"
+        "  closed  — page says no longer accepting / position filled / "
+        "404 / removed, OR the role is missing from the company's "
+        "current job board.\n"
+        "  unknown — cannot tell (page is empty/blocked AND search is "
+        "inconclusive).\n\n"
+        "Respond with one JSON object only, no prose, no markdown fence:\n"
+        "{\"status\": \"open\"|\"closed\"|\"unknown\", "
+        "\"reason\": \"<≤20 words>\"}"
+    )
+    stdout = run_p_with_tools(
+        prompt,
+        allowed_tools="WebFetch WebSearch",
+        timeout_s=timeout_s,
+        output_format="json",
+    )
+    if stdout is None:
+        return (None, "unknown:cli_unavailable")
+    body = extract_assistant_text(stdout)
+    data = parse_json_block(body)
+    if not isinstance(data, dict):
+        return (None, "unknown:parse_failed")
+    status = str(data.get("status") or "").strip().lower()
+    reason = str(data.get("reason") or "")[:80]
+    if status == "open":
+        return (True, "ok")
+    if status == "closed":
+        return (False, f"closed:{reason}")
+    return (None, f"unknown:{reason}")
+
+
 # ---------- MarkdownV2 helpers ----------
 
 _MDV2_SPECIALS = r"_*[]()~`>#+-=|{}.!\\"
@@ -912,7 +1000,37 @@ def format_job_mdv2(
 
 # ---------- Inline keyboards ----------
 
-def job_keyboard(job_id: str, applied_status: str | None = None, url: str | None = None) -> dict:
+def _maybe_redirect_url(url: str, job_id: str, chat_id: int | None) -> str:
+    """Wrap `url` in a signed redirect link when the env is configured.
+
+    Returns the original URL unchanged if any of:
+      - REDIRECT_BASE_URL or REDIRECT_HMAC_SECRET unset
+      - chat_id is None (caller didn't pass a recipient — happens in
+        tests / dry-runs)
+    Keeps the failure mode safe: bad config silently degrades to raw
+    URLs, never broken buttons.
+    """
+    if chat_id is None:
+        return url
+    base = os.environ.get("REDIRECT_BASE_URL", "").strip()
+    secret = os.environ.get("REDIRECT_HMAC_SECRET", "").strip()
+    if not base or not secret:
+        return url
+    try:
+        from redirect_server import build_redirect_url
+        return build_redirect_url(base, secret, job_id, int(chat_id))
+    except Exception:  # noqa: BLE001
+        log.debug("_maybe_redirect_url: build failed, falling back to raw url",
+                  exc_info=True)
+        return url
+
+
+def job_keyboard(
+    job_id: str,
+    applied_status: str | None = None,
+    url: str | None = None,
+    chat_id: int | None = None,
+) -> dict:
     """Build the inline keyboard under each job message.
 
     callback_data is capped at 64 bytes; our job_id is 16 hex chars → plenty of room.
@@ -922,10 +1040,15 @@ def job_keyboard(job_id: str, applied_status: str | None = None, url: str | None
         r:<job_id>  → rewrite resume for this position
 
     The top row is a direct URL button (Telegram opens the posting in-browser).
+    When REDIRECT_BASE_URL + REDIRECT_HMAC_SECRET are set in env AND a
+    `chat_id` is supplied, we substitute a signed redirect URL instead so
+    the in-process redirect server can log the click before 302-ing to the
+    posting. See redirect_server.py for the matching listener.
     """
     rows: list[list[dict]] = []
     if url:
-        rows.append([{"text": "View posting ↗", "url": url}])
+        view_url = _maybe_redirect_url(url, job_id, chat_id)
+        rows.append([{"text": "View posting ↗", "url": view_url}])
     if applied_status == "applied":
         status_row = [{"text": "✓ Applied", "callback_data": f"n:{job_id}"}]
     elif applied_status == "skipped":
@@ -1716,6 +1839,7 @@ def send_per_job_digest(
     dead_url_count = 0
     too_old_count = 0
     forum_url_count = 0
+    web_search_closed_count = 0
     for job in jobs:
         enr = enrichments.get(job.job_id)
 
@@ -1724,11 +1848,21 @@ def send_per_job_digest(
         # Sources that don't surface posted_at (LinkedIn, web_search) are
         # admitted by default; flip JOB_AGE_MISSING_POLICY=reject to be
         # strict. JOB_AGE_FILTER_OFF=1 disables the gate entirely.
+        #
+        # web_search source is a hard exception: Claude's open-web subagent
+        # has surfaced stale Ashby/Greenhouse listings (closed roles still
+        # indexed by Google) that scored 5/5 because the enricher only sees
+        # the title. Force a strict 7-day window and reject missing
+        # posted_at — `web_search` postings without a date are unverifiable
+        # and disproportionately stale.
         if not JOB_AGE_FILTER_OFF:
+            is_web_search = (job.source or "").strip().lower() == "web_search"
+            max_days = 7 if is_web_search else MAX_JOB_AGE_DAYS
+            missing_policy = "reject" if is_web_search else JOB_AGE_MISSING_POLICY
             allowed, reason = _is_within_age_window(
                 job.posted_at or "",
-                max_days=MAX_JOB_AGE_DAYS,
-                missing_policy=JOB_AGE_MISSING_POLICY,
+                max_days=max_days,
+                missing_policy=missing_policy,
             )
             if not allowed:
                 too_old_count += 1
@@ -1811,10 +1945,44 @@ def send_per_job_digest(
                 )
                 continue
 
+        # web_search-only LLM verifier. Last gate before send because it's
+        # the most expensive (one Claude subprocess per posting, with
+        # WebFetch + WebSearch tools). Only fires when `source` is
+        # `web_search` — the only source where stale Ashby/Greenhouse SPA
+        # postings have leaked through every cheaper gate. `unknown`
+        # verdicts pass through (never drop on uncertainty).
+        if (
+            not WEB_SEARCH_VERIFY_OFF
+            and (job.source or "").strip().lower() == "web_search"
+            and (job.url or "").strip()
+        ):
+            ws_status, ws_reason = _web_search_listing_still_open(
+                job, timeout_s=WEB_SEARCH_VERIFY_TIMEOUT_S,
+            )
+            if ws_status is False:
+                web_search_closed_count += 1
+                if _forensic is not None:
+                    _forensic.log_step(
+                        "telegram.web_search_closed",
+                        input={
+                            "job_id": job.job_id,
+                            "source": job.source,
+                            "url": job.url,
+                            "title": (job.title or "")[:120],
+                        },
+                        output={"reason": ws_reason},
+                        chat_id=chat_id,
+                    )
+                log.info(
+                    "send_per_job_digest: dropping %s (web_search) — listing closed: %s",
+                    job.job_id, ws_reason,
+                )
+                continue
+
         text = format_job_mdv2(
             job, include_snippet=inc_snip, snippet_chars=snip_chars, enrichment=enr,
         )
-        kb = job_keyboard(job.job_id, url=job.url or None)
+        kb = job_keyboard(job.job_id, url=job.url or None, chat_id=chat_id)
         send_status = "ok"
         msg_err = None
         msg_id = None
@@ -1864,6 +2032,7 @@ def send_per_job_digest(
                 "dead_url_count": dead_url_count,
                 "too_old_count": too_old_count,
                 "forum_url_count": forum_url_count,
+                "web_search_closed_count": web_search_closed_count,
                 "header_sent": not skip_header,
                 "sort_mode": sort_mode,
                 "sort_direction": "best_first",
