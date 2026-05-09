@@ -157,12 +157,28 @@ CREATE TABLE IF NOT EXISTS digest_run_jobs (
     recorded_at     REAL    NOT NULL,
     PRIMARY KEY (chat_id, run_id, job_id)
 );
+-- Per-(user, job) record of "View posting" link clicks. Populated by the
+-- in-process redirect server when a user taps the URL button on a job
+-- card. Multiple clicks for the same (chat, job) produce multiple rows
+-- so we can analyze re-engagement patterns. user_agent / referer help
+-- distinguish phone vs desktop browser sessions.
+CREATE TABLE IF NOT EXISTS posting_clicks (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id     INTEGER NOT NULL,
+    job_id      TEXT    NOT NULL,
+    clicked_at  REAL    NOT NULL,
+    user_agent  TEXT,
+    referer     TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_app_status ON applications(chat_id, status);
 CREATE INDEX IF NOT EXISTS idx_sent_job ON sent_messages(chat_id, job_id);
 CREATE INDEX IF NOT EXISTS idx_profile_builds_chat ON profile_builds(chat_id, built_at DESC);
 CREATE INDEX IF NOT EXISTS idx_research_runs_chat ON research_runs(chat_id, finished_at DESC);
 CREATE INDEX IF NOT EXISTS idx_digest_run_chat ON digest_run_jobs(chat_id, run_id DESC);
 CREATE INDEX IF NOT EXISTS idx_digest_run_age ON digest_run_jobs(recorded_at);
+CREATE INDEX IF NOT EXISTS idx_posting_clicks_user ON posting_clicks(chat_id, clicked_at DESC);
+CREATE INDEX IF NOT EXISTS idx_posting_clicks_job ON posting_clicks(job_id);
 """
 
 
@@ -931,6 +947,81 @@ class DB:
                 (chat_id, job_id),
             ).fetchone()
             return row is not None
+
+    # ---------- posting_clicks (View-posting redirector analytics) ----------
+
+    def record_posting_click(
+        self,
+        chat_id: int,
+        job_id: str,
+        user_agent: str | None = None,
+        referer: str | None = None,
+    ) -> None:
+        """Append one click event. Caller has already verified the HMAC."""
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT INTO posting_clicks
+                    (chat_id, job_id, clicked_at, user_agent, referer)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (int(chat_id), str(job_id), time.time(),
+                 (user_agent or "")[:300] or None,
+                 (referer or "")[:300] or None),
+            )
+
+    def get_job_url(self, job_id: str) -> str | None:
+        """Look up a posting's canonical URL by stable hash. Used by the
+        redirect server right before issuing the 302."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT url FROM jobs WHERE job_id = ?",
+                (str(job_id),),
+            ).fetchone()
+            if row is None:
+                return None
+            return row["url"] or None
+
+    def count_posting_clicks(
+        self,
+        chat_id: int | None = None,
+        since: float | None = None,
+    ) -> int:
+        """Total clicks. Both args optional for narrowing."""
+        sql = "SELECT COUNT(*) AS n FROM posting_clicks WHERE 1=1"
+        params: list = []
+        if chat_id is not None:
+            sql += " AND chat_id = ?"
+            params.append(int(chat_id))
+        if since is not None:
+            sql += " AND clicked_at >= ?"
+            params.append(float(since))
+        with self._conn() as c:
+            row = c.execute(sql, params).fetchone()
+            return int(row["n"]) if row else 0
+
+    def list_posting_clicks(
+        self,
+        chat_id: int,
+        since: float | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        """Recent clicks for one user, joined to job title/company for display."""
+        sql = """
+            SELECT pc.job_id, pc.clicked_at, pc.user_agent,
+                   j.title, j.company, j.source, j.url
+              FROM posting_clicks pc
+         LEFT JOIN jobs j ON j.job_id = pc.job_id
+             WHERE pc.chat_id = ?
+        """
+        params: list = [int(chat_id)]
+        if since is not None:
+            sql += " AND pc.clicked_at >= ?"
+            params.append(float(since))
+        sql += " ORDER BY pc.clicked_at DESC LIMIT ?"
+        params.append(int(limit))
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(sql, params).fetchall()]
 
     # ---------- digest_run_jobs (per-run score cache for ⬇/⬆ filter buttons) ----------
 
