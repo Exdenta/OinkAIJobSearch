@@ -186,6 +186,36 @@ def fetch(filters: dict) -> list[Job]:
                 snippet=clean_snippet(desc_html, max_chars=400),
             ))
 
+        # Algorithm v2.2 — Option 4: fetch each ReliefWeb detail page so
+        # Sonnet sees the full posting body (location specifics, years
+        # of experience required, language, on-site vs remote). The RSS
+        # snippet stops at ~400 chars and routinely omits the "Required
+        # Experience" / "Eligibility" sections.
+        if jobs:
+            try:
+                from sources._detail_fetch import fetch_many_bodies
+                body_map = fetch_many_bodies(
+                    [j.url for j in jobs], max_chars=4000, workers=8,
+                )
+                enriched = 0
+                for i, j in enumerate(jobs):
+                    body = body_map.get(j.url, "")
+                    if body and len(body) > len(j.snippet):
+                        jobs[i] = Job(
+                            source=j.source, external_id=j.external_id,
+                            title=j.title, company=j.company,
+                            location=j.location, url=j.url,
+                            posted_at=j.posted_at, snippet=body,
+                            salary=getattr(j, "salary", ""),
+                        )
+                        enriched += 1
+                log.info(
+                    "reliefweb: detail-page bodies fetched for %d/%d postings",
+                    enriched, len(jobs),
+                )
+            except Exception:
+                log.exception("reliefweb: detail-page fetch raised; continuing")
+
         sample_titles = [j.title for j in jobs[:5]]
 
     except requests.RequestException as e:

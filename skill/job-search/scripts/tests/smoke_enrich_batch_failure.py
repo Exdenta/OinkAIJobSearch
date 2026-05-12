@@ -186,7 +186,11 @@ def test_one_batch_fails_others_succeed() -> None:
             jobs=jobs,
             resume_text="MLOps engineer, 8 years Python and AWS.",
             timeout_s=60,
-            projected_prefs={"keywords": ["mlops"]},
+            prefs_text="MLOps engineer prefs",
+            # Single-pass: this test asserts batch-failure handling, not the
+            # two-pass merge — leaving two_pass on inflates primary-batch
+            # counts with the Sonnet pass and breaks the assertion below.
+            two_pass=False, max_jobs_per_call=25,
         )
     finally:
         job_enrich.log.removeHandler(handler)
@@ -311,7 +315,10 @@ def test_split_retry_recovers() -> None:
         jobs=jobs,
         resume_text="MLOps engineer.",
         timeout_s=60,
-        projected_prefs={"keywords": ["mlops"]},
+        prefs_text="MLOps engineer prefs",
+        # Single-pass: this test counts CLI invocations to verify split-retry
+        # behavior; two-pass would double them with a Sonnet pass.
+        two_pass=False, max_jobs_per_call=25,
     )
 
     _assert(

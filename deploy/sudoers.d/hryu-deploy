@@ -1,0 +1,16 @@
+# /etc/sudoers.d/hryu-deploy — deploy automation only.
+#
+# Install as: sudo install -o root -g root -m 0440 \
+#   /home/hryu/app/deploy/sudoers.d/hryu-deploy /etc/sudoers.d/hryu-deploy
+# Validate with `visudo -c` BEFORE logging out — a bad sudoers file locks
+# you out of root.
+#
+# Members of the hryu-deploy group can restart Hryu services and reload
+# Caddy without a password. They CANNOT escalate to a root shell.
+#
+# Bootstrap setup:
+#   sudo groupadd -f hryu-deploy
+#   sudo useradd -m -s /bin/bash -G hryu-deploy deploy   # if not present
+#   sudo usermod -aG hryu-deploy deploy
+
+%hryu-deploy  ALL=(root) NOPASSWD: /bin/systemctl restart hryu-bot.service, /bin/systemctl restart hryu-digest.service, /bin/systemctl reload caddy.service, /bin/systemctl status hryu-bot.service, /bin/systemctl status hryu-digest.service, /bin/systemctl status hryu-digest.timer, /bin/systemctl is-active hryu-bot.service, /bin/journalctl -u hryu-bot.service *, /bin/journalctl -u hryu-digest.service *

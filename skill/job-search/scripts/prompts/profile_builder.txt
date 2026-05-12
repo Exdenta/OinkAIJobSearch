@@ -26,7 +26,7 @@ the factual content (skills, experience, stated preferences) only.
 OUTPUT SCHEMA (every field MUST be present, even when empty)
 ============================================================
 {{
-  "schema_version": 2,
+  "schema_version": 3,
   "ideal_fit_paragraph":   "<2-4 sentences, plain text, no markdown>",
   "primary_role":          "<lowercase role family, e.g. 'frontend engineer'>",
   "target_levels":         ["<any of: junior, mid, middle, senior, lead, staff, principal>"],
@@ -42,7 +42,9 @@ OUTPUT SCHEMA (every field MUST be present, even when empty)
   "exclude_keywords":      ["<lowercase substring veto anywhere in body>"],
   "exclude_companies":     ["<company name, case preserved>"],
 
-  "locations":             ["<lowercase city/region/country/macro-region>"],
+  "onsite_locations":      ["<lowercase city/region — STRICT: onsite/hybrid OK only here>"],
+  "remote_regions":        ["<lowercase country/macro-region — remote OK in these>"],
+  "locations":             ["<lowercase — union of the two above, kept for back-compat>"],
   "remote":                "any" | "remote" | "hybrid" | "onsite",
   "time_zone_band":        "<e.g. 'UTC-1..UTC+3', empty string if unclear>",
 
@@ -192,47 +194,90 @@ DERIVATION RULES
 10. `exclude_companies` — ONLY names the user_description explicitly lists.
     Do NOT invent. If the user didn't name any, emit [].
 
-11. `locations` — cities/regions the user names, plus macro-regions that
-    contain their residence (e.g. a resident of Bilbao gets "bilbao",
-    "basque", "spain", "europe", "eu"). If user_description says "remote",
-    still keep geography tokens so we can filter remote-EU vs remote-Canada.
+11. `onsite_locations` — STRICT list of cities/regions where the user is
+    willing to work onsite or hybrid. Include ONLY tokens the user
+    explicitly named OR clearly implied as their physical residence area.
+    Do NOT add macro-regions ("europe", "eu", "emea") here — those belong
+    in `remote_regions` only. Examples:
+      - User says "Bilbao or Basque" → ["bilbao", "basque", "euskadi"]
+      - User says "London onsite" → ["london"]
+      - User says "Berlin or hybrid Munich" → ["berlin", "munich"]
+      - User says "remote only" → []  (no onsite OK)
+    Typical list size: 0-5 items. Keep tight.
 
-12. `remote`:
+12. `remote_regions` — countries / macro-regions where remote work is
+    acceptable. Use macro-region tokens to express "anywhere within X":
+      - EU member states + UK + Norway + Switzerland + Iceland + Liechtenstein → "europe", "eu"
+      - Europe + Middle East + Africa → "emea"
+      - US + Canada + Mexico → "north america"
+      - Mexico + Central + South America → "latam"
+      - Asia-Pacific → "apac"
+      - Truly any TZ → "anywhere"
+    Examples:
+      - User says "remote in EU" → ["europe", "eu", "spain", ...]
+        (include the home country verbatim too so country-specific remote
+        like "Remote · Spain" matches.)
+      - User says "remote US only" → ["united states", "us", "usa",
+        "remote-us", "north america"]
+      - User says "onsite Bilbao only, no remote" → []
+    Typical list size: 1-8 items.
+
+13. `locations` — UNION of `onsite_locations` and `remote_regions`,
+    de-duplicated. Kept for back-compat with v2 readers; downstream code
+    prefers the two split fields above when present.
+
+14. `remote`:
       - "remote only"/"fully remote"/"anywhere" → "remote"
       - "hybrid" → "hybrid"
       - "on-site"/"in-office" → "onsite"
+      - if user says BOTH "onsite in X" AND "remote elsewhere" → "any"
       - else → "any"
 
-13. `time_zone_band` — infer from locations. EU = "UTC-1..UTC+3", UK =
-    "UTC..UTC+1", US East = "UTC-5..UTC-4", US West = "UTC-8..UTC-7",
-    empty string if ambiguous/global.
+15. `time_zone_band` — infer from `remote_regions` and the candidate's
+    home location. EU = "UTC-1..UTC+3", UK = "UTC..UTC+1", US East =
+    "UTC-5..UTC-4", US West = "UTC-8..UTC-7". This field is consumed by
+    the AI scorer to penalize remote postings outside the band, so keep
+    it tight to the user's actual TZ tolerance. Empty string only if
+    user explicitly accepts any TZ.
 
-14. `salary_min_usd` — if user_description says a number, convert EUR/GBP/
+16. `salary_min_usd` — if user_description says a number, convert EUR/GBP/
     CAD ~1:1 to USD for our purposes. 0 otherwise. Never infer a floor
     from resume seniority.
 
-15. `drop_if_salary_unknown` — TRUE only if user_description explicitly
+17. `drop_if_salary_unknown` — TRUE only if user_description explicitly
     says "must list salary" or similar.
 
-16. `language` — working language if named. Empty string otherwise.
+18. `language` — working language if named. Empty string otherwise.
 
-17. `max_age_hours` — if user_description says a recency window, convert
+19. `max_age_hours` — if user_description says a recency window, convert
     ("last week" = 168, "last 3 days" = 72, "this week" = 168). Else 0.
 
-18. `min_match_score` — default 0. If user_description says something like
+20. `min_match_score` — default 0. If user_description says something like
     "only strong matches", set 3; "only great matches", set 4.
 
-19. `search_seeds.linkedin.queries` — up to 5 entries. Each `q` is a
+21. `search_seeds.linkedin.queries` — up to 5 entries. Each `q` is a
     short, LinkedIn-UI-shaped phrase (NOT a boolean query). Each `geo` is
     a LinkedIn-recognizable region name (e.g. "Spain", "European Union",
     "United Kingdom", "Germany", "Belgium", "Netherlands", "Ireland",
     "Poland", "United States"). `f_TPR` is always "r86400" (past 24h).
 
+    GEO RESTRICTION — pick `geo` values ONLY from regions the candidate
+    has actually OK'd. Specifically:
+      * countries / macro-regions in `onsite_locations` or `remote_regions`,
+      * AND the LinkedIn-canonical name covering the candidate's home
+        country (e.g. user residence = Bilbao → "Spain" allowed; "European
+        Union" allowed because the user listed "europe").
+    DO NOT add Germany / Poland / Netherlands etc. unless those countries
+    are explicitly in `onsite_locations` or fall inside a macro-region
+    listed in `remote_regions` AND the user's free_text suggests they're
+    open to roles based there. When the user only wants "remote in EU",
+    prefer `geo="European Union"` over individual member states — fewer
+    queries, less off-locale noise.
+
     Diversify GEOS across the 5 queries so they don't dedupe each other
-    (LinkedIn over-deduplicates same-region searches). Pick five
-    DIFFERENT regions when possible. Cover the candidate's primary geo
-    + 1-2 macro EU regions + 1-2 specific English-speaking EU hubs
-    (UK / Ireland / Netherlands / Germany / Poland depending on stack).
+    (LinkedIn over-deduplicates same-region searches). Pick DIFFERENT
+    regions when possible WITHIN the allowed set above — never add
+    out-of-locale geos just to diversify.
 
     Construct each `q` using vocabulary recruiters write, NOT resume
     jargon. By role family:
@@ -240,13 +285,15 @@ DERIVATION RULES
       - Tech/engineering — primary_role variant + a top stack token:
         a. primary_role + top stack_primary in candidate's main geo
         b. primary_role + remote/region hint in a wider region
-        c. (optional) stack_secondary angle in a different geo
-        Example (Vue frontend mid, Bilbao):
+        c. (optional) stack_secondary angle in another candidate-allowed geo
+        Example (Vue frontend mid, Bilbao, remote-EU OK):
           [
             {{"q":"frontend vue developer","geo":"Spain","f_TPR":"r86400"}},
             {{"q":"react typescript remote","geo":"European Union","f_TPR":"r86400"}},
-            {{"q":"nuxt frontend","geo":"Germany","f_TPR":"r86400"}}
+            {{"q":"nuxt frontend","geo":"Spain","f_TPR":"r86400"}}
           ]
+        Note: every `geo` is a region the candidate OK'd. No Germany,
+        Poland, Netherlands etc. unless the user explicitly listed them.
 
       - Research/academic — operational role + thematic specialty + geo:
         Use nouns recruiters use (researcher, fellow, postdoc, lecturer,
@@ -266,7 +313,7 @@ DERIVATION RULES
             {{"q":"M&E specialist humanitarian","geo":"European Union","f_TPR":"r86400"}}
           ]
 
-20. `search_seeds.web_search.seed_phrases` — 5-8 items. Each is a short
+22. `search_seeds.web_search.seed_phrases` — 5-8 items. Each is a short
     search-engine query (lowercase, no boolean operators needed; the
     WebSearch agent handles those). Mix:
       - 2 generic: "<role variant> <top stack/specialty> <region or remote>"
@@ -298,24 +345,24 @@ DERIVATION RULES
         "site:teamtailor.com programme officer NGO europe"
       ]
 
-21. `search_seeds.web_search.ats_domains` — ONLY from this allowlist:
+23. `search_seeds.web_search.ats_domains` — ONLY from this allowlist:
       greenhouse.io, lever.co, ashbyhq.com, workable.com, personio.de,
       recruitee.com, myworkday.com, bamboohr.com, teamtailor.com,
       smartrecruiters.com
     Pick 3-6 that are popular for the candidate's region and role.
 
-22. `search_seeds.web_search.focus_notes` — 1-2 short plain-text sentences
+24. `search_seeds.web_search.focus_notes` — 1-2 short plain-text sentences
     telling the web_search sub-agent what to prioritize and what to avoid
     (e.g. "Prefer EU-timezone-friendly remote roles. De-prioritize mobile-
     first companies and Ruby shops."). No markdown.
 
-23. `ideal_fit_paragraph` — 2-4 plain sentences describing the ideal job
+25. `ideal_fit_paragraph` — 2-4 plain sentences describing the ideal job
     fit ("Mid-level frontend engineer role working primarily in Vue 2 or
     React, on a European-timezone remote team or in Bilbao, building
     production UIs rather than dashboards or admin tooling."). Third-
     person, neutral tone, no markdown.
 
-24. `free_text` — copy the user_description input VERBATIM (strip leading/
+26. `free_text` — copy the user_description input VERBATIM (strip leading/
     trailing whitespace, cap at 500 chars). If user_description is empty,
     emit "".
 
@@ -325,7 +372,9 @@ HARD CONSTRAINTS (the parser checks these)
  - Every top-level key in the schema MUST be present.
  - Every list field MUST be an array (even if empty).
  - `remote` MUST be one of: "any", "remote", "hybrid", "onsite".
- - `schema_version` MUST be the integer 2.
+ - `schema_version` MUST be the integer 3.
+ - `onsite_locations` and `remote_regions` MUST both be present (arrays;
+   may be empty).
  - All strings in list fields other than `exclude_companies` MUST be
    lowercase.
  - `title_must_match` and `title_exclude` strings must be ≤ 40 chars each.
@@ -351,7 +400,7 @@ no Solidity, no senior/staff roles."
 
 Output:
 {{
-  "schema_version": 2,
+  "schema_version": 3,
   "ideal_fit_paragraph": "Mid-level frontend engineer working primarily in Vue 2 or React with TypeScript, preferring a European-timezone remote team or an on-site role in Bilbao. Focus on production user interfaces for end-user apps rather than heavy internal tooling.",
   "primary_role": "frontend engineer",
   "target_levels": ["mid", "middle"],
@@ -364,8 +413,10 @@ Output:
   "title_exclude": ["senior", "staff", "principal", "lead", "head", "director", "vp", "manager", "backend", "back-end", "back end", "data engineer", "devops", "sre", "qa engineer", "security engineer", "ios", "android", "mobile"],
   "exclude_keywords": ["wordpress", "drupal", "solidity", "salesforce", "bootcamp", "unpaid"],
   "exclude_companies": [],
+  "onsite_locations": ["bilbao", "basque", "euskadi"],
+  "remote_regions": ["spain", "europe", "eu", "emea"],
   "locations": ["bilbao", "basque", "euskadi", "spain", "europe", "eu", "emea"],
-  "remote": "remote",
+  "remote": "any",
   "time_zone_band": "UTC-1..UTC+3",
   "salary_min_usd": 0,
   "drop_if_salary_unknown": false,
@@ -377,7 +428,7 @@ Output:
       "queries": [
         {{"q": "frontend vue developer", "geo": "Spain", "f_TPR": "r86400"}},
         {{"q": "react typescript remote", "geo": "European Union", "f_TPR": "r86400"}},
-        {{"q": "nuxt frontend", "geo": "Germany", "f_TPR": "r86400"}}
+        {{"q": "vue frontend engineer", "geo": "Spain", "f_TPR": "r86400"}}
       ]
     }},
     "web_search": {{
@@ -405,7 +456,7 @@ Must list salary."
 
 Output:
 {{
-  "schema_version": 2,
+  "schema_version": 3,
   "ideal_fit_paragraph": "Senior backend engineer role working primarily in Python with Django or FastAPI, on a US-timezone remote team building production services backed by Postgres and AWS infrastructure. Individual-contributor track, not people management.",
   "primary_role": "backend engineer",
   "target_levels": ["senior"],
@@ -418,6 +469,8 @@ Output:
   "title_exclude": ["staff", "principal", "lead", "head", "director", "vp", "manager", "em ", "engineering manager", "frontend", "front-end", "front end", "data engineer", "ios", "android", "mobile", "devops", "sre", "qa engineer", "security engineer"],
   "exclude_keywords": ["php", "wordpress", "drupal", "salesforce developer"],
   "exclude_companies": [],
+  "onsite_locations": ["austin", "texas"],
+  "remote_regions": ["united states", "us", "usa", "remote-us", "north america"],
   "locations": ["united states", "us", "usa", "remote-us", "austin", "texas", "north america"],
   "remote": "remote",
   "time_zone_band": "UTC-8..UTC-4",
@@ -464,7 +517,7 @@ titles. EU/EMEA, remote OK. Prefer English-language roles."
 
 Output:
 {{
-  "schema_version": 2,
+  "schema_version": 3,
   "ideal_fit_paragraph": "Mid-level qualitative researcher role in an NGO, academic, or policy organisation working on migration, peace and conflict, or sustainability themes. Open to programme officer, project officer, M&E specialist, postdoctoral fellow, lecturer, or consultant titles in any EU country including remote, with English as the working language.",
   "primary_role": "qualitative researcher",
   "target_levels": ["mid", "middle"],
@@ -477,6 +530,8 @@ Output:
   "title_exclude": ["director", "head", "vp", "chief", "ux researcher", "user researcher", "market researcher", "quantitative researcher", "quant", "data engineer", "software engineer", "developer", "sales", "marketing"],
   "exclude_keywords": ["quantitative finance", "market research", "ux research", "user research", "bootcamp", "unpaid"],
   "exclude_companies": [],
+  "onsite_locations": ["bilbao", "basque", "euskadi"],
+  "remote_regions": ["spain", "europe", "eu", "emea"],
   "locations": ["bilbao", "basque", "euskadi", "spain", "europe", "eu", "emea"],
   "remote": "any",
   "time_zone_band": "UTC-1..UTC+3",

@@ -25,11 +25,12 @@ from __future__ import annotations
 import logging
 import time
 
+import re
 import requests
 from bs4 import BeautifulSoup
 
 from dedupe import Job
-from text_utils import fix_mojibake
+from text_utils import fix_mojibake, strip_html
 import forensic
 
 log = logging.getLogger(__name__)
@@ -50,20 +51,62 @@ SEARCH = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search
 # well under LinkedIn's anonymous rate limit when paced.
 MAX_USER_QUERIES = 5
 
+# v2.3: cross-product cap. When user_seeds use the new separated shape
+# {queries: [...], geos: [...]}, the dispatcher computes the full
+# cross-product and trims to this many (q × geo) combinations after
+# _diversify_geo ordering. Default = 10 lets a 3-query × 4-geo set
+# saturate without blowing the rate budget.
+MAX_LINKEDIN_DISPATCHES = 10
+
+# LinkedIn's guest-search location resolver is broad but inconsistent:
+#   * All ISO 3166 country names resolve (Spain, Germany, ...).
+#   * Major cities mostly resolve (New York, London, Madrid, Berlin,
+#     Barcelona, Paris, Dublin, San Francisco) but some don't
+#     (Amsterdam, Bilbao, "Greater X Metropolitan Area"; resolver
+#     misses depend on LinkedIn's internal geoUrn registry, which
+#     changes over time and has no public list).
+#   * Country clusters: "European Union", "European Economic Area",
+#     "Asia Pacific", "APAC", "Worldwide" resolve.
+#   * Aliases that LOOK like macros DON'T resolve: "EMEA", "LATAM",
+#     "Middle East and North Africa".
+#
+# Rather than maintain a brittle hardcoded list, the dispatcher tries
+# every geo Opus proposes and dynamically blacklists those that page-1
+# 0-results AT FETCH TIME (see `fetch_for_user`). That way:
+#   * Unknown geo wastes ONE search request, not the full pagination
+#     budget (4 pages × 1.5s = 6s saved per dead combo).
+#   * Same-run sibling dispatches reusing the dead geo are skipped.
+#   * Opus picks freely; LinkedIn's actual resolver is the authority.
+
+
+def _normalize_linkedin_geo(geo: str) -> str | None:
+    """Trim + clamp length. No allowlist — let LinkedIn's resolver decide.
+
+    Returns None for empty input so callers can detect "no geo" cleanly.
+    """
+    g = (geo or "").strip()[:80]
+    return g or None
+
 # Per-query cap: each profile query runs independently up to this many
 # postings. Total jobs returned by `fetch_for_user` is bounded by
 # `MAX_USER_QUERIES * PER_QUERY_CAP`, NOT a single shared `max_per_source`
 # ceiling — that legacy behavior caused query 1 to saturate the budget and
 # starve queries 2..N (e.g. "frontend Spain" took the whole 12, "vue Germany"
-# never executed). Setting it to 10 matches the LinkedIn page size so a
-# single page per query fills it; pagination kicks in only when fewer than
-# this many results come back from page 1.
-PER_QUERY_CAP = 30
+# never executed).
+#
+# v2.3: doubled from 30 → 60. With PAGINATION_STARTS=(10,25,50) we now
+# walk 4 pages per query (start=0/10/25/50), each returning ~25 fresh
+# cards after dedupe → ~75-100 unique results per query, 5 queries
+# total → max ~300-500 LinkedIn candidates per user per run (capped at
+# 60/query). LinkedIn anonymous rate limit handles this comfortably at
+# PACE_SECONDS=1.5 between requests.
+PER_QUERY_CAP = 60
 
 # How many additional pages to try per query when page 1 is short of
-# `PER_QUERY_CAP`. LinkedIn returns 25 cards per page, so 2 extra pages
-# yields up to 75 candidates per query while keeping request count modest.
-PAGINATION_STARTS = (10, 25)
+# `PER_QUERY_CAP`. LinkedIn returns 25 cards per page; added start=50
+# alongside (10, 25) so each query can sweep four pages. ~75-100
+# unique results per query after URL dedupe.
+PAGINATION_STARTS = (10, 25, 50)
 
 # Polite pause between back-to-back LinkedIn requests. Kept as a named
 # constant so tests can monkeypatch it.
@@ -218,61 +261,141 @@ def _diversify_geo(queries: list[dict]) -> list[dict]:
     return out
 
 
-def fetch_for_user(filters: dict, user_seeds: dict | None) -> list[Job]:
-    """Per-user LinkedIn fetch — runs up to 3 queries shaped by the profile.
+def _flatten_user_seeds(user_seeds: dict | None) -> list[dict]:
+    """Normalize either schema (paired or separated) into a flat list of
+    {q, geo, f_TPR} dispatch dicts.
 
-    `user_seeds` is the `search_seeds.linkedin` dict from the user's profile:
+    Separated shape (v2.3):
+        {"queries": [<str>, ...], "geos": [<str>, ...], "f_TPR": "r86400"}
+        → cross-product, capped at MAX_LINKEDIN_DISPATCHES after
+          _diversify_geo for round-robin geo coverage.
 
-        {"queries": [{"q": "...", "geo": "...", "f_TPR": "r86400"}, ...]}
+    Paired shape (v2.0 back-compat):
+        {"queries": [{"q":..., "geo":..., "f_TPR":...}, ...]}
+        → one dispatch per entry, capped at MAX_USER_QUERIES.
 
-    For each query we run a small page sequence, collect matching cards,
-    and fold them into the combined result. Behavior:
-
-      * enforce a hard cap of `MAX_USER_QUERIES` (3) queries;
-      * each query gets its OWN budget of `PER_QUERY_CAP` postings — no
-        shared total cap. Q1 saturating the budget no longer starves Q2/Q3;
-      * if page 1 returns fewer than `PER_QUERY_CAP` unique results, walk
-        `PAGINATION_STARTS` (start=10, then start=25) until the budget fills
-        or LinkedIn runs out of results;
-      * `_diversify_geo` reorders queries so the i-th query's geo differs
-        from the (i-1)-th when possible — keeps each geo's first page fresh
-        (LinkedIn dedups same-geo searches heavily);
-      * dedupe on URL across queries AND pages;
-      * sleep `PACE_SECONDS` between requests (but NOT after the final one);
-      * stop early on rate-limit — within a query we abort that query's
-        pagination; across queries we abort the whole batch.
-
-    If `user_seeds` is None / missing / has no usable queries, returns []
-    — there's no global default query to fall back to. Users get LinkedIn
-    results only after the Opus profile builder has produced search seeds.
+    Returns [] for malformed / empty input.
     """
-    queries: list[dict] = []
-    if isinstance(user_seeds, dict):
-        raw_queries = user_seeds.get("queries") or []
-        if isinstance(raw_queries, list):
-            for item in raw_queries[:MAX_USER_QUERIES]:
-                if not isinstance(item, dict):
-                    continue
-                q = str(item.get("q") or "").strip()
-                if not q:
-                    continue
-                queries.append({
-                    "q": q[:200],
-                    "geo": str(item.get("geo") or "").strip()[:80],
-                    "f_TPR": str(item.get("f_TPR") or "r86400").strip()[:12],
-                })
+    if not isinstance(user_seeds, dict):
+        return []
+    raw_queries = user_seeds.get("queries") or []
+    if not isinstance(raw_queries, list) or not raw_queries:
+        return []
+
+    default_tpr = str(user_seeds.get("f_TPR") or "r86400").strip()[:12]
+
+    # Detect schema variant by the first entry's type.
+    first = raw_queries[0]
+    if isinstance(first, str):
+        # SEPARATED: list-of-strings + a sibling `geos` list.
+        q_strings: list[str] = [
+            q.strip()[:200]
+            for q in raw_queries
+            if isinstance(q, str) and q.strip()
+        ][:MAX_USER_QUERIES]
+        raw_geos = user_seeds.get("geos") or []
+        if not isinstance(raw_geos, list):
+            raw_geos = []
+        geo_strings: list[str] = []
+        for g in raw_geos:
+            if not isinstance(g, str) or not g.strip():
+                continue
+            normalized = _normalize_linkedin_geo(g)
+            if normalized:
+                geo_strings.append(normalized)
+        if not geo_strings:
+            # No geos provided → run each query without a location filter
+            # (LinkedIn defaults to worldwide).
+            geo_strings = [""]
+        # Cross-product.
+        combos: list[dict] = []
+        for q in q_strings:
+            for g in geo_strings:
+                combos.append({"q": q, "geo": g, "f_TPR": default_tpr})
+        # _diversify_geo (defined below) reorders so consecutive entries
+        # hit distinct geos; trim to dispatch cap.
+        combos = _diversify_geo(combos)
+        return combos[:MAX_LINKEDIN_DISPATCHES]
+
+    if isinstance(first, dict):
+        # PAIRED (v2.0 legacy): each entry is {q, geo, f_TPR}.
+        out: list[dict] = []
+        for item in raw_queries[:MAX_USER_QUERIES]:
+            if not isinstance(item, dict):
+                continue
+            q = str(item.get("q") or "").strip()
+            if not q:
+                continue
+            raw_geo = str(item.get("geo") or "").strip()
+            geo = (_normalize_linkedin_geo(raw_geo) or "") if raw_geo else ""
+            out.append({
+                "q": q[:200],
+                "geo": geo,
+                "f_TPR": str(item.get("f_TPR") or default_tpr).strip()[:12],
+            })
+        return out
+
+    return []
+
+
+def fetch_for_user(filters: dict, user_seeds: dict | None) -> list[Job]:
+    """Per-user LinkedIn fetch — dispatches a cross-product of queries × geos.
+
+    Two `user_seeds.linkedin` schemas supported:
+
+      v2.3 SEPARATED (new):
+          {"queries": ["frontend react typescript", "react remote"],
+           "geos":    ["Spain", "European Union", "Bilbao, Basque Country"],
+           "f_TPR":   "r86400"}
+        → cross-product: each query is run against EVERY geo, capped at
+          `MAX_LINKEDIN_DISPATCHES` total (q × geo) combinations after
+          _diversify_geo ordering.
+
+      v2.0 PAIRED (legacy, still supported):
+          {"queries": [{"q":"react remote", "geo":"Spain", "f_TPR":"r86400"},
+                       ...]}
+        → one dispatch per entry, same behavior as before. Existing v4
+          profiles built before 2026-05-12 use this shape; they keep
+          working.
+
+    Behavior per dispatch:
+      * each (q, geo) combo gets its OWN budget of `PER_QUERY_CAP` postings;
+      * walks pages `0, *PAGINATION_STARTS` (start=0,10,25,50) until the
+        budget fills or LinkedIn returns 0;
+      * dedupes on URL across all dispatches and pages;
+      * `PACE_SECONDS` sleep between requests;
+      * `_RateLimited` aborts the whole batch (returns what we have).
+
+    If user_seeds is None / missing / has no usable queries → returns [].
+    """
+    queries: list[dict] = _flatten_user_seeds(user_seeds)
 
     if not queries:
         log.debug("linkedin: no user_seeds provided, returning []")
         return []
 
+    # _flatten_user_seeds already _diversify_geo'd the cross-product
+    # branch. Re-call here for the legacy paired branch (cheap; for an
+    # already-diversified list it's idempotent).
     queries = _diversify_geo(queries)
     remote = str(filters.get("remote") or "")
     seen_urls: set[str] = set()
     combined: list[Job] = []
     request_idx = 0
+    # Dynamic geo blacklist for this run. When a geo returns page-1
+    # 0-results, sibling combos reusing that geo are skipped — saves
+    # the pagination budget (3 extra requests × 1.5s) on every dead
+    # combo. Geo "" (worldwide) is never blacklisted; LinkedIn always
+    # returns something for an empty location.
+    dead_geos: set[str] = set()
 
     for q_idx, query in enumerate(queries):
+        if query["geo"] and query["geo"] in dead_geos:
+            log.info(
+                "linkedin[user]: skipping query %d/%d (geo %r already returned 0 this run)",
+                q_idx + 1, len(queries), query["geo"],
+            )
+            continue
         per_query_total = 0
         # Page sequence: start=0 always, then PAGINATION_STARTS if budget
         # not yet filled. Stops as soon as a page returns 0 (no more results).
@@ -305,8 +428,122 @@ def fetch_for_user(filters: dict, user_seeds: dict | None) -> list[Job]:
                 q_idx + 1, len(queries), query["q"], query["geo"],
                 start, len(batch), per_query_total, len(combined),
             )
+            # Empty PAGE 1 with a non-blank geo → mark that geo dead
+            # for this run so sibling (q, geo) combos skip ahead.
+            if not batch and start == 0 and query["geo"]:
+                dead_geos.add(query["geo"])
+                log.warning(
+                    "linkedin: geo %r did not resolve on page 1 — "
+                    "blacklisted for the remainder of this run",
+                    query["geo"],
+                )
             # Empty page → no point trying further offsets for this query.
             if not batch:
                 break
 
+    # Algorithm v2.2 — Option 4: LinkedIn search cards only carry title +
+    # company + location. Without the detail-page body, Sonnet scored every
+    # LinkedIn posting 0 even on perfectly targeted queries (594-job run
+    # 2026-05-12 produced 0/42 ≥2 from linkedin). Fetch the body for each
+    # card here, paced via PACE_SECONDS so we stay under LinkedIn's
+    # anonymous rate limit. Single _RateLimited hit aborts the body-fetch
+    # loop but keeps whatever bodies we've already fetched.
+    if combined:
+        combined = _fetch_detail_bodies(combined)
+
     return combined
+
+
+# LinkedIn's public detail page (`/jobs/view/...`) is gated — anonymous
+# visitors only see "sign in" prompts and similar-job sidebars, not the
+# description body. The PUBLIC GUEST endpoint
+# `/jobs-guest/jobs/api/jobPosting/<id>` returns the same posting's
+# description as an unauthenticated HTML fragment, wrapped in a
+# `show-more-less-html__markup` div. We hit THAT, not the gated view.
+_LI_GUEST_POST_URL = "https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{jid}"
+_LI_DESC_BLOCK_RE = re.compile(
+    r'show-more-less-html__markup[^>]*>(.*?)</div>',
+    re.DOTALL,
+)
+_LI_JOB_ID_RE = re.compile(r"(\d{8,})(?:[/?#]|$)")
+
+
+def _linkedin_job_id_from_url(url: str) -> str | None:
+    """LinkedIn job-view URLs end with `<slug>-<jobId>[?...]`. Pull the id.
+
+    Returns None on URLs that don't match — caller falls back to the
+    raw HTML fetch / skips the body.
+    """
+    if not url:
+        return None
+    m = _LI_JOB_ID_RE.search(url)
+    return m.group(1) if m else None
+
+
+def _fetch_detail_bodies(jobs: list[Job]) -> list[Job]:
+    """Populate ``Job.snippet`` for each LinkedIn card from the public
+    `jobs-guest/jobs/api/jobPosting/<id>` endpoint.
+
+    Sequentially paced via ``PACE_SECONDS`` (LinkedIn rate-limits
+    concurrent guest IPs aggressively). Stops early on the first 429/403
+    — we'd rather return jobs with empty snippets than burn the rest of
+    the day's quota.
+
+    Returns a new list (we reconstruct each entry so partial-state
+    mutations aren't visible to callers).
+    """
+    enriched: list[Job] = []
+    rate_limit_hit = False
+    fetched_n = 0
+    for j in jobs:
+        if rate_limit_hit or not j.url:
+            enriched.append(j)
+            continue
+        jid = _linkedin_job_id_from_url(j.url)
+        if not jid:
+            enriched.append(j)
+            continue
+        time.sleep(PACE_SECONDS)
+        endpoint = _LI_GUEST_POST_URL.format(jid=jid)
+        try:
+            resp = requests.get(endpoint, headers=UA, timeout=15)
+        except requests.RequestException as e:
+            log.debug("linkedin detail %s: %s", endpoint, e)
+            enriched.append(j)
+            continue
+        if resp.status_code in (429, 403):
+            log.warning(
+                "linkedin guest detail rate-limited (%d) at %s — aborting body fetches",
+                resp.status_code, endpoint,
+            )
+            rate_limit_hit = True
+            enriched.append(j)
+            continue
+        if resp.status_code >= 400:
+            enriched.append(j)
+            continue
+        m = _LI_DESC_BLOCK_RE.search(resp.text or "")
+        if not m:
+            enriched.append(j)
+            continue
+        # Inside show-more-less-html__markup: <strong>, <ul>, <li>, <br>,
+        # plain text. Strip tags and unescape entities → clean body text.
+        from text_utils import strip_html as _strip
+        body = fix_mojibake(_strip(m.group(1)))
+        if len(body) > 4000:
+            body = body[:4000].rstrip() + "…"
+        if body and len(body) > len(j.snippet or ""):
+            enriched.append(Job(
+                source=j.source, external_id=j.external_id,
+                title=j.title, company=j.company, location=j.location,
+                url=j.url, posted_at=j.posted_at, snippet=body,
+                salary=getattr(j, "salary", ""),
+            ))
+            fetched_n += 1
+        else:
+            enriched.append(j)
+    log.info(
+        "linkedin: guest-API bodies fetched for %d/%d cards (rate_limited=%s)",
+        fetched_n, len(jobs), rate_limit_hit,
+    )
+    return enriched

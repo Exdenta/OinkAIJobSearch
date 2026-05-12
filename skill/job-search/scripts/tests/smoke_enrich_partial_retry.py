@@ -149,7 +149,8 @@ def test_partial_recovered_via_targeted_reask() -> None:
             jobs=jobs,
             resume_text="MLOps engineer, 8 years Python and AWS.",
             timeout_s=60,
-            projected_prefs={"keywords": ["mlops"]},
+            prefs_text="MLOps engineer prefs",
+            two_pass=False, max_jobs_per_call=25,
         )
     finally:
         job_enrich.log.removeHandler(handler)
@@ -241,7 +242,8 @@ def test_partial_retry_is_capped_at_one() -> None:
         jobs=jobs,
         resume_text="MLOps engineer.",
         timeout_s=60,
-        projected_prefs={"keywords": ["mlops"]},
+        prefs_text="MLOps engineer prefs",
+        two_pass=False, max_jobs_per_call=25,
     )
 
     _assert(
@@ -280,7 +282,8 @@ def test_full_batch_no_retry() -> None:
         jobs=jobs,
         resume_text="MLOps engineer.",
         timeout_s=60,
-        projected_prefs={"keywords": ["mlops"]},
+        prefs_text="MLOps engineer prefs",
+        two_pass=False, max_jobs_per_call=25,
     )
 
     _assert(

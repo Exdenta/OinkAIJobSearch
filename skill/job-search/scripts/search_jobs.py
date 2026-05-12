@@ -67,6 +67,7 @@ from user_profile import (                                 # noqa: E402
     effective_filters,
     project_to_prefs,
 )
+import user_files                                          # noqa: E402
 import pig_stickers as _pigs                               # noqa: E402
 
 try:
@@ -190,21 +191,79 @@ def post_filter(jobs: list[Job], filters: dict) -> list[Job]:
 
 # ---------- fetch ----------
 
+def _fetch_one_source(
+    key: str,
+    mod,
+    filters: dict,
+    *,
+    store: MonitorStore | None = None,
+    pipeline_run_id: int | None = None,
+) -> tuple[str, list[Job], str | None]:
+    """Run ONE source adapter inside its telemetry contexts.
+
+    Returns (key, jobs, err_str). `err_str=None` on success; string
+    summary on failure (adapter exception) — the parallel orchestrator
+    collects errors and surfaces them via the legacy `errors` list.
+    """
+    try:
+        with forensic.step(
+            f"sources.{key}.fetch",
+            input={
+                "max_age_hours": filters.get("max_age_hours"),
+                "max_per_source": filters.get("max_per_source"),
+                "sources_enabled": list((filters.get("sources") or {}).keys()),
+            },
+            run_id=pipeline_run_id,
+        ) as fctx:
+            if store is not None and pipeline_run_id is not None:
+                with source_run(store, pipeline_run_id, key) as sctx:
+                    fetched = mod.fetch(filters) or []
+                    sctx.set_count(len(fetched))
+            else:
+                fetched = mod.fetch(filters) or []
+            fctx.set_output({
+                "count": len(fetched),
+                "sample_titles": [getattr(j, "title", "")[:80] for j in fetched[:5]],
+            })
+        log.info("  %s → %d raw postings", key, len(fetched))
+        return key, fetched, None
+    except Exception as e:
+        log.exception("%s fetch raised: %s", key, e)
+        return key, [], f"{type(e).__name__}: {str(e)[:200]}"
+
+
 def fetch_all(
     filters: dict,
     *,
     store: MonitorStore | None = None,
     pipeline_run_id: int | None = None,
 ) -> tuple[list[Job], list[str]]:
-    """Fan out to every enabled global source adapter.
+    """Fan out to every enabled global source adapter, IN PARALLEL.
 
-    When `store` and `pipeline_run_id` are supplied, each adapter call is
-    wrapped in a `source_run` telemetry context so per-source health is
-    persisted. The dry-run path passes neither and skips telemetry.
+    Algorithm v2.2: switched from a serial for-loop to a thread pool
+    (configurable via `defaults.ai_source_workers`, default 6). Source
+    adapters are network-IO bound (HTTP/RSS/JSON gets, occasional
+    Claude CLI subprocess for curated_boards/devex/un_careers/
+    ub_doctoral) so threading scales them well — wall time drops from
+    ~11-23 min serial to ~2-4 min for 23 adapters.
+
+    Thread-safety notes:
+      * `forensic.log_step` is explicitly thread-safe (per-line append).
+      * `MonitorStore.source_run` opens a fresh sqlite3 connection per
+        call via `DB._conn`, so concurrent inserts don't collide.
+      * Adapters keep their own internal concurrency (LinkedIn paces
+        1.5s between requests, impactpool fans out 8 detail-page
+        workers). Running multiple adapters in parallel multiplies
+        outbound traffic — keep `ai_source_workers` modest.
+
+    When `store` and `pipeline_run_id` are supplied, each adapter call
+    is still wrapped in a `source_run` telemetry context. The dry-run
+    path passes neither and skips telemetry.
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     enabled = filters.get("sources") or {}
-    all_jobs: list[Job] = []
-    errors: list[str] = []
+    tasks: list[tuple[str, object]] = []
     for key, mod in SOURCES.items():
         if key == "remote_boards":
             if not any(enabled.get(k, True) for k in ("remoteok", "remotive", "weworkremotely")):
@@ -214,39 +273,45 @@ def fetch_all(
                 continue
         elif not enabled.get(key, True):
             continue
-        log.info("Fetching from %s…", key)
-        # Forensic step + telemetry wrap. The source_run ctx writes one row
-        # per (pipeline_run, source). The forensic.step writes a JSONL line
-        # capturing inputs (filter shape) + outputs (count + sample titles)
-        # so failures and 0-result runs can be analyzed post-hoc. Both are
-        # opt-out via env (FORENSIC_OFF / no store). On exception we record
-        # 'failed' to source_runs, capture the error to forensic, and
-        # continue with the partial-run semantics the legacy path used.
-        try:
-            with forensic.step(
-                f"sources.{key}.fetch",
-                input={
-                    "max_age_hours": filters.get("max_age_hours"),
-                    "max_per_source": filters.get("max_per_source"),
-                    "sources_enabled": list((filters.get("sources") or {}).keys()),
-                },
-                run_id=pipeline_run_id,
-            ) as fctx:
-                if store is not None and pipeline_run_id is not None:
-                    with source_run(store, pipeline_run_id, key) as sctx:
-                        fetched = mod.fetch(filters) or []
-                        sctx.set_count(len(fetched))
-                else:
-                    fetched = mod.fetch(filters) or []
-                fctx.set_output({
-                    "count": len(fetched),
-                    "sample_titles": [getattr(j, "title", "")[:80] for j in fetched[:5]],
-                })
-            log.info("  %s → %d raw postings", key, len(fetched))
+        tasks.append((key, mod))
+
+    workers = int(filters.get("ai_source_workers") or 6)
+    log.info("fetch_all: dispatching %d sources across %d workers",
+             len(tasks), workers)
+
+    all_jobs: list[Job] = []
+    errors: list[str] = []
+    if workers <= 1 or len(tasks) <= 1:
+        for key, mod in tasks:
+            _k, fetched, err = _fetch_one_source(
+                key, mod, filters,
+                store=store, pipeline_run_id=pipeline_run_id,
+            )
             all_jobs.extend(fetched)
-        except Exception as e:
-            log.exception("%s fetch raised: %s", key, e)
-            errors.append(key)
+            if err is not None:
+                errors.append(_k)
+        return all_jobs, errors
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [
+            pool.submit(
+                _fetch_one_source, key, mod, filters,
+                store=store, pipeline_run_id=pipeline_run_id,
+            )
+            for key, mod in tasks
+        ]
+        for fut in as_completed(futures):
+            try:
+                key, fetched, err = fut.result()
+            except Exception as e:
+                # _fetch_one_source already catches & returns errs;
+                # this is the belt-and-braces guard.
+                log.exception("fetch_all worker raised: %s", e)
+                errors.append("worker_exception")
+                continue
+            all_jobs.extend(fetched)
+            if err is not None:
+                errors.append(key)
     return all_jobs, errors
 
 
@@ -383,27 +448,44 @@ def run(dry_run: bool = False, only_chat: int | None = None) -> int:
                 chat_id = int(u["chat_id"])
                 stats["users_total"] += 1
 
+                # Algorithm v2: profile JSON is now a thin envelope
+                # (search_seeds + bookkeeping). Scoring inputs come from the
+                # per-user files state/users/<chat_id>/{resume.txt,prefs.txt}.
+                # The DB column users.min_match_score holds the ⭐ floor
+                # (survives profile rebuilds, unlike the JSON one used to).
                 profile = profile_from_json(db.get_user_profile(chat_id))
-                free_text = (db.get_prefs_free_text(chat_id) or "").strip()
+                resume_text = user_files.read_resume(chat_id)
+                prefs_text = user_files.read_prefs(chat_id)
+                free_text = prefs_text  # legacy alias for downstream callers
 
                 effective = effective_filters(filters, profile)
-                if profile is not None and not is_empty_profile(profile):
-                    log.info(
-                        "User %s: profile "
-                        "(keywords=%s title_must=%s title_excl=%s locations=%s remote=%s seniority=%s)",
-                        chat_id,
-                        effective.get("keywords") or [],
-                        effective.get("title_must_match") or [],
-                        effective.get("title_exclude") or [],
-                        effective.get("locations") or [],
-                        effective.get("remote") or "any",
-                        effective.get("seniority") or "any",
-                    )
-                else:
-                    log.info("User %s: no profile yet → inherits globals", chat_id)
+                log.info(
+                    "User %s: resume_chars=%d prefs_chars=%d seeds=%s",
+                    chat_id, len(resume_text), len(prefs_text),
+                    bool((profile or {}).get("search_seeds")),
+                )
 
                 user_pool = post_filter(jobs_raw, effective)
                 log.info("User %s: post_filter %d → %d", chat_id, len(jobs_raw), len(user_pool))
+
+                # Algorithm v2.3: per-user source toggles. If the user
+                # has an `enabled_sources` list (set by the profile
+                # builder at build time, optionally edited via the
+                # /sources UI), drop pool entries whose source isn't in
+                # the list. Saves Sonnet enrichment tokens on off-family
+                # sources (e.g. ai_jobs_net for a researcher, jobs_ac_uk
+                # for a frontend dev).
+                enabled = db.get_enabled_sources(chat_id)
+                if enabled:
+                    allowed = set(enabled)
+                    before_src = len(user_pool)
+                    user_pool = [j for j in user_pool if j.source in allowed]
+                    if before_src != len(user_pool):
+                        log.info(
+                            "User %s: source-toggle filter %d → %d "
+                            "(allowed=%d sources)",
+                            chat_id, before_src, len(user_pool), len(allowed),
+                        )
 
                 # -------- per-user LinkedIn fetch --------
                 li_seeds = ((profile or {}).get("search_seeds") or {}).get("linkedin")
@@ -496,20 +578,23 @@ def run(dry_run: bool = False, only_chat: int | None = None) -> int:
                 if not user_jobs and quiet:
                     continue
 
+                # NOTE: liveness gate runs at send-time on the few postings
+                # that survive scoring + the ⭐ floor — see telegram_client.
+                # send_per_job_digest. Running it pre-enrich on the full
+                # 500-1000 job pool wasted ~90 minutes of Haiku WebFetch
+                # calls for a handful of dead postings — most candidates
+                # are filtered cheaper by score or floor anyway.
+
                 enrichments_by_job_id: dict[str, dict] = {}
-                prefs_for_ai = project_to_prefs(profile)
                 if ai_enrich and user_jobs:
-                    resume_text = (u["resume_text"] or "") if "resume_text" in u.keys() else ""
                     try:
                         with forensic.step(
                             "enrich_jobs_ai",
                             input={
                                 "job_count": len(user_jobs),
                                 "resume_chars": len(resume_text),
-                                "projected_prefs_keys": sorted(list(prefs_for_ai.keys())),
-                                "primary_role": (profile or {}).get("primary_role"),
-                                "stack_primary": (profile or {}).get("stack_primary"),
-                                "min_match_score": (profile or {}).get("min_match_score"),
+                                "prefs_chars": len(prefs_text),
+                                "min_match_score": db.get_min_match_score(chat_id),
                                 "sample_input_jobs": [
                                     {"job_id": j.job_id, "title": j.title[:80],
                                      "company": j.company[:60], "source": j.source}
@@ -522,8 +607,12 @@ def run(dry_run: bool = False, only_chat: int | None = None) -> int:
                             raw = enrich_jobs_ai(
                                 user_jobs,
                                 resume_text,
+                                prefs_text,
                                 timeout_s=enrich_timeout_s,
-                                projected_prefs=prefs_for_ai,
+                                max_jobs_per_call=int(filters.get("ai_max_jobs_per_call") or 10),
+                                two_pass=bool(filters.get("ai_two_pass", False)),
+                                triage_floor=int(filters.get("ai_triage_floor") or 2),
+                                workers=int(filters.get("ai_enrich_workers") or 4),
                             )
                             enrichments_by_job_id = by_job_id(raw, user_jobs)
                             # Summary only. Per-verdict detail is emitted as
@@ -570,6 +659,7 @@ def run(dry_run: bool = False, only_chat: int | None = None) -> int:
                                     output={
                                         "match_score": enr.get("match_score"),
                                         "why_match": (enr.get("why_match") or "")[:300],
+                                        "why_mismatch": (enr.get("why_mismatch") or "")[:300],
                                         "key_details_summary": key_details_summary,
                                     },
                                     chat_id=chat_id,
@@ -597,7 +687,9 @@ def run(dry_run: bool = False, only_chat: int | None = None) -> int:
                         log.debug("record_digest_run_jobs failed; continuing", exc_info=True)
 
                 enriched_count = len(enrichments_by_job_id)
-                user_min_score = int((profile or {}).get("min_match_score") or 0)
+                # Floor lives on the DB column now (algorithm v2). Falls
+                # back to the global default when the user hasn't tapped ⭐.
+                user_min_score = int(db.get_min_match_score(chat_id) or 0)
                 effective_min_score = user_min_score if user_min_score > 0 else default_min_score
                 dropped_below_score = 0
                 if effective_min_score > 0 and user_jobs:
@@ -629,13 +721,10 @@ def run(dry_run: bool = False, only_chat: int | None = None) -> int:
                     except Exception:
                         log.debug("unsent_count_at_score failed; continuing", exc_info=True)
 
-                try:
-                    if user_jobs:
-                        _pigs.send_sticker(tg, chat_id, _pigs.GOOD_MORNING)
-                    else:
-                        _pigs.send_sticker(tg, chat_id, _pigs.NO_MATCHES)
-                except Exception:
-                    log.debug("digest-header sticker send failed; continuing", exc_info=True)
+                # Pig sticker moved INTO send_per_job_digest in v2.2 so
+                # it fires after the age/url/forum/liveness prefilter and
+                # reflects the actual count the user will see, not the
+                # pre-gate score-floor count.
 
                 try:
                     _sent_jobs_this_run: list[str] = []

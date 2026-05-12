@@ -1,0 +1,16 @@
+[Unit]
+Description=Daily run of Hryu digest
+
+[Timer]
+# 08:00 in Europe/Berlin every day. Set TZ=Europe/Berlin in /home/hryu/.env
+# if you also want app-level timestamps in the same zone; the systemd timer
+# itself uses the OnCalendar TZ regardless.
+OnCalendar=*-*-* 08:00:00 Europe/Berlin
+# Catch-up if the box was off at 08:00 — fire on next boot.
+Persistent=true
+# Avoid stampedes if multiple servers ever exist behind a shared deploy.
+RandomizedDelaySec=300
+Unit=hryu-digest.service
+
+[Install]
+WantedBy=timers.target

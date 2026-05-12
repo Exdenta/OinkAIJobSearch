@@ -935,7 +935,8 @@ def format_job_mdv2(
 
     If `enrichment` is provided (from job_enrich.enrich_jobs_ai), we render:
       - a ⭐ score bar right under the title
-      - a resume-aware `why_match` line
+      - a resume-aware `why_match` line ("✅ Match: …")
+      - an algorithm-v2 `why_mismatch` line ("⚠️ Mismatch: …") when present
       - a compact list of key_details (stack, seniority, remote, salary, …)
 
     Without enrichment the card falls back to title / company / snippet / source.
@@ -966,8 +967,11 @@ def format_job_mdv2(
         lines.append("")
         lines.append(f"{_score_bar(score)}  *{score}/5 match*")
         why = (enrichment.get("why_match") or "").strip()
+        why_mismatch = (enrichment.get("why_mismatch") or "").strip()
         if why:
-            lines.append("_" + mdv2_escape(why[:260]) + "_")
+            lines.append("✅ " + mdv2_escape(why[:260]))
+        if why_mismatch:
+            lines.append("⚠️ " + mdv2_escape(why_mismatch[:260]))
         detail_lines = _render_key_details_mdv2(enrichment.get("key_details") or {})
         if detail_lines:
             lines.append("")
@@ -1791,70 +1795,21 @@ def send_per_job_digest(
     except Exception:  # pragma: no cover
         _forensic = None
 
-    # Header send. Failures here are rare but if Telegram is down we want
-    # to surface the reason post-hoc. `skip_header=True` is the "Lower
-    # floor" replay path — caller already has a header in the chat and
-    # only needs the additional per-job cards appended.
-    header_status = "ok"
-    header_err = None
-    if not skip_header:
-        try:
-            kb = digest_header_keyboard(
-                run_id=run_id,
-                current_floor=int(min_score or 0),
-                lower_count=int(lower_count_at_step or 0),
-            )
-            header_text = digest_header_mdv2() + "\n\n" + _count_line(
-                jobs,
-                min_score=min_score,
-                enriched_count=enriched_count,
-                dropped_below_score=dropped_below_score,
-            )
-            tg.send_message(chat_id, header_text, reply_markup=kb)
-        except Exception as e:
-            header_status = "error"
-            header_err = {"class": type(e).__name__, "message": str(e)[:300]}
-            log.error("send_per_job_digest: header send failed for %s: %s", chat_id, e)
-            if _forensic is not None:
-                _forensic.log_step(
-                    "telegram.send_header",
-                    input={"chat_id": chat_id, "job_count": len(jobs), "min_score": min_score},
-                    output={"status": header_status},
-                    error=header_err,
-                    chat_id=chat_id,
-                )
-            return 0
-        if _forensic is not None:
-            _forensic.log_step(
-                "telegram.send_header",
-                input={"chat_id": chat_id, "job_count": len(jobs), "min_score": min_score},
-                output={"status": header_status},
-                chat_id=chat_id,
-            )
-
-    if not jobs:
-        return 1 if not skip_header else 0
-    sent = 1 if not skip_header else 0
+    # ----------------------------------------------------------------
+    # PREFILTER PASS (algorithm v2.2): apply age, dead-URL, forum, and
+    # LLM-liveness gates BEFORE the header card so the count line and
+    # the pig sticker reflect what the user actually receives. Previous
+    # behavior was "send header with N count, then drop K at send time,
+    # leaving the user with N-K cards and a header that lied." See
+    # send_per_job_digest docstring for per-gate semantics.
+    # ----------------------------------------------------------------
+    alive_jobs: list[Job] = []
     fail_count = 0
     dead_url_count = 0
     too_old_count = 0
     forum_url_count = 0
     web_search_closed_count = 0
     for job in jobs:
-        enr = enrichments.get(job.job_id)
-
-        # Age-window gate. Runs BEFORE the URL-liveness probe so we don't
-        # waste a HEAD request on postings we're already going to drop.
-        # Sources that don't surface posted_at (LinkedIn, web_search) are
-        # admitted by default; flip JOB_AGE_MISSING_POLICY=reject to be
-        # strict. JOB_AGE_FILTER_OFF=1 disables the gate entirely.
-        #
-        # web_search source is a hard exception: Claude's open-web subagent
-        # has surfaced stale Ashby/Greenhouse listings (closed roles still
-        # indexed by Google) that scored 5/5 because the enricher only sees
-        # the title. Force a strict 7-day window and reject missing
-        # posted_at — `web_search` postings without a date are unverifiable
-        # and disproportionately stale.
         if not JOB_AGE_FILTER_OFF:
             is_web_search = (job.source or "").strip().lower() == "web_search"
             max_days = 7 if is_web_search else MAX_JOB_AGE_DAYS
@@ -1876,26 +1831,17 @@ def send_per_job_digest(
                     _forensic.log_step(
                         "job.too_old",
                         input={
-                            "job_id": job.job_id,
-                            "source": job.source,
+                            "job_id": job.job_id, "source": job.source,
                             "posted_at": job.posted_at or "",
                             "title": (job.title or "")[:120],
                         },
                         output={"age_days": age_days_val, "reason": reason},
                         chat_id=chat_id,
                     )
-                log.info(
-                    "send_per_job_digest: dropping %s (%s) — too old: %s",
-                    job.job_id, job.source, reason,
-                )
+                log.info("send_per_job_digest: dropping %s (%s) — too old: %s",
+                         job.job_id, job.source, reason)
                 continue
 
-        # URL liveness gate. Skip the HEAD probe entirely when the
-        # operator has disabled validation (URL_VALIDATION_OFF=1) or the
-        # job has no URL to check. Otherwise: drop dead URLs BEFORE we
-        # build the message / call on_sent, so the user never sees a
-        # broken posting and the DB mapping isn't poisoned with a
-        # message_id pointing at a 404.
         if not URL_VALIDATION_OFF and (job.url or "").strip():
             alive, reason = _url_is_alive(job.url, timeout_s=URL_VALIDATION_TIMEOUT_S)
             if not alive:
@@ -1904,25 +1850,16 @@ def send_per_job_digest(
                     _forensic.log_step(
                         "telegram.url_dead",
                         input={
-                            "job_id": job.job_id,
-                            "source": job.source,
-                            "url": job.url,
-                            "title": (job.title or "")[:120],
+                            "job_id": job.job_id, "source": job.source,
+                            "url": job.url, "title": (job.title or "")[:120],
                         },
                         output={"reason": reason},
                         chat_id=chat_id,
                     )
-                log.info(
-                    "send_per_job_digest: dropping %s (%s) — dead URL: %s",
-                    job.job_id, job.source, reason,
-                )
+                log.info("send_per_job_digest: dropping %s (%s) — dead URL: %s",
+                         job.job_id, job.source, reason)
                 continue
 
-        # Forum / discussion-page filter. Runs AFTER the liveness gate so
-        # dead-and-forum URLs are still bucketed as dead (cheaper signal,
-        # surfaces source-side rot). hackernews jobs are exempt by source —
-        # their URLs legitimately point at news.ycombinator.com threads.
-        # FORUM_FILTER_OFF=1 disables the gate entirely.
         if not FORUM_FILTER_OFF and (job.url or "").strip():
             real, reason = _url_is_real_posting(job.url, job.source or "")
             if not real:
@@ -1931,31 +1868,17 @@ def send_per_job_digest(
                     _forensic.log_step(
                         "job.forum_url",
                         input={
-                            "job_id": job.job_id,
-                            "source": job.source,
-                            "url": job.url,
-                            "title": (job.title or "")[:120],
+                            "job_id": job.job_id, "source": job.source,
+                            "url": job.url, "title": (job.title or "")[:120],
                         },
                         output={"reason": reason},
                         chat_id=chat_id,
                     )
-                log.info(
-                    "send_per_job_digest: dropping %s (%s) — forum URL: %s",
-                    job.job_id, job.source, reason,
-                )
+                log.info("send_per_job_digest: dropping %s (%s) — forum URL: %s",
+                         job.job_id, job.source, reason)
                 continue
 
-        # web_search-only LLM verifier. Last gate before send because it's
-        # the most expensive (one Claude subprocess per posting, with
-        # WebFetch + WebSearch tools). Only fires when `source` is
-        # `web_search` — the only source where stale Ashby/Greenhouse SPA
-        # postings have leaked through every cheaper gate. `unknown`
-        # verdicts pass through (never drop on uncertainty).
-        if (
-            not WEB_SEARCH_VERIFY_OFF
-            and (job.source or "").strip().lower() == "web_search"
-            and (job.url or "").strip()
-        ):
+        if not WEB_SEARCH_VERIFY_OFF and (job.url or "").strip():
             ws_status, ws_reason = _web_search_listing_still_open(
                 job, timeout_s=WEB_SEARCH_VERIFY_TIMEOUT_S,
             )
@@ -1965,20 +1888,86 @@ def send_per_job_digest(
                     _forensic.log_step(
                         "telegram.web_search_closed",
                         input={
-                            "job_id": job.job_id,
-                            "source": job.source,
-                            "url": job.url,
-                            "title": (job.title or "")[:120],
+                            "job_id": job.job_id, "source": job.source,
+                            "url": job.url, "title": (job.title or "")[:120],
                         },
                         output={"reason": ws_reason},
                         chat_id=chat_id,
                     )
-                log.info(
-                    "send_per_job_digest: dropping %s (web_search) — listing closed: %s",
-                    job.job_id, ws_reason,
-                )
+                log.info("send_per_job_digest: dropping %s (listing closed) — %s",
+                         job.job_id, ws_reason)
                 continue
 
+        alive_jobs.append(job)
+
+    # ----------------------------------------------------------------
+    # Pig sticker decision — moved inline so it reflects the ALIVE count,
+    # not the pre-gate score-floor count. (Used to live in search_jobs.py
+    # before this restructure.)
+    # ----------------------------------------------------------------
+    try:
+        import pig_stickers as _pigs
+        _pigs.send_sticker(
+            tg, chat_id,
+            _pigs.GOOD_MORNING if alive_jobs else _pigs.NO_MATCHES,
+        )
+    except Exception:
+        log.debug("send_per_job_digest: pig sticker send failed; continuing",
+                  exc_info=True)
+
+    # ----------------------------------------------------------------
+    # Header send (now with accurate count = len(alive_jobs)).
+    # ----------------------------------------------------------------
+    header_status = "ok"
+    header_err = None
+    if not skip_header:
+        try:
+            kb = digest_header_keyboard(
+                run_id=run_id,
+                current_floor=int(min_score or 0),
+                lower_count=int(lower_count_at_step or 0),
+            )
+            header_text = digest_header_mdv2() + "\n\n" + _count_line(
+                alive_jobs,
+                min_score=min_score,
+                enriched_count=enriched_count,
+                dropped_below_score=dropped_below_score,
+            )
+            tg.send_message(chat_id, header_text, reply_markup=kb)
+        except Exception as e:
+            header_status = "error"
+            header_err = {"class": type(e).__name__, "message": str(e)[:300]}
+            log.error("send_per_job_digest: header send failed for %s: %s",
+                      chat_id, e)
+            if _forensic is not None:
+                _forensic.log_step(
+                    "telegram.send_header",
+                    input={"chat_id": chat_id, "job_count": len(alive_jobs),
+                           "min_score": min_score},
+                    output={"status": header_status},
+                    error=header_err,
+                    chat_id=chat_id,
+                )
+            return 0
+        if _forensic is not None:
+            _forensic.log_step(
+                "telegram.send_header",
+                input={"chat_id": chat_id, "job_count": len(alive_jobs),
+                       "min_score": min_score},
+                output={"status": header_status},
+                chat_id=chat_id,
+            )
+
+    if not alive_jobs:
+        return 1 if not skip_header else 0
+    sent = 1 if not skip_header else 0
+
+    # ----------------------------------------------------------------
+    # Per-job loop — pure send now, no gates. Every job in alive_jobs
+    # passed the prefilter above.
+    # ----------------------------------------------------------------
+    for job in alive_jobs:
+        enr = enrichments.get(job.job_id)
         text = format_job_mdv2(
             job, include_snippet=inc_snip, snippet_chars=snip_chars, enrichment=enr,
         )

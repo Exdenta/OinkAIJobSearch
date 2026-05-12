@@ -223,9 +223,7 @@ def fetch(filters: dict) -> list[Job]:
             location = bodies[1] if len(bodies) >= 2 else ""
             seniority = bodies[2] if len(bodies) >= 3 else ""
 
-            # Snippet: synthesize a short bullet from what we have, since the
-            # listing card has no description blob. Keep it humanish and let
-            # clean_snippet's HTML stripper / mojibake fixer pass through.
+            # Listing-card metadata as a fallback if detail fetch fails.
             snippet_bits = [b for b in (company, location, seniority) if b]
             snippet_raw = " — ".join(snippet_bits)
 
@@ -238,9 +236,32 @@ def fetch(filters: dict) -> list[Job]:
                     (location or "Worldwide")[:120],   # location
                     full_url,                          # url
                     "",                                # posted_at (not on listing)
-                    clean_snippet(snippet_raw, max_chars=400),  # snippet
+                    clean_snippet(snippet_raw, max_chars=400),  # snippet (fallback)
                     "",                                # salary
                 )
+            )
+
+        # Algorithm v2.2 — Option 4: fetch each detail page so the
+        # scorer sees the full posting body (years required, hard
+        # location, language, etc.). Concurrent GETs; failures fall
+        # back to the listing-card snippet built above.
+        if jobs:
+            from sources._detail_fetch import fetch_many_bodies
+            body_map = fetch_many_bodies(
+                [j.url for j in jobs], max_chars=4000, workers=8,
+            )
+            enriched = 0
+            for i, j in enumerate(jobs):
+                body = body_map.get(j.url, "")
+                if body and len(body) > len(j.snippet):
+                    jobs[i] = j._replace(snippet=body) if hasattr(j, "_replace") else Job(
+                        j.source, j.external_id, j.title, j.company, j.location,
+                        j.url, j.posted_at, body, j.salary,
+                    )
+                    enriched += 1
+            log.info(
+                "impactpool: detail-page bodies fetched for %d/%d postings",
+                enriched, len(jobs),
             )
 
         sample_titles = [j.title for j in jobs[:5]]

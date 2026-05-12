@@ -79,7 +79,12 @@ _ALLOWED_LEVELS = frozenset({
     "junior", "mid", "middle", "senior", "lead", "staff", "principal",
 })
 
+# Output cap: the `free_text` field the profile JSON echoes back stays
+# tight (500 chars). The INPUT we feed the prompt — `user_description` —
+# accumulates the user's /prefs verbatim PLUS rolling skip-feedback
+# comments, so we clip it at a higher ceiling to preserve those signals.
 _MAX_FREETEXT_LEN = 500
+_MAX_USER_DESC_INPUT_CHARS = 3000
 _MAX_RESUME_CHARS = 8000   # the resume fed into the prompt is clipped
 _MAX_TITLE_TOKEN = 40
 _MAX_LINKEDIN_Q = 80
@@ -87,8 +92,11 @@ _MAX_SEED_PHRASE = 120
 _MAX_LINKEDIN_QUERIES = 5
 _MAX_SEED_PHRASES = 12
 
-# Location of the external prompt file.
+# Location of the external prompt files.
+#   profile_builder.txt — v3 schema (full structured profile, legacy mode)
+#   profile_seeds.txt   — v4 schema (search seeds only — algorithm v2)
 _PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "profile_builder.txt"
+_SEEDS_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "profile_seeds.txt"
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +123,30 @@ def _render_prompt(resume_text: str, user_description: str) -> str:
     if not tmpl:
         return ""
     clipped_resume = (resume_text or "")[:_MAX_RESUME_CHARS]
-    clipped_prefs = (user_description or "")[:_MAX_FREETEXT_LEN]
+    clipped_prefs = (user_description or "")[:_MAX_USER_DESC_INPUT_CHARS]
+    return (
+        tmpl
+        .replace("{resume_text}", clipped_resume)
+        .replace("{user_description}", clipped_prefs)
+    )
+
+
+def _load_seeds_template() -> str:
+    """Read the algorithm-v2 seeds-only prompt. Returns "" on failure."""
+    try:
+        return _SEEDS_PROMPT_PATH.read_text(encoding="utf-8")
+    except OSError as e:
+        log.error("profile_builder: can't read seeds prompt at %s: %s",
+                  _SEEDS_PROMPT_PATH, e)
+        return ""
+
+
+def _render_seeds_prompt(resume_text: str, user_description: str) -> str:
+    tmpl = _load_seeds_template()
+    if not tmpl:
+        return ""
+    clipped_resume = (resume_text or "")[:_MAX_RESUME_CHARS]
+    clipped_prefs = (user_description or "")[:_MAX_USER_DESC_INPUT_CHARS]
     return (
         tmpl
         .replace("{resume_text}", clipped_resume)
@@ -147,6 +178,127 @@ def _len_le(xs: list[str], n: int) -> bool:
     return all(len(s) <= n for s in xs)
 
 
+def _validate_linkedin_seeds(li: Any) -> list[str]:
+    """Validate the search_seeds.linkedin block. Accepts BOTH shapes:
+
+      SEPARATED (v2.3 — preferred):
+        {"queries": [<str>, ...], "geos": [<str>, ...], "f_TPR": "r86400"}
+
+      PAIRED (v2.0 legacy, still accepted):
+        {"queries": [{"q":..., "geo":..., "f_TPR":...}, ...]}
+
+    Returns the list of validation error strings (empty when shape OK).
+    """
+    errs: list[str] = []
+    if not isinstance(li, dict):
+        return ["search_seeds.linkedin must be an object"]
+    queries = li.get("queries")
+    if not isinstance(queries, list):
+        return ["search_seeds.linkedin.queries must be a list"]
+    if not queries:
+        return errs  # empty list is fine — adapter returns []
+    if len(queries) > _MAX_LINKEDIN_QUERIES:
+        errs.append(
+            f"search_seeds.linkedin.queries length > {_MAX_LINKEDIN_QUERIES}"
+        )
+
+    # Distinguish shapes by the first entry's type.
+    first = queries[0]
+    if isinstance(first, str):
+        # SEPARATED shape: queries = [<str>], geos = [<str>], f_TPR = <str>
+        for i, q in enumerate(queries):
+            if not isinstance(q, str):
+                errs.append(f"linkedin.queries[{i}] must be a string")
+                continue
+            if len(q) > _MAX_LINKEDIN_Q:
+                errs.append(f"linkedin.queries[{i}] > {_MAX_LINKEDIN_Q} chars")
+        geos = li.get("geos")
+        if geos is not None:
+            if not isinstance(geos, list) or not all(isinstance(g, str) for g in geos):
+                errs.append("linkedin.geos must be a list of strings")
+        f_tpr = li.get("f_TPR")
+        if f_tpr is not None and not isinstance(f_tpr, str):
+            errs.append("linkedin.f_TPR must be a string")
+    elif isinstance(first, dict):
+        # PAIRED legacy shape.
+        for i, q in enumerate(queries):
+            if not isinstance(q, dict):
+                errs.append(f"linkedin.queries[{i}] must be an object")
+                continue
+            qs = q.get("q")
+            if not isinstance(qs, str):
+                errs.append(f"linkedin.queries[{i}].q must be a string")
+            elif len(qs) > _MAX_LINKEDIN_Q:
+                errs.append(f"linkedin.queries[{i}].q > {_MAX_LINKEDIN_Q} chars")
+            if not isinstance(q.get("geo"), str):
+                errs.append(f"linkedin.queries[{i}].geo must be a string")
+            if not isinstance(q.get("f_TPR"), str):
+                errs.append(f"linkedin.queries[{i}].f_TPR must be a string")
+    else:
+        errs.append(
+            "linkedin.queries entries must be strings (v2.3 separated) "
+            "or objects (v2.0 paired)"
+        )
+    return errs
+
+
+def seeds_schema_validate(profile: Any) -> list[str]:
+    """Validate the algorithm-v2 seeds-only schema (schema_version=4).
+
+    Looser than `profile_schema_validate` — most legacy fields are absent
+    by design. Required: schema_version=4, primary_role string, and a
+    well-formed `search_seeds` block. Bookkeeping keys (`built_at`,
+    `built_from`) are accepted but not required.
+    """
+    errs: list[str] = []
+    if not isinstance(profile, dict):
+        return ["profile is not a dict"]
+
+    required = {"schema_version", "primary_role", "search_seeds"}
+    missing = sorted(required - set(profile))
+    if missing:
+        errs.append(f"missing keys: {missing}")
+
+    if profile.get("schema_version") != 4:
+        errs.append("schema_version must equal 4")
+
+    if "primary_role" in profile and not _is_str(profile["primary_role"]):
+        errs.append("primary_role must be a string")
+
+    # `enabled_sources` is OPTIONAL — older v4 profiles built before
+    # 2026-05-12 don't carry it. When present, must be a list of strings.
+    if "enabled_sources" in profile:
+        es = profile["enabled_sources"]
+        if not (isinstance(es, list) and all(isinstance(s, str) for s in es)):
+            errs.append("enabled_sources must be a list of strings")
+
+    seeds = profile.get("search_seeds")
+    if not isinstance(seeds, dict):
+        errs.append("search_seeds must be an object")
+    else:
+        errs.extend(_validate_linkedin_seeds(seeds.get("linkedin")))
+        ws = seeds.get("web_search")
+        if not isinstance(ws, dict):
+            errs.append("search_seeds.web_search must be an object")
+        else:
+            phrases = ws.get("seed_phrases") or []
+            if not _is_str_list(phrases):
+                errs.append("search_seeds.web_search.seed_phrases must be a list of strings")
+            elif phrases and (len(phrases) > _MAX_SEED_PHRASES
+                              or not _len_le(phrases, _MAX_SEED_PHRASE)):
+                errs.append(
+                    f"seed_phrases length > {_MAX_SEED_PHRASES} or items > {_MAX_SEED_PHRASE} chars"
+                )
+            ats = ws.get("ats_domains") or []
+            if not _is_str_list(ats):
+                errs.append("search_seeds.web_search.ats_domains must be a list of strings")
+            else:
+                bad = [d for d in ats if d not in _ALLOWED_ATS]
+                if bad:
+                    errs.append(f"ats_domains contains disallowed entries: {bad}")
+    return errs
+
+
 def profile_schema_validate(profile: Any) -> list[str]:
     """Return a list of validation errors; empty list means valid.
 
@@ -159,7 +311,8 @@ def profile_schema_validate(profile: Any) -> list[str]:
     if not isinstance(profile, dict):
         return ["profile is not a dict"]
 
-    # Required top-level keys
+    # Required top-level keys. v3 adds `onsite_locations` + `remote_regions`
+    # alongside the legacy `locations` field (kept for back-compat readers).
     required = {
         "schema_version", "ideal_fit_paragraph", "primary_role",
         "target_levels", "years_experience",
@@ -170,12 +323,21 @@ def profile_schema_validate(profile: Any) -> list[str]:
         "max_age_hours", "min_match_score",
         "search_seeds", "free_text",
     }
+    sv = profile.get("schema_version")
+    if sv == 4:
+        # Algorithm-v2 seeds-only profile. Loosens the required set
+        # drastically — see `seeds_schema_validate` for the strict
+        # checker. Falling through to legacy validation would reject
+        # every v4 profile because most fields are intentionally absent.
+        return seeds_schema_validate(profile)
+    if sv == 3:
+        required = required | {"onsite_locations", "remote_regions"}
     missing = sorted(required - set(profile))
     if missing:
         errs.append(f"missing keys: {missing}")
 
-    if profile.get("schema_version") != 2:
-        errs.append("schema_version must equal 2")
+    if sv not in (2, 3):
+        errs.append("schema_version must equal 2, 3, or 4")
 
     for k in ("ideal_fit_paragraph", "primary_role", "time_zone_band",
               "language", "free_text"):
@@ -185,7 +347,8 @@ def profile_schema_validate(profile: Any) -> list[str]:
     for k in ("target_levels", "stack_primary", "stack_secondary",
               "stack_adjacent", "stack_antipatterns",
               "title_must_match", "title_exclude", "exclude_keywords",
-              "exclude_companies", "locations"):
+              "exclude_companies", "locations",
+              "onsite_locations", "remote_regions"):
         if k in profile and not _is_str_list(profile[k]):
             errs.append(f"{k} must be a list of strings")
 
@@ -221,7 +384,7 @@ def profile_schema_validate(profile: Any) -> list[str]:
         "target_levels", "stack_primary", "stack_secondary",
         "stack_adjacent", "stack_antipatterns",
         "title_must_match", "title_exclude", "exclude_keywords",
-        "locations",
+        "locations", "onsite_locations", "remote_regions",
     ]
     for k in lower_fields:
         xs = profile.get(k)
@@ -244,29 +407,7 @@ def profile_schema_validate(profile: Any) -> list[str]:
     if not isinstance(seeds, dict):
         errs.append("search_seeds must be an object")
     else:
-        li = seeds.get("linkedin")
-        if not isinstance(li, dict):
-            errs.append("search_seeds.linkedin must be an object")
-        else:
-            queries = li.get("queries")
-            if not isinstance(queries, list):
-                errs.append("search_seeds.linkedin.queries must be a list")
-            else:
-                if len(queries) > _MAX_LINKEDIN_QUERIES:
-                    errs.append(f"search_seeds.linkedin.queries length > {_MAX_LINKEDIN_QUERIES}")
-                for i, q in enumerate(queries):
-                    if not isinstance(q, dict):
-                        errs.append(f"linkedin.queries[{i}] must be an object")
-                        continue
-                    qs = q.get("q")
-                    if not isinstance(qs, str):
-                        errs.append(f"linkedin.queries[{i}].q must be a string")
-                    elif len(qs) > _MAX_LINKEDIN_Q:
-                        errs.append(f"linkedin.queries[{i}].q > {_MAX_LINKEDIN_Q} chars")
-                    if not isinstance(q.get("geo"), str):
-                        errs.append(f"linkedin.queries[{i}].geo must be a string")
-                    if not isinstance(q.get("f_TPR"), str):
-                        errs.append(f"linkedin.queries[{i}].f_TPR must be a string")
+        errs.extend(_validate_linkedin_seeds(seeds.get("linkedin")))
         ws = seeds.get("web_search")
         if not isinstance(ws, dict):
             errs.append("search_seeds.web_search must be an object")
@@ -490,6 +631,115 @@ def build_profile_sync(
         )
 
 
+def build_search_seeds_sync(
+    resume_text: str,
+    free_text: str,
+    *,
+    timeout_s: int = DEFAULT_TIMEOUT_S,
+    model: str = DEFAULT_MODEL,
+    _run_p: Callable = _instrumented_run_p,
+) -> BuildResult:
+    """Algorithm-v2 builder: emit a search_seeds-only profile (schema v4).
+
+    Same control flow as `build_profile_sync`, but renders the
+    seeds-only prompt and validates against `seeds_schema_validate`. The
+    output is a small profile dict carrying just `search_seeds` plus
+    bookkeeping (`built_at`, `built_from`). Used by the queue's
+    `_run_one` whenever the operator has flipped the profile to v2.
+    """
+    resume_sha1 = sha1_hex(resume_text)
+    prefs_sha1 = sha1_hex(free_text)
+    start = time.monotonic()
+
+    with forensic.step(
+        "profile_builder.build_search_seeds_sync",
+        input={
+            "resume_chars": len(resume_text or ""),
+            "free_text_chars": len(free_text or ""),
+            "free_text_head": (free_text or "")[:300],
+            "resume_sha1": resume_sha1,
+            "prefs_sha1": prefs_sha1,
+            "model": model,
+            "timeout_s": timeout_s,
+        },
+    ) as fctx:
+        prompt = _render_seeds_prompt(resume_text, free_text)
+        if not prompt:
+            fctx.set_output({"status": "exception", "reason": "seeds prompt template missing"})
+            return BuildResult(
+                status="exception",
+                error="seeds prompt template missing",
+                resume_sha1=resume_sha1, prefs_sha1=prefs_sha1, model=model,
+            )
+
+        try:
+            stdout = _run_p(prompt, timeout_s=timeout_s, model=model)
+        except Exception as e:
+            fctx.set_output({"status": "exception", "reason": f"run_p raised: {e!r}"})
+            return BuildResult(
+                status="exception",
+                error=f"run_p raised: {e!r}",
+                elapsed_ms=int((time.monotonic() - start) * 1000),
+                resume_sha1=resume_sha1, prefs_sha1=prefs_sha1, model=model,
+            )
+
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        if stdout is None:
+            fctx.set_output({"status": "cli_missing_or_timeout", "elapsed_ms": elapsed_ms})
+            return BuildResult(
+                status="cli_missing_or_timeout",
+                error="run_p returned None",
+                elapsed_ms=elapsed_ms,
+                resume_sha1=resume_sha1, prefs_sha1=prefs_sha1, model=model,
+            )
+
+        body = extract_assistant_text(stdout)
+        parsed = parse_json_block(body)
+        if parsed is None:
+            fctx.set_output({
+                "status": "parse_error", "elapsed_ms": elapsed_ms,
+                "body_head": (body or "")[:300],
+            })
+            return BuildResult(
+                status="parse_error",
+                error=f"unparseable response (head={body[:200]!r})",
+                elapsed_ms=elapsed_ms,
+                resume_sha1=resume_sha1, prefs_sha1=prefs_sha1, model=model,
+            )
+
+        errs = seeds_schema_validate(parsed)
+        if errs:
+            fctx.set_output({
+                "status": "validation_error", "elapsed_ms": elapsed_ms,
+                "errors": errs[:8],
+            })
+            return BuildResult(
+                status="validation_error",
+                error="; ".join(errs)[:500],
+                elapsed_ms=elapsed_ms,
+                resume_sha1=resume_sha1, prefs_sha1=prefs_sha1, model=model,
+            )
+
+        # Reuse `_clip_profile` to enforce caps; then stamp bookkeeping.
+        stamped = _stamp_metadata(
+            _clip_profile(parsed),
+            resume_sha1=resume_sha1, prefs_sha1=prefs_sha1,
+            model=model, elapsed_ms=elapsed_ms,
+        )
+        fctx.set_output({
+            "status": "ok",
+            "elapsed_ms": elapsed_ms,
+            "primary_role": stamped.get("primary_role"),
+            "search_seed_keys": list((stamped.get("search_seeds") or {}).keys()),
+        })
+        return BuildResult(
+            status="ok",
+            profile=stamped,
+            elapsed_ms=elapsed_ms,
+            resume_sha1=resume_sha1, prefs_sha1=prefs_sha1, model=model,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Async debounced queue (per-user)
 # ---------------------------------------------------------------------------
@@ -517,7 +767,10 @@ class ProfileBuilderQueue:
         debounce_s: float = DEFAULT_DEBOUNCE_S,
         timeout_s: int = DEFAULT_TIMEOUT_S,
         model: str = DEFAULT_MODEL,
-        sync_builder: Callable = build_profile_sync,
+        # Algorithm v2: queue defaults to seeds-only builder. Operators
+        # can swap back to the structured profile builder by passing
+        # `sync_builder=build_profile_sync`. Tests still inject mocks here.
+        sync_builder: Callable = build_search_seeds_sync,
         on_done: Callable[[int, BuildResult], None] | None = None,
     ) -> None:
         self.db = db
@@ -676,6 +929,20 @@ class ProfileBuilderQueue:
                         )
                 profile_json = json.dumps(result.profile, ensure_ascii=False)
                 rev = self.db.set_user_profile(chat_id, profile_json)
+                # Mirror Opus-picked enabled_sources into the dedicated
+                # DB column so search_jobs can read it without parsing
+                # the profile JSON every run. Bot /sources UI also reads
+                # from the column. Best-effort: a failure here leaves
+                # the user on operator-default sources.
+                es = result.profile.get("enabled_sources")
+                if isinstance(es, list) and es:
+                    try:
+                        self.db.set_enabled_sources(chat_id, es)
+                    except Exception:
+                        log.exception(
+                            "profile_builder: set_enabled_sources failed "
+                            "for chat=%s", chat_id,
+                        )
                 log.info(
                     "profile_builder: DONE chat=%s status=ok rev=%s elapsed=%dms "
                     "keywords=%d title_must=%d title_excl=%d ln_queries=%d seeds=%d",
