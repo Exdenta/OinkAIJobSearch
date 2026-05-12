@@ -393,6 +393,36 @@ def fetch(filters: dict) -> list[Job]:
                 "",                              # salary (DevEx rarely surfaces this)
             ))
 
+        # Algorithm v2.2 — Option 4: DevEx Google-search snippets stop
+        # at ~150 chars and routinely omit the "Required qualifications"
+        # block, which is exactly the signal Sonnet needs to rule out
+        # senior-only / US-only / Arabic-required postings. Fetch each
+        # detail URL inline. (DevEx HTML is DataDome-gated for the
+        # Anthropic WebFetch service, but a plain requests.get with a
+        # browser UA gets through.)
+        if out:
+            try:
+                from sources._detail_fetch import fetch_many_bodies
+                body_map = fetch_many_bodies(
+                    [j.url for j in out], max_chars=4000, workers=8,
+                )
+                enriched = 0
+                for i, j in enumerate(out):
+                    body = body_map.get(j.url, "")
+                    if body and len(body) > len(j.snippet):
+                        out[i] = Job(
+                            j.source, j.external_id, j.title, j.company,
+                            j.location, j.url, j.posted_at, body,
+                            getattr(j, "salary", ""),
+                        )
+                        enriched += 1
+                log.info(
+                    "devex: detail-page bodies fetched for %d/%d postings",
+                    enriched, len(out),
+                )
+            except Exception:
+                log.exception("devex: detail-page fetch raised; continuing")
+
         sample_titles = [j.title[:80] for j in out[:5]]
 
         fctx.set_output({

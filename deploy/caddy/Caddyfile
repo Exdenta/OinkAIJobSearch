@@ -1,0 +1,47 @@
+# Caddyfile for hryu.example.com
+#
+# Replace `hryu.example.com` with the real apex domain when DNS is ready:
+#   sudo sed -i 's/hryu\.example\.com/realdomain.tld/g' /etc/caddy/Caddyfile \
+#     && sudo systemctl reload caddy
+#
+# Caddy auto-provisions Let's Encrypt certs as soon as A/AAAA records point
+# at this server. The first request after DNS propagation may stall briefly
+# while the ACME challenge completes — that's expected.
+
+hryu.example.com {
+    encode zstd gzip
+
+    # ----- Backend API -----
+        reverse_proxy 127.0.0.1:8000
+    }
+
+    # ----- Posting-click redirector -----
+    # The redirect server is started in-process by hryu-bot.service (see
+    # bot.py:2723). It listens on 127.0.0.1:8001 (REDIRECT_BIND_PORT in
+    # /home/hryu/.env) and only handles GET /r?j=…&u=…&s=… — see
+    # skill/job-search/scripts/redirect_server.py:114 for the path check.
+    # No separate systemd unit fronts it.
+    handle /r* {
+        reverse_proxy 127.0.0.1:8001
+    }
+
+    # ----- Health endpoint -----
+    # Cheap upstream check for monitors. 200 with no body.
+    respond /healthz 200
+
+    # Catch-all last. `try_files` falls back to index.html so client-side
+    handle {
+        try_files {path} /index.html
+        file_server
+    }
+
+    log {
+        output file /var/log/caddy/hryu-access.log
+        format json
+    }
+}
+
+# Redirect www → apex.
+www.hryu.example.com {
+    redir https://hryu.example.com{uri} permanent
+}

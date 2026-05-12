@@ -11,10 +11,13 @@ JSON object. This module provides the consumer-side helpers:
     * `format_profile_summary_mdv2`     human-readable MarkdownV2 rendering
     * `set_min_match_score(p, score)`   surgical ⭐ edit — returns updated dict
 
-Profile shape (see `profile_builder.py` for the authoritative schema):
+Profile shape (see `profile_builder.py` for the authoritative schema).
+
+Schema v3 (current) splits geo into TWO axes so we can express "onsite-or-
+hybrid OK in a small pinned list AND remote OK in a wider macro region":
 
     {
-      "schema_version": 2,
+      "schema_version": 3,
       "ideal_fit_paragraph": "...",
       "primary_role": "...",
       "target_levels": ["senior"],
@@ -27,7 +30,13 @@ Profile shape (see `profile_builder.py` for the authoritative schema):
       "title_exclude": [...],
       "exclude_keywords": [...],
       "exclude_companies": [...],
-      "locations": [...],
+
+      # NEW in v3 — replace the single `locations` list with two axes.
+      "onsite_locations":  [...],   # cities/regions where onsite/hybrid OK
+      "remote_regions":    [...],   # countries/macro-regions where remote OK
+      # Legacy single-list location stays in the JSON for back-compat readers.
+      "locations":         [...],
+
       "remote": "remote"|"hybrid"|"onsite"|"any",
       "time_zone_band": "...",
       "salary_min_usd": 80000,
@@ -47,6 +56,10 @@ Profile shape (see `profile_builder.py` for the authoritative schema):
       "built_at":   "<iso>",              # stamped post-build
       "built_from": {resume_sha1, prefs_sha1, model, elapsed_ms}
     }
+
+Schema v2 profiles (single `locations` + `remote`) are still loaded — the
+projector synthesizes `onsite_locations`/`remote_regions` from the legacy
+fields so downstream code is schema-agnostic.
 
 Fields the user didn't state stay at their sentinel (`[]` / `"any"` / `0` /
 `""`). `effective_filters` treats sentinel values as "inherit from global".
@@ -97,7 +110,7 @@ def is_empty_profile(profile: dict[str, Any] | None) -> bool:
         return True
     for key in ("stack_primary", "stack_secondary", "title_must_match",
                 "title_exclude", "exclude_keywords", "exclude_companies",
-                "locations"):
+                "locations", "onsite_locations", "remote_regions"):
         if profile.get(key):
             return False
     if (profile.get("remote") or "any") != "any":
@@ -196,6 +209,11 @@ def _project(profile: dict[str, Any]) -> dict[str, Any]:
       * `exclude_keywords` = exclude_keywords ∪ stack_antipatterns
       * `seniority`        = target_levels collapsed to a single enum if it
                              contains exactly one distinct level, else "any".
+      * `onsite_locations` / `remote_regions`: schema v3 fields. For v2
+        profiles (single `locations`), we synthesize:
+          - onsite_locations = strict (city/region) entries only
+          - remote_regions   = full legacy `locations` list
+        so the prompt's two-axis location rule still has data to work with.
       * title gates, locations, remote, companies, salary, language,
         max_age_hours, min_match_score, free_text pass through.
     """
@@ -239,6 +257,27 @@ def _project(profile: dict[str, Any]) -> dict[str, Any]:
     if remote not in _VALID_REMOTE:
         remote = "any"
 
+    legacy_locations = _str_list(p.get("locations"))
+    onsite = _str_list(p.get("onsite_locations"))
+    remote_regions = _str_list(p.get("remote_regions"))
+
+    # Synthesize the v3 axes from a v2 profile if explicit fields absent.
+    # A v2 `locations` list typically contains both strict cities and macro
+    # regions; without further info we feed strict-looking tokens to onsite
+    # and the full list to remote_regions. _MACRO_REGION_TOKENS lists the
+    # tokens we treat as macro (and therefore NOT onsite-acceptable).
+    if not onsite and not remote_regions and legacy_locations:
+        onsite = [t for t in legacy_locations if t not in _MACRO_REGION_TOKENS]
+        remote_regions = list(legacy_locations)
+    elif onsite and not remote_regions:
+        remote_regions = list(legacy_locations) or list(onsite)
+    elif remote_regions and not onsite:
+        onsite = [t for t in (legacy_locations or remote_regions)
+                  if t not in _MACRO_REGION_TOKENS]
+
+    years_experience = int(p.get("years_experience") or 0)
+    time_zone_band = str(p.get("time_zone_band") or "").strip()
+
     return {
         "keywords":               keywords,
         "title_must_match":       _str_list(p.get("title_must_match")),
@@ -246,8 +285,13 @@ def _project(profile: dict[str, Any]) -> dict[str, Any]:
         "exclude_keywords":       exclude_keywords,
         "exclude_companies":      exclude_companies,
         "seniority":              seniority,
-        "locations":              _str_list(p.get("locations")),
+        "target_levels":          target_levels,
+        "locations":              legacy_locations,
+        "onsite_locations":       onsite,
+        "remote_regions":         remote_regions,
         "remote":                 remote,
+        "time_zone_band":         time_zone_band,
+        "years_experience":       years_experience,
         "salary_min_usd":         int(p.get("salary_min_usd") or 0),
         "drop_if_salary_unknown": bool(p.get("drop_if_salary_unknown")),
         "language":               str(p.get("language") or "").strip().lower(),
@@ -255,6 +299,18 @@ def _project(profile: dict[str, Any]) -> dict[str, Any]:
         "min_match_score":        max(0, min(5, int(p.get("min_match_score") or 0))),
         "free_text":              str(p.get("free_text") or "").strip()[:500],
     }
+
+
+# Tokens we treat as macro-region rather than strict onsite-acceptable city.
+# Used to back-derive `onsite_locations` from a v2 profile's flat `locations`
+# list — a posting in "germany" passes if the user listed "europe" but not if
+# they only listed "bilbao" / "spain".
+_MACRO_REGION_TOKENS = frozenset({
+    "europe", "eu", "emea", "schengen",
+    "north america", "latam", "apac", "asia-pacific",
+    "anywhere", "global", "worldwide", "remote",
+    "remote-eu", "remote-us", "remote-uk",
+})
 
 
 # The v1 filter merge used this field map; preserved here so the merge
@@ -477,6 +533,13 @@ def format_profile_summary_mdv2(
     if yrs:
         lines.append(row("📅", "Years", str(yrs)))
 
+    has_v3_geo = bool(p.get("onsite_locations") or p.get("remote_regions"))
+    geo_rows = (
+        [("Onsite OK in",   "onsite_locations", "🏢"),
+         ("Remote regions", "remote_regions",   "🌍")]
+        if has_v3_geo
+        else [("Locations",  "locations",       "📍")]
+    )
     for label, key, emoji in [
         ("Primary stack",     "stack_primary",      "🧰"),
         ("Secondary stack",   "stack_secondary",    "🔧"),
@@ -484,7 +547,7 @@ def format_profile_summary_mdv2(
         ("Title must match",  "title_must_match",   "📎"),
         ("Title exclude",     "title_exclude",      "🚫"),
         ("Body exclude",      "exclude_keywords",   "🚫"),
-        ("Locations",         "locations",          "📍"),
+        *geo_rows,
         ("Excluded companies","exclude_companies",  "🏢"),
     ]:
         vals = p.get(key) or []

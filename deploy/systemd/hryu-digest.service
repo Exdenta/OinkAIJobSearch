@@ -1,0 +1,29 @@
+[Unit]
+Description=Hryu daily digest (search_jobs.py)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=hryu
+Group=hryu
+WorkingDirectory=/home/hryu/app
+EnvironmentFile=/home/hryu/.env
+Environment=PATH=/home/hryu/venv/bin:/usr/bin:/bin
+Environment=PYTHONPATH=/home/hryu/app/skill/job-search/scripts
+ExecStart=/home/hryu/venv/bin/python skill/job-search/scripts/search_jobs.py
+StandardOutput=journal
+StandardError=journal
+
+# 45 min — market_research workers + Opus calls can be slow when sources
+# are degraded. If you tighten this, also tighten the per-source timeouts
+# in skill/job-search/scripts/search_jobs.py.
+TimeoutStartSec=2700
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/hryu/state /home/hryu/logs
+ProtectKernelTunables=true
+ProtectKernelModules=true
+PrivateTmp=true

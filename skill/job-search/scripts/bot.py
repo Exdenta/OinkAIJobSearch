@@ -295,6 +295,7 @@ HELP_MDV2 = (
         "  /myprofile       show your current profile\n"
         "  /prefs           rewrite your preferences in plain English\n"
         "  /minscore        set the match-score filter\n"
+        "  /sources         toggle which job sources to use\n"
         "  /rebuildprofile  force a fresh profile rebuild\n"
         "  /marketresearch  run a deep market scan (~25-40 min, .docx)\n"
         "  /cleardata       delete resume, history, profile, or everything\n"
@@ -384,6 +385,8 @@ def handle_command(tg: TelegramClient, db: DB, chat_id: int, text: str, user: di
         _clear_prefs(tg, db, chat_id)
     elif cmd in ("/minscore", "/score", "/rating"):
         _ask_min_score(tg, db, chat_id)
+    elif cmd in ("/sources", "/jobsources"):
+        _show_sources_menu(tg, db, chat_id)
     elif cmd in ("/myprofile", "/profile", "/myprefs", "/showprefs"):
         _show_profile(tg, db, chat_id)
     elif cmd in ("/rebuildprofile", "/rebuild"):
@@ -444,6 +447,170 @@ def _ask_min_score(tg: TelegramClient, db: DB, chat_id: int) -> None:
     )
 
 
+# ---------- /sources picker (algorithm v2.3) ----------
+
+# Display order + human labels for the per-user source-toggle menu.
+# Order is functional: tech first (most users care about these), then
+# Spain locals, then NGO/intl-dev, then academic, then niche/blocked.
+_SOURCES_CATALOG: list[tuple[str, str]] = [
+    # tech / startup
+    ("hackernews",      "HackerNews Who is Hiring"),
+    ("remoteok",        "RemoteOK"),
+    ("remotive",        "Remotive"),
+    ("weworkremotely",  "We Work Remotely"),
+    ("linkedin",        "LinkedIn (per-user queries)"),
+    ("web_search",      "Open-web search (per-user)"),
+    ("curated_boards",  "Curated remote boards"),
+    ("ycombinator_was", "Y Combinator startups"),
+    ("builtin",         "BuiltIn (US tech)"),
+    ("justjoinit",      "Just Join IT (CEE tech)"),
+    ("nofluffjobs",     "NoFluffJobs (CEE tech)"),
+    ("ai_jobs_net",     "AI Jobs Net"),
+    # Spain / EU local + commercial
+    ("infojobs",        "InfoJobs (Spain)"),
+    ("tecnoempleo",     "Tecnoempleo (Spain tech)"),
+    ("ikerbasque",      "Ikerbasque (Basque research)"),
+    ("wttj",            "Welcome to the Jungle (FR/BE/NL)"),
+    # international dev / NGO / humanitarian
+    ("reliefweb",       "ReliefWeb (humanitarian)"),
+    ("impactpool",      "ImpactPool (UN/NGO)"),
+    ("devex",           "DevEx (intl development)"),
+    ("un_careers",      "UN Careers"),
+    # academic / research / postdoc
+    ("euraxess",        "Euraxess (EU research)"),
+    ("jobs_ac_uk",      "jobs.ac.uk (UK academic)"),
+    ("math_ku_phd",     "KU Math PhD board"),
+    ("ub_doctoral",     "UB doctoral"),
+    # blocked / stubs (kept for completeness; flipping doesn't matter
+    # in practice because adapters return [])
+    ("eures",           "EURES (blocked stub)"),
+    ("academicpositions", "AcademicPositions (blocked)"),
+    ("wellfound",       "Wellfound (blocked)"),
+]
+
+
+def _effective_enabled_sources(db: DB, chat_id: int) -> set[str]:
+    """Return the set of source-keys the user currently has enabled.
+
+    Reads the DB column written by the profile builder + the /sources
+    UI. When unset (None), falls back to the operator default
+    (`defaults.DEFAULTS["sources"]`).
+    """
+    explicit = db.get_enabled_sources(chat_id)
+    if explicit is not None:
+        return set(explicit)
+    # Operator-default fallback. Imported lazily so test runs don't have
+    # to monkey-patch defaults.DEFAULTS.
+    try:
+        from defaults import DEFAULTS as _DEFAULTS
+    except ImportError:
+        return set()
+    sources = _DEFAULTS.get("sources") or {}
+    return {k for k, v in sources.items() if v}
+
+
+def _sources_menu_keyboard(enabled: set[str]) -> dict:
+    """Build the inline-keyboard for the /sources picker. Each row is one
+    source: ✅/❌ indicator + human label. Tap → callback `src:<key>`.
+    The footer row has Select All / Clear All shortcuts.
+    """
+    rows = []
+    for key, label in _SOURCES_CATALOG:
+        on = key in enabled
+        prefix = "✅" if on else "▫️"
+        rows.append([{
+            "text": f"{prefix}  {label}",
+            "callback_data": f"src:{key}",
+        }])
+    rows.append([
+        {"text": "✅ Enable all",  "callback_data": "src:_all"},
+        {"text": "▫️ Disable all", "callback_data": "src:_none"},
+    ])
+    rows.append([{"text": "✕ Close", "callback_data": "src:_close"}])
+    return {"inline_keyboard": rows}
+
+
+def _sources_menu_text_mdv2(enabled: set[str], total: int) -> str:
+    n_on = len(enabled)
+    head = (
+        f"⚙️ *Job sources*\n\n"
+        + mdv2_escape(
+            f"Currently {n_on} of {total} sources are active. Each "
+            "source is a separate adapter (LinkedIn search, HN Who-is-"
+            "Hiring, ReliefWeb, etc.). Tap a row to toggle it on/off. "
+            "Your changes apply on the next digest run."
+        )
+    )
+    return head
+
+
+def _show_sources_menu(tg: TelegramClient, db: DB, chat_id: int) -> None:
+    """Send the /sources picker. Tapping a row fires callback `src:<key>`."""
+    db.upsert_user(chat_id)
+    enabled = _effective_enabled_sources(db, chat_id)
+    kb = _sources_menu_keyboard(enabled)
+    text = _sources_menu_text_mdv2(enabled, len(_SOURCES_CATALOG))
+    tg.send_message(chat_id, text, reply_markup=kb)
+
+
+def _handle_sources_callback(
+    tg: TelegramClient, db: DB, cb: dict,
+    chat_id: int, msg_id: int, action: str,
+) -> None:
+    """Callback handler for the /sources picker. `action` is the suffix
+    after `src:` — a source key (e.g. "linkedin"), or one of the special
+    shortcuts: `_all`, `_none`, `_close`.
+    """
+    cb_id = cb.get("id", "")
+    enabled = _effective_enabled_sources(db, chat_id)
+
+    if action == "_close":
+        try:
+            tg.edit_reply_markup(chat_id, msg_id, {"inline_keyboard": []})
+        except Exception:
+            log.debug("/sources close edit failed", exc_info=True)
+        tg.answer_callback(cb_id, "Closed.")
+        return
+
+    if action == "_all":
+        new_set = {k for k, _ in _SOURCES_CATALOG}
+        toast = f"All {len(new_set)} sources enabled."
+    elif action == "_none":
+        new_set = set()
+        toast = "All sources disabled."
+    else:
+        # Toggle a single source.
+        valid_keys = {k for k, _ in _SOURCES_CATALOG}
+        if action not in valid_keys:
+            tg.answer_callback(cb_id, "Unknown source.")
+            return
+        new_set = set(enabled)
+        if action in new_set:
+            new_set.discard(action)
+            toast = f"{action}: disabled"
+        else:
+            new_set.add(action)
+            toast = f"{action}: enabled"
+
+    try:
+        db.set_enabled_sources(chat_id, sorted(new_set) if new_set else None)
+    except Exception:
+        log.exception("/sources: set_enabled_sources failed for chat=%s", chat_id)
+        tg.answer_callback(cb_id, "Save failed — see logs.")
+        return
+
+    # Update the in-place keyboard so the ✅/▫️ markers reflect the new
+    # state without re-sending the whole message. Body text mentions
+    # the count, which changes too — edit_message_text would be ideal
+    # but the body content rarely changes meaningfully on a single tap,
+    # so just refresh the keyboard.
+    try:
+        tg.edit_reply_markup(chat_id, msg_id, _sources_menu_keyboard(new_set))
+    except Exception:
+        log.debug("/sources keyboard edit failed", exc_info=True)
+    tg.answer_callback(cb_id, toast)
+
+
 def _handle_filter_button(
     tg: TelegramClient,
     db: DB,
@@ -476,8 +643,8 @@ def _handle_filter_button(
             tg.answer_callback(cb_id, "Invalid floor.")
             return
         new_floor = max(0, min(5, new_floor))
-        profile = profile_from_json(db.get_user_profile(chat_id))
-        db.set_user_profile(chat_id, profile_to_json(set_min_match_score(profile, new_floor)))
+        # v2: floor lives on the DB column, decoupled from profile JSON.
+        db.set_min_match_score(chat_id, new_floor)
         try:
             kb = digest_header_keyboard(run_id=None, current_floor=new_floor, lower_count=0)
             tg.edit_reply_markup(chat_id, msg_id, kb or {"inline_keyboard": []})
@@ -545,8 +712,8 @@ def _handle_filter_button(
             except Exception:
                 log.debug("mark_digest_jobs_sent failed; continuing", exc_info=True)
 
-        profile = profile_from_json(db.get_user_profile(chat_id))
-        db.set_user_profile(chat_id, profile_to_json(set_min_match_score(profile, new_floor)))
+        # v2: ⭐ writes the DB column.
+        db.set_min_match_score(chat_id, new_floor)
 
         try:
             next_lower = (
@@ -568,14 +735,14 @@ def _handle_filter_button(
 
 def _apply_min_score(tg: TelegramClient, db: DB, cb: dict, chat_id: int, msg_id: int,
                      score: int) -> None:
-    """Callback handler for `ms:<n>`: persist score into the user's profile JSON
-    and echo back. If the user has no profile yet, a minimal stub containing
-    only the score is stored; the next successful Opus rebuild carries the
-    score forward (see profile_builder._run_one)."""
+    """Callback handler for `ms:<n>`: persist score into the DB column.
+
+    v1 stored this in the user_profile JSON, where every Opus rebuild
+    reset it to 0. v2 keeps it in `users.min_match_score` so the user's
+    explicit ⭐ tap survives every rebuild and never gets clobbered.
+    """
     score = max(0, min(5, int(score)))
-    profile = profile_from_json(db.get_user_profile(chat_id))
-    new_profile = set_min_match_score(profile, score)
-    db.set_user_profile(chat_id, profile_to_json(new_profile))
+    db.set_min_match_score(chat_id, score)
 
     # Edit the picker message in place so the row's marker updates and the
     # status line reflects the new threshold. Tapping the already-selected
@@ -1195,6 +1362,8 @@ def _save_prefs_from_text(tg: TelegramClient, db: DB, chat_id: int, text: str) -
         return
 
     try:
+        # v2.2: db.set_prefs_free_text dual-writes prefs.txt internally
+        # — one source of truth, callers can't skip the file mirror.
         db.set_prefs_free_text(chat_id, text)
         db.set_awaiting_state(chat_id, None)
     except Exception as e:
@@ -1312,6 +1481,13 @@ def _handle_skip_reason_text(
         err = e
         log.exception("apply_skip_feedback failed for chat=%s", chat_id)
 
+    # v2.2: db.append_skip_note dual-writes prefs.txt internally — one
+    # entry point keeps DB col and on-disk file in sync.
+    try:
+        db.append_skip_note(chat_id, text)
+    except Exception:
+        log.exception("skip-feedback append failed for chat=%s", chat_id)
+
     db.set_awaiting_state(chat_id, None)
 
     if err is not None:
@@ -1424,7 +1600,13 @@ def _enqueue_profile_rebuild(
 ) -> None:
     """Read the user's resume_text + /prefs free-text and schedule an Opus
     rebuild. Fire-and-forget; the queue handles debounce, in-flight, and
-    progress messages."""
+    progress messages.
+
+    The free_text fed to Opus is `prefs_free_text` plus any accumulated
+    skip-reason comments (rolling buffer). That way every "not a fit"
+    comment the user wrote shapes the next profile rebuild — locations,
+    languages, seniority — without forcing the user to re-edit /prefs.
+    """
     row = db.get_user(chat_id)
     if row is None:
         return
@@ -1433,7 +1615,15 @@ def _enqueue_profile_rebuild(
         resume_text = row["resume_text"] or ""
     except (IndexError, KeyError):
         resume_text = ""
-    free_text = (db.get_prefs_free_text(chat_id) or "").strip()
+    prefs = (db.get_prefs_free_text(chat_id) or "").strip()
+    skip_notes = (db.get_skip_notes_text(chat_id) or "").strip()
+    if skip_notes:
+        sep = "\n\n[Recent 'not a fit' comments]\n"
+        free_text = (prefs + sep + skip_notes) if prefs else (
+            "[Recent 'not a fit' comments]\n" + skip_notes
+        )
+    else:
+        free_text = prefs
     try:
         _get_profile_queue(db, tg).enqueue(
             chat_id=chat_id,
@@ -1672,6 +1862,12 @@ def _handle_callback_inner(
             )
             return
         _apply_min_score(tg, db, cb, chat_id, msg_id, score)
+        return
+
+    # /sources picker — payload is either a source key (e.g. "linkedin")
+    # or one of the special shortcuts (_all / _none / _close).
+    if kind == "src":
+        _handle_sources_callback(tg, db, cb, chat_id, msg_id, payload)
         return
 
     # Clean-my-data flow — three callback prefixes, none of which reference a

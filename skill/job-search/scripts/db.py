@@ -47,6 +47,11 @@ CREATE TABLE IF NOT EXISTS users (
     -- started.
     onboarding_state        TEXT,
     onboarding_completed_at REAL,
+    -- Optional email + verification timestamp, populated only via the web
+    -- magic-link login. Telegram-onboarded users keep these NULL. Uniqueness
+    -- is enforced by `idx_users_email_lower` (partial, case-insensitive).
+    email                   TEXT,
+    email_verified_at       REAL,
     registered_at    REAL NOT NULL
 );
 
@@ -181,6 +186,21 @@ CREATE INDEX IF NOT EXISTS idx_posting_clicks_user ON posting_clicks(chat_id, cl
 CREATE INDEX IF NOT EXISTS idx_posting_clicks_job ON posting_clicks(job_id);
 """
 
+# Indexes that reference columns added by `_migrate()` cannot live in the
+# main SCHEMA block — `executescript(SCHEMA)` runs against a pre-existing
+# table whose `users.email` column hasn't been added yet, and SQLite would
+# raise `no such column: email`. We create them in `_migrate()` after the
+# ALTER TABLE, where the column is guaranteed to exist.
+POST_MIGRATE_INDEXES = """
+-- Case-insensitive uniqueness on the optional users.email column. Used by
+-- the web onboarding (magic-link login) so the same address never maps to
+-- two different chat_ids. SQLite supports indexed expressions, and the
+-- partial-index `WHERE email IS NOT NULL` keeps Telegram-onboarded users
+-- (email IS NULL) from sharing a single phantom row.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_lower
+    ON users(LOWER(email)) WHERE email IS NOT NULL;
+"""
+
 
 class DB:
     def __init__(self, path: Path | str):
@@ -220,6 +240,25 @@ class DB:
             c.execute("ALTER TABLE users ADD COLUMN user_profile TEXT")
         if "prefs_free_text" not in have_cols:
             c.execute("ALTER TABLE users ADD COLUMN prefs_free_text TEXT")
+        # Rolling buffer of recent skip-reason comments. Folded into the
+        # free_text passed to the profile builder so Opus can incorporate
+        # the user's accumulated rejection signals (location/stack/seniority
+        # mismatches the user verbalized after pressing "not a fit").
+        if "skip_notes_text" not in have_cols:
+            c.execute("ALTER TABLE users ADD COLUMN skip_notes_text TEXT")
+        # Algorithm v2: ⭐ button writes the per-user score floor here so it
+        # survives profile rebuilds. v1 stored this in the user_profile JSON
+        # under `min_match_score`, but every Opus rebuild reset it to 0.
+        # Sourcing the floor from a real column decouples the two.
+        if "min_match_score" not in have_cols:
+            c.execute("ALTER TABLE users ADD COLUMN min_match_score INTEGER DEFAULT 0")
+        # Algorithm v2.3: per-user source toggles (JSON list of source
+        # keys). Empty / NULL → fall back to operator default (all
+        # enabled sources from defaults.DEFAULTS["sources"]). Opus picks
+        # the initial list at profile-build time based on resume +
+        # prefs; /sources bot UI lets the user toggle individual entries.
+        if "enabled_sources" not in have_cols:
+            c.execute("ALTER TABLE users ADD COLUMN enabled_sources TEXT")
         if "awaiting_state" not in have_cols:
             c.execute("ALTER TABLE users ADD COLUMN awaiting_state TEXT")
         if "profile_revision" not in have_cols:
@@ -234,6 +273,15 @@ class DB:
             c.execute("ALTER TABLE users ADD COLUMN onboarding_state TEXT")
         if "onboarding_completed_at" not in have_cols:
             c.execute("ALTER TABLE users ADD COLUMN onboarding_completed_at REAL")
+
+        # Web-app login columns. Optional — Telegram-onboarded users may
+        # never set an email; web users always do. The unique index in
+        # SCHEMA enforces case-insensitive uniqueness, but only when the
+        # column is non-NULL so the bot's existing rows aren't affected.
+        if "email" not in have_cols:
+            c.execute("ALTER TABLE users ADD COLUMN email TEXT")
+        if "email_verified_at" not in have_cols:
+            c.execute("ALTER TABLE users ADD COLUMN email_verified_at REAL")
 
         # Refresh; the ADD COLUMN statements above may have changed things.
         have_cols = {r["name"] for r in c.execute("PRAGMA table_info(users)")}
@@ -271,6 +319,11 @@ class DB:
         for legacy in ("user_prefs", "consume_profile_v2", "v2_opt_out"):
             if legacy in have_cols:
                 c.execute(f"ALTER TABLE users DROP COLUMN {legacy}")
+
+        # Indexes that reference columns ADD-ed above. Must come after the
+        # ALTER TABLE, otherwise SQLite raises `no such column: email` when
+        # called against a DB that pre-dates this migration.
+        c.executescript(POST_MIGRATE_INDEXES)
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
@@ -339,14 +392,98 @@ class DB:
                 "SELECT * FROM users WHERE resume_path IS NOT NULL AND resume_path <> ''"
             ))
 
+    # ---------- web login: email lookup / allocation ----------
+
+    def find_user_by_email(self, email: str | None) -> sqlite3.Row | None:
+        """Look up a user row by email, case-insensitively. Returns None if
+        the address is empty / unknown. Used by the web magic-link verify
+        path: a hit means the address was already registered (either on
+        an earlier web visit, or by a Telegram user who later attached
+        their email)."""
+        if not email or not email.strip():
+            return None
+        with self._conn() as c:
+            return c.execute(
+                "SELECT * FROM users WHERE LOWER(email) = LOWER(?)",
+                (email.strip(),),
+            ).fetchone()
+
+    def set_email(
+        self,
+        chat_id: int,
+        email: str | None,
+        verified_at: float | None = None,
+    ) -> None:
+        """Persist the user's email + verification timestamp.
+
+        Pass `email=None` to clear (rare — accounts get fully deleted via
+        delete_user instead). `verified_at` defaults to now() when an
+        email is being set, NULL when it's being cleared.
+        """
+        normalized = email.strip() if isinstance(email, str) and email.strip() else None
+        if normalized is not None and verified_at is None:
+            verified_at = time.time()
+        if normalized is None:
+            verified_at = None
+        with self._conn() as c:
+            c.execute(
+                "UPDATE users SET email = ?, email_verified_at = ? WHERE chat_id = ?",
+                (normalized, verified_at, chat_id),
+            )
+
+    def allocate_web_chat_id(self) -> int:
+        """Reserve a negative chat_id for a web-only user (never seen on
+        Telegram). Web users register without a chat_id; we mint negative
+        integers so they can't collide with the positive ints Telegram
+        hands out. The next id is `-1 - <count of existing negative rows>`,
+        which is deterministic and monotonic for the lifetime of the DB.
+        """
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT COUNT(*) AS n FROM users WHERE chat_id < 0"
+            ).fetchone()
+            n = int(row["n"] or 0) if row else 0
+            return -1 - n
+
     # ---------- prefs free-text (raw input for the profile builder) ----------
 
     def set_prefs_free_text(self, chat_id: int, text: str | None) -> None:
-        """Persist the raw /prefs description verbatim. Pass None to clear."""
+        """Persist the raw /prefs description verbatim. Pass None to clear.
+
+        Algorithm v2.2: dual-writes to `state/users/<chat_id>/prefs.txt`
+        via `user_files.write_prefs` so every caller (bot.py /prefs flow,
+        web backend onboarding submit + settings PATCH, onboarding wizard,
+        future entry points) keeps the on-disk source-of-truth in sync
+        with the DB column. search_jobs.py reads the file at scoring
+        time; if a caller skipped the file write, scoring saw an empty
+        prefs blob (the 385675637 bug). Centralising here removes that
+        whole class of mistake.
+
+        The file write is best-effort: a FS hiccup never breaks the DB
+        write or its caller. The DB column is still the authoritative
+        record — `user_files.read_prefs` returns "" when the file is
+        missing and `tools/migrate_v2_files.py` can rehydrate it.
+        """
         with self._conn() as c:
             c.execute(
                 "UPDATE users SET prefs_free_text = ? WHERE chat_id = ?",
                 (text, chat_id),
+            )
+        # Lazy import keeps db.py free of a hard dependency on the
+        # script-side helper at module load time (matters in test
+        # harnesses that import db.py without the full bot tree on
+        # sys.path).
+        try:
+            from user_files import write_prefs as _wp
+        except ImportError:
+            return
+        try:
+            _wp(chat_id, text or "")
+        except Exception:
+            import logging
+            logging.getLogger(__name__).debug(
+                "set_prefs_free_text: file mirror write failed; "
+                "DB row already updated", exc_info=True,
             )
 
     def get_prefs_free_text(self, chat_id: int) -> str | None:
@@ -358,6 +495,142 @@ class DB:
             if row is None:
                 return None
             return row["prefs_free_text"]
+
+    # ---------- skip-feedback notes (rolling buffer of user comments) ----------
+
+    # Cap the rolling buffer so it doesn't grow unboundedly. ~2000 chars is
+    # roughly 30-50 short comments — plenty of signal without bloating the
+    # profile-builder prompt.
+    _MAX_SKIP_NOTES_CHARS = 2000
+
+    def append_skip_note(self, chat_id: int, text: str) -> None:
+        """Append a skip-reason comment to the rolling buffer.
+
+        Buffer is one big newline-separated string; we trim from the FRONT
+        when the buffer would exceed `_MAX_SKIP_NOTES_CHARS` so the most
+        recent comments win. Empty / whitespace-only `text` is a no-op.
+
+        Algorithm v2.2: dual-writes to prefs.txt via
+        `user_files.append_skip_note` so the scorer (which reads the
+        file) sees the same accumulated rejection signal the DB carries.
+        """
+        t = (text or "").strip()
+        if not t:
+            return
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT skip_notes_text FROM users WHERE chat_id = ?", (chat_id,),
+            ).fetchone()
+            current = "" if row is None else (row["skip_notes_text"] or "")
+            entry = f"- {t[:400]}"
+            joined = (current + "\n" + entry) if current else entry
+            if len(joined) > self._MAX_SKIP_NOTES_CHARS:
+                # Drop oldest entries (FIFO) until we're under the cap.
+                lines = joined.split("\n")
+                while lines and len("\n".join(lines)) > self._MAX_SKIP_NOTES_CHARS:
+                    lines.pop(0)
+                joined = "\n".join(lines)
+            c.execute(
+                "UPDATE users SET skip_notes_text = ? WHERE chat_id = ?",
+                (joined, chat_id),
+            )
+        try:
+            from user_files import append_skip_note as _asn
+        except ImportError:
+            return
+        try:
+            _asn(chat_id, t)
+        except Exception:
+            import logging
+            logging.getLogger(__name__).debug(
+                "append_skip_note: file mirror write failed; "
+                "DB row already updated", exc_info=True,
+            )
+
+    def get_skip_notes_text(self, chat_id: int) -> str | None:
+        """Return the rolling skip-reason buffer, or None if empty."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT skip_notes_text FROM users WHERE chat_id = ?", (chat_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return row["skip_notes_text"]
+
+    # ---------- score floor (⭐ button) ----------
+
+    def set_min_match_score(self, chat_id: int, score: int) -> None:
+        """Persist the user's ⭐ floor. Clamps to [0,5]. Survives profile
+        rebuilds because it lives in its own column rather than the
+        Opus-owned profile JSON."""
+        s = max(0, min(5, int(score or 0)))
+        with self._conn() as c:
+            c.execute(
+                "UPDATE users SET min_match_score = ? WHERE chat_id = ?",
+                (s, chat_id),
+            )
+
+    def get_min_match_score(self, chat_id: int) -> int:
+        """Return the user's ⭐ floor (0-5). 0 means inherit the global default."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT min_match_score FROM users WHERE chat_id = ?", (chat_id,),
+            ).fetchone()
+            if row is None:
+                return 0
+            try:
+                return max(0, min(5, int(row["min_match_score"] or 0)))
+            except (TypeError, ValueError):
+                return 0
+
+    # ---------- per-user source toggles (algorithm v2.3) ----------
+
+    def set_enabled_sources(
+        self, chat_id: int, sources: list[str] | None,
+    ) -> None:
+        """Persist the user's per-source allow-list. Pass None / empty to
+        clear (= inherit operator-default `defaults.DEFAULTS["sources"]`).
+
+        Stored as a JSON array of source keys (e.g. "linkedin", "remoteok",
+        "ai_jobs_net"). Source dispatch in search_jobs.py reads this list
+        and drops jobs whose source isn't in it before enrichment.
+        """
+        import json as _json
+        if not sources:
+            value = None
+        else:
+            value = _json.dumps(
+                [str(s) for s in sources if isinstance(s, str) and s],
+                ensure_ascii=False,
+            )
+        with self._conn() as c:
+            c.execute(
+                "UPDATE users SET enabled_sources = ? WHERE chat_id = ?",
+                (value, chat_id),
+            )
+
+    def get_enabled_sources(self, chat_id: int) -> list[str] | None:
+        """Return the user's per-source allow-list or None when unset.
+
+        None means "inherit operator-default sources block from
+        defaults.DEFAULTS". Empty list means "no sources" — unusual but
+        respected literally (no jobs surfaced).
+        """
+        import json as _json
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT enabled_sources FROM users WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchone()
+            if row is None or row["enabled_sources"] is None:
+                return None
+            try:
+                parsed = _json.loads(row["enabled_sources"])
+            except (TypeError, ValueError):
+                return None
+            if not isinstance(parsed, list):
+                return None
+            return [s for s in parsed if isinstance(s, str) and s]
 
     # ---------- user profile (Opus-built, structured) ----------
 
@@ -585,6 +858,9 @@ class DB:
                 UPDATE users
                 SET user_profile     = NULL,
                     prefs_free_text  = NULL,
+                    skip_notes_text  = NULL,
+                    min_match_score  = 0,
+                    enabled_sources  = NULL,
                     profile_built_at = NULL,
                     profile_revision = 0
                 WHERE chat_id = ?
@@ -906,6 +1182,20 @@ class DB:
                     "SELECT job_id FROM applications WHERE chat_id = ?", (chat_id,)
                 )
             }
+
+    def clear_application(self, chat_id: int, job_id: str) -> int:
+        """Drop the (chat, job) applications row entirely, restoring the
+        "no decision made" state. Used by the web /undo route — broader
+        than `set_application_status` because it has to handle the case
+        where the row didn't exist before the action being undone (then
+        the previous status was simply "absent"). Returns rows removed
+        (0 or 1)."""
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM applications WHERE chat_id = ? AND job_id = ?",
+                (chat_id, str(job_id)),
+            )
+            return int(cur.rowcount or 0)
 
     def applied_jobs(self, chat_id: int) -> list[sqlite3.Row]:
         with self._conn() as c:

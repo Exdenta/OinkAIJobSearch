@@ -1,0 +1,57 @@
+# GitHub Actions workflow — Hetzner deploy.
+#
+# This file is intentionally placed under deploy/github-actions/ instead of
+# .github/workflows/ so that committing the deploy bundle does NOT trigger
+# CI. To enable:
+#
+#   mkdir -p .github/workflows
+#   git mv deploy/github-actions/deploy.yml .github/workflows/deploy.yml
+#   git commit -m "ci: enable Hetzner deploy"
+#
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   HETZNER_HOST     Hostname or IP of the server (e.g. hryu.example.com)
+#   HETZNER_SSH_KEY  Private ED25519 key whose public half is in the
+#                    `deploy` user's ~/.ssh/authorized_keys on the server.
+#                    Generate locally with:
+#                      ssh-keygen -t ed25519 -C "github-deploy" -f hryu_deploy
+#                    Put hryu_deploy.pub on the server, paste hryu_deploy
+#                    into the GH secret. Never commit either.
+
+name: Deploy to Hetzner
+
+on:
+  push:
+    branches: [master, main]
+  workflow_dispatch:
+
+# Serialize deploys — never let two pushes race.
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        env:
+          HETZNER_SSH_KEY: ${{ secrets.HETZNER_SSH_KEY }}
+          HETZNER_HOST: ${{ secrets.HETZNER_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$HETZNER_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$HETZNER_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Run deploy.sh
+        env:
+          HOST: ${{ secrets.HETZNER_HOST }}
+        run: |
+          chmod +x deploy/deploy.sh
+          deploy/deploy.sh "$HOST"

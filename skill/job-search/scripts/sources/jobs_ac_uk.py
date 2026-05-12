@@ -268,6 +268,34 @@ def fetch(filters: dict) -> list[Job]:
         log.exception("jobs_ac_uk fetch failed: %s", e)
         body_head = body_head or repr(e)[:300]
 
+    # Algorithm v2.2 — Option 4: jobs.ac.uk RSS gives ~400 chars of
+    # description; the actual job spec (eligibility, PhD reqs,
+    # responsibilities, funding terms) lives on the detail page.
+    # Fetching it inline lets Sonnet see "Home/UK students only" or
+    # "PhD in Linguistics required" before scoring.
+    if jobs:
+        try:
+            from sources._detail_fetch import fetch_many_bodies
+            body_map = fetch_many_bodies(
+                [j.url for j in jobs], max_chars=4000, workers=8,
+            )
+            enriched = 0
+            for i, j in enumerate(jobs):
+                body = body_map.get(j.url, "")
+                if body and len(body) > len(j.snippet):
+                    jobs[i] = Job(
+                        j.source, j.external_id, j.title, j.company,
+                        j.location, j.url, j.posted_at, body,
+                        getattr(j, "salary", ""),
+                    )
+                    enriched += 1
+            log.info(
+                "jobs_ac_uk: detail-page bodies fetched for %d/%d postings",
+                enriched, len(jobs),
+            )
+        except Exception:
+            log.exception("jobs_ac_uk: detail-page fetch raised; continuing")
+
     sample_titles = [j.title for j in jobs[:5]]
 
     _log_forensic(

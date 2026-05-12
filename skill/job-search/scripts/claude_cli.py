@@ -40,6 +40,12 @@ log = logging.getLogger(__name__)
 # specific Haiku build or promote to Sonnet for an A/B.
 SMALLEST_MODEL = os.environ.get("CLAUDE_SMALLEST_MODEL", "haiku")
 
+# Mid-tier model used for the second pass of the two-pass enrichment flow:
+# Haiku triages every posting cheaply, then Sonnet re-scores survivors with
+# the same prompt. Sonnet is better at implicit constraints (language,
+# location nuance, years-experience math) where Haiku is noisy.
+MID_MODEL = os.environ.get("CLAUDE_MID_MODEL", "sonnet")
+
 
 def run_p(
     prompt: str,

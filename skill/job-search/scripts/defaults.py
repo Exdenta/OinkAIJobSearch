@@ -67,11 +67,55 @@ DEFAULTS: dict = {
     # AI enrichment — single Haiku call per user per run scores every fetched
     # posting against resume + preferences. The sole matching gate.
     "ai_enrich":            True,
-    "ai_enrich_timeout_s":  240,
+    # v2.1: bumped 240→1200 because Sonnet at batch=10 with full resume +
+    # prefs + 10 jobs (~37k chars prompt) routinely hit the old 240s
+    # ceiling, forcing split-retries. 1200 (~20 min) gives Sonnet breathing
+    # room without inviting indefinite hangs.
+    "ai_enrich_timeout_s":  1200,
+
+    # Two-pass scoring. Default OFF in algorithm v2 — Haiku gets a smaller,
+    # cleaner per-batch prompt (raw resume + raw prefs.txt + 5 jobs) plus
+    # the new why_mismatch field, which empirically gives Haiku enough
+    # context to score reliably without a Sonnet re-score. Operators can
+    # flip this back on if Haiku noise returns.
+    #   ai_two_pass:        master toggle. False → single-pass Haiku.
+    #   ai_triage_floor:    only meaningful when two_pass=True.
+    "ai_two_pass":        False,
+    "ai_triage_floor":    2,
+
+    # Per-batch chunk size (algorithm v2.1). Bumped from 5 → 10 once we
+    # promoted the scorer to Sonnet — Sonnet handles the bigger prompt
+    # comfortably and the larger batch halves the per-pool wall time.
+    "ai_max_jobs_per_call": 10,
+    # Parallel batch dispatch (v2.1). Each batch is one `claude -p` sub-
+    # process; firing N at once roughly divides wall time by N. Anthropic
+    # API + claude CLI handle their own rate limits; the OS subprocess
+    # pool is the practical bound. 4 workers cuts a 60-min serial run to
+    # ~15-20 min while staying well under the per-key rate ceiling.
+    "ai_enrich_workers": 4,
+
+    # Parallel source-fetch dispatch (v2.2). The global-pass `fetch_all`
+    # runs 23 adapters in a thread pool of this size. Adapters are
+    # network-IO bound; threading scales them well. Six is a safe
+    # middle ground — each adapter has its own internal concurrency
+    # (LinkedIn paces 1.5s/req, impactpool runs 8 detail-page workers),
+    # and 6 simultaneous adapters means roughly 6× outbound HTTP +
+    # 1-2× claude subprocesses at peak.
+    "ai_source_workers": 6,
+
+    # Liveness verifier moved to send-time (telegram_client) in v2.1 —
+    # only the postings that survived scoring + ⭐ floor get a Haiku
+    # WebFetch verification. Per-pool pre-enrich verification was 90+ min
+    # of wasted Haiku calls. The toggle below is left as a no-op for
+    # back-compat with operators who set it; remove on next major bump.
+    "ai_pre_enrich_liveness": False,
 
     # Default match-score floor when a user hasn't set their own ⭐ via the
-    # bot button. 0 disables; clamps to [0, 5].
-    "ai_min_match_score": 2,
+    # bot button. 0 disables; clamps to [0, 5]. Bumped 2 → 4 in v2.1 —
+    # at 2, users who never tapped ⭐ were getting 30-50 borderline
+    # postings per day. 4 keeps the bar high enough that the default
+    # output feels curated.
+    "ai_min_match_score": 4,
 
     # Per-scrape timeout for Claude-CLI-backed adapters (curated_boards).
     "ai_scrape_timeout_s":     180,

@@ -563,6 +563,26 @@ def apply_skip_feedback(
         },
     }
 
+    # Algorithm v2: when the user has a seeds-only profile (schema_v=4),
+    # the structured exclude lists this module mutates do not exist.
+    # Scoring reads prefs.txt directly and the bot has already appended
+    # the user's reason there before calling us — no Haiku surgery
+    # needed. Short-circuit with a generic ack so we don't burn a model
+    # call for a no-op.
+    if int((profile or {}).get("schema_version") or 0) == 4:
+        ack = (
+            "Got it — your feedback is in your prefs file and will shape the "
+            "next digest scoring."
+        )
+        result = _empty_result(ack)
+        forensic.log_step(
+            "skip_feedback.applied",
+            input=forensic_input,
+            output={"additions": {}, "summary": result["summary"], "skipped": "v2_seeds_only"},
+            chat_id=chat_id,
+        )
+        return result
+
     # Empty reason → don't waste a Haiku call.
     if not user_reason:
         result = _empty_result(_FALLBACK_SUMMARY_NO_EXTRACT)
