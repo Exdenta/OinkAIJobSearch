@@ -60,7 +60,12 @@ from log_ttl import cleanup_logs                            # noqa: E402
 # `linkedin` and `web_search` are imported but NOT in the global SOURCES
 # dispatch below — they only run per-user inside the recipient loop, using
 # each profile's stored seeds. See run() below.
-from job_enrich import enrich_jobs_ai, by_job_id           # noqa: E402
+from job_enrich import (                                   # noqa: E402
+    enrich_jobs_ai,
+    by_job_id,
+    pick_most_relevant_ai,
+    reanalyze_scoring_ai,
+)
 from user_profile import (                                 # noqa: E402
     profile_from_json,
     is_empty_profile,
@@ -692,6 +697,12 @@ def run(dry_run: bool = False, only_chat: int | None = None) -> int:
                 user_min_score = int(db.get_min_match_score(chat_id) or 0)
                 effective_min_score = user_min_score if user_min_score > 0 else default_min_score
                 dropped_below_score = 0
+                # Keep the pre-floor pool around for the v2.4 fallback
+                # path — when nothing clears the user's ⭐ floor, we still
+                # surface the single most-relevant near-miss.
+                pre_floor_jobs = list(user_jobs)
+                fallback_mode = False
+                fallback_top_score = 0
                 if effective_min_score > 0 and user_jobs:
                     before = len(user_jobs)
                     user_jobs = [
@@ -704,6 +715,95 @@ def run(dry_run: bool = False, only_chat: int | None = None) -> int:
                              chat_id, effective_min_score, gate_source, before, len(user_jobs))
                     if not user_jobs and quiet:
                         continue
+
+                # ----- v2.4 fallback (refactored 2026-05-15) ---------
+                # Run the send-time prefilter (age / dead-URL / forum /
+                # LLM-liveness) on the FLOOR-survivors first. Only if
+                # NO job survives the gates do we fall back to the
+                # closest miss from `pre_floor_jobs`. Previous version
+                # checked `if not user_jobs` BEFORE the prefilter, which
+                # skipped the fallback whenever the floor cut returned
+                # at least 1 job — but that job often died inside
+                # `send_per_job_digest`'s inline prefilter, leaving the
+                # user with 0 sent and no fallback.
+                from telegram_client import prefilter_for_send
+                alive_floor: list[Job] = []
+                if user_jobs:
+                    alive_floor, _drop_counts = prefilter_for_send(
+                        user_jobs, chat_id, forensic=forensic,
+                    )
+                    if len(alive_floor) != len(user_jobs):
+                        log.info(
+                            "User %s: send-time prefilter %d → %d (gate drops)",
+                            chat_id, len(user_jobs), len(alive_floor),
+                        )
+                if effective_min_score > 0 and not alive_floor and enrichments_by_job_id and pre_floor_jobs:
+                    # Pull candidates from the pre-floor pool, sorted by
+                    # score DESC. For each score tier with >=2 tied
+                    # candidates, the Sonnet tie-breaker picks the best.
+                    # Then validate the pick via prefilter; on death,
+                    # try the next candidate in the same tier, then the
+                    # next tier.
+                    scored = [
+                        (int((enrichments_by_job_id.get(j.job_id) or {}).get("match_score") or 0), j)
+                        for j in pre_floor_jobs
+                        # Don't re-try jobs we already validated in
+                        # alive_floor above (none survived); they're
+                        # also in pre_floor_jobs.
+                    ]
+                    scored = [(s, j) for s, j in scored if s >= 1]
+                    # Group by score tier (desc).
+                    tiers: dict[int, list[Job]] = {}
+                    for s, j in scored:
+                        tiers.setdefault(s, []).append(j)
+                    picked_fallback = None
+                    picked_score = 0
+                    for tier_score in sorted(tiers.keys(), reverse=True):
+                        candidates = tiers[tier_score]
+                        # Sonnet tie-break when >1; for size 1, no call.
+                        try:
+                            top = pick_most_relevant_ai(
+                                candidates, resume_text, prefs_text,
+                                timeout_s=enrich_timeout_s,
+                            )
+                        except Exception:
+                            log.exception("User %s: fallback picker raised", chat_id)
+                            top = candidates[0]
+                        # Try the Sonnet pick first, then siblings in
+                        # the same tier. Each one through prefilter to
+                        # confirm liveness.
+                        ordered = ([top] if top else []) + [
+                            j for j in candidates if top is None or j.external_id != top.external_id
+                        ]
+                        for cand in ordered:
+                            survivors, _ = prefilter_for_send(
+                                [cand], chat_id, forensic=forensic,
+                            )
+                            if survivors:
+                                picked_fallback = survivors[0]
+                                picked_score = tier_score
+                                break
+                        if picked_fallback is not None:
+                            break
+                    if picked_fallback is not None:
+                        alive_floor = [picked_fallback]
+                        fallback_mode = True
+                        fallback_top_score = picked_score
+                        log.info(
+                            "User %s: floor=%d had 0 alive matches; "
+                            "fallback card top_score=%d title=%s",
+                            chat_id, effective_min_score, picked_score,
+                            picked_fallback.title[:60],
+                        )
+                    else:
+                        log.info(
+                            "User %s: floor=%d had 0 alive matches AND "
+                            "no living fallback candidate; sending NO_MATCHES",
+                            chat_id, effective_min_score,
+                        )
+                # All downstream stages use `alive_floor` as the final
+                # send list. user_jobs kept for digest_run_jobs caching.
+                user_jobs = alive_floor
                 # Header floor reflects the gate that actually fired (user
                 # value if set, otherwise the global default). Surfacing 0
                 # would hide the ⬆ button and lie about what was filtered.
@@ -740,6 +840,9 @@ def run(dry_run: bool = False, only_chat: int | None = None) -> int:
                         enriched_count=enriched_count,
                         dropped_below_score=dropped_below_score,
                         lower_count_at_step=lower_count_at_step,
+                        fallback_mode=fallback_mode,
+                        fallback_top_score=fallback_top_score,
+                        pre_filtered=True,
                     )
                     total_sent += sent
                     if _sent_jobs_this_run:
@@ -755,6 +858,84 @@ def run(dry_run: bool = False, only_chat: int | None = None) -> int:
                     pctx.incr_errors(1)
                     send_failed_chat = chat_id
                     break
+
+                # --- v2.5 audit stage --------------------------------
+                # AFTER the cards have shipped, re-grade the score-≥1
+                # verdicts with a second-opinion model (Opus by default)
+                # and persist any disagreements. This catches scoring
+                # drift (Sonnet over- or under-scoring) without blocking
+                # the digest. Disagreements land in forensic as
+                # `scoring_audit.review` lines so we can grep for
+                # systematic misses post-hoc and decide whether a
+                # follow-up manual top-up is warranted.
+                if filters.get("ai_scoring_audit", True) and enrichments_by_job_id:
+                    try:
+                        ext_to_job = {j.external_id: j for j in user_pool}
+                        # Audit score-≥1 only — score-0s are firmly
+                        # negative and re-checking them is rarely useful.
+                        ext_id_to_enrich = {
+                            ext_id: enr for ext_id, enr in enrichments_by_job_id.items()
+                            # enrichments_by_job_id is keyed by *job_id*
+                            # not external_id; rebuild via the
+                            # external_id keys we kept above.
+                        }
+                        # Actually rebuild a key-by-external_id map
+                        # because reanalyze_scoring_ai wants external_ids.
+                        ext_enr: dict[str, dict] = {}
+                        audit_jobs: list[Job] = []
+                        for j in user_pool:
+                            enr = enrichments_by_job_id.get(j.job_id) or {}
+                            score = int(enr.get("match_score") or 0)
+                            if score >= 1:
+                                ext_enr[j.external_id] = enr
+                                audit_jobs.append(j)
+                        if audit_jobs:
+                            audit_timeout = int(
+                                filters.get("ai_scoring_audit_timeout_s") or enrich_timeout_s
+                            )
+                            audit_model = str(
+                                filters.get("ai_scoring_audit_model") or "opus"
+                            )
+                            reviews = reanalyze_scoring_ai(
+                                audit_jobs, ext_enr, resume_text, prefs_text,
+                                timeout_s=audit_timeout, model=audit_model,
+                            )
+                            disagreements = [
+                                r for r in reviews
+                                if r["verdict"] != "agree"
+                            ]
+                            log.info(
+                                "User %s: scoring audit — %d reviewed, "
+                                "%d disagreements (raises=%d lowers=%d)",
+                                chat_id, len(reviews), len(disagreements),
+                                sum(1 for r in disagreements if r["verdict"] == "raise"),
+                                sum(1 for r in disagreements if r["verdict"] == "lower"),
+                            )
+                            # One forensic line per review entry so ops
+                            # can grep specific patterns later.
+                            for r in reviews:
+                                j = ext_to_job.get(r["id"])
+                                forensic.log_step(
+                                    "scoring_audit.review",
+                                    input={
+                                        "external_id": r["id"],
+                                        "title": (getattr(j, "title", "") or "")[:120],
+                                        "company": (getattr(j, "company", "") or "")[:80],
+                                        "source": getattr(j, "source", ""),
+                                    },
+                                    output={
+                                        "original_score": r["original_score"],
+                                        "revised_score":  r["revised_score"],
+                                        "verdict":        r["verdict"],
+                                        "comment":        r["comment"],
+                                    },
+                                    chat_id=chat_id,
+                                    run_id=pctx.run_id,
+                                )
+                    except Exception:
+                        log.exception("User %s: scoring audit raised; "
+                                      "continuing", chat_id)
+                # -----------------------------------------------------
 
             stats["jobs_sent_total"] = total_sent
             log.info(

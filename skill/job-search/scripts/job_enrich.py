@@ -131,6 +131,49 @@ US only", "no Solidity"), fold those into the relevant veto / location
 list. Treat skip-reasons as authoritative additions to the user's
 stated prefs.
 
+═══ TOP-LEVEL SCORING DOCTRINE — read before applying any rule ═══
+
+These three doctrines override anything below if they conflict.
+
+DOCTRINE A — NEVER penalize "overqualification". Anywhere.
+  Forbidden why_mismatch phrasings (drop them; do not subtract):
+    × "candidate is overqualified for this junior role"
+    × "X years experience exceeds Y-year requirement"
+    × "salary undervalues the candidate"
+    × "below market", "compensation too low"
+    × "senior candidate vs mid posting"
+    × "candidate's tenure exceeds the role bar"
+  Good example — Senior candidate sees a Junior React role:
+    why_match: "React stack matches; remote EU; English."
+    why_mismatch: ""        ← LEAVE EMPTY when only delta is downward
+    score: base score, no penalty. NO subtraction.
+
+DOCTRINE B — NEVER stack penalties on the SAME underlying fact.
+  Common stacked-penalty bugs (caught by audit 2026-05-15):
+    × "Senior title → -1 (seniority)  AND  5+ years → -1 (years)"
+       Both penalize the same upward gap. Apply ONLY ONE.
+    × "Junior title → -1 below-target  AND  2y required → -1 years
+       gap below candidate." Apply NEITHER (Doctrine A).
+  Rule: if SENIORITY PENALTY fires from the title, the PER-SKILL
+  YEARS PENALTY for the same skill/role does NOT also fire. The two
+  penalties exist to catch DIFFERENT signals (title vs body), not to
+  double-tax the same gap.
+
+DOCTRINE C — Generic "<Stack> Developer (Remote)" titles whose BODY
+describes data labeling / LLM evaluation / AI rating tasks are NOT
+frontend / backend / engineering postings. They are PROMPT-rating
+gigs (BairesDev / Hire Feed / Outlier-style aggregators). Veto with
+score=0 when the body shows ANY of:
+    "evaluate AI/LLM responses", "rate model outputs",
+    "data labeling", "training data review",
+    "prompt engineering" as the JOB (not as a tool you use),
+    "rate model quality", "provide human feedback for AI",
+    "review LLM outputs", "rank responses", "score completions"
+why_mismatch must cite: "AI-rating / data-labeling gig — not real
+engineering" (with the matched phrase).
+
+═════════════════════════════════════════════════════════════════════
+
 For each posting, you must:
 
   1. Score how well it matches THIS candidate, on an integer 0-5 scale:
@@ -240,41 +283,54 @@ For each posting, you must:
      gap = max(0, required_level - candidate_level)
      subtract = gap   (so each level below the bar costs 1 point)
 
+     The CEFR penalty fires ONLY when the posting names a language AND
+     specifies an EXPLICIT high-bar level. Vague phrasing
+     ("proficient", "professional working", "advanced", "good
+     communicator", "comfortable in English") is NOT enough — too many
+     postings boilerplate-include those without meaning a true C1.
+
      Identifying the REQUIRED language + level for a posting:
-       - Look at posting body/title: "all classes taught in French",
-         "fluency in German required", "C2-level Spanish", "must be
-         native-level Polish speaker", "Spanish-language working
-         environment", or the posting is itself written entirely in a
-         non-English language as the working language of the role.
-       - If the posting names a language but no explicit level:
-           * "fluent" / "fluency" / "native" / "near-native"  → C2
-           * "professional" / "professional working"          → C1
-           * "advanced"                                       → C1
-           * "working knowledge" / "conversational"           → B2
-           * "basic"                                          → A2
-           * If the posting is BODY-LANGUAGE in non-English (e.g. a
-             Spanish-language listing) → treat as C1 required for that
-             language.
-           * If posting only says "English required" with no level → C1.
+       - HIGH-CONFIDENCE TRIGGERS (penalty fires):
+           * Explicit CEFR letter: "C1", "C2", "B2"
+             (e.g. "C2-level Spanish", "C1 German required").
+           * "fluent" / "fluency" / "near-native"   → C2
+           * "native" / "native speaker" / "native-level"   → C2
+           * "must be native-level <lang>"          → C2
+           * "all <activities> taught in <lang>"    → C2 (working
+             language is that language end-to-end).
+           * Posting body language is non-English AND the role
+             explicitly demands the body language → C1 minimum.
+       - DO NOT TRIGGER on weak signals — these stay at "no penalty":
+           * "professional", "professional working proficiency",
+             "advanced", "working knowledge", "conversational",
+             "comfortable in", "good <lang> skills", "<lang> a plus".
+           * "English required" with no level qualifier — assume B2,
+             which is below C1 so no auto-C1 bar.
+           * Posting NAMES a language but doesn't tie it to a
+             requirement ("we work across English / Spanish teams").
        - If posting is multilingual ("English OR French"): pick the
          language with the SMALLEST gap for the candidate (best of).
-       - If posting language requirement is genuinely ambiguous, do not
-         apply the language penalty.
+       - If genuinely ambiguous: NO penalty.
 
      Identifying the candidate's LEVEL for that language:
-       - Read the resume's languages section / inline language mentions.
-         Recognise CEFR markers (A1/A2/B1/B2/C1/C2), as well as
-         "native", "bilingual", "fluent" (= C2), "professional"/"working
-         proficiency" (= C1), "intermediate" (= B1), "basic" (= A2),
-         and explicit certificate names (DELF C1, Goethe B2, etc.).
+       - Read the resume's languages section / inline language mentions
+         AND the PREFS file (which may explicitly list levels:
+         "Languages: English C1, Russian native").
+       - Recognise CEFR markers (A1/A2/B1/B2/C1/C2), "native",
+         "bilingual", "fluent" (= C2), "intermediate" (= B1),
+         "basic" (= A2), explicit certificate names (DELF C1, Goethe
+         B2, IELTS 7.0 ≈ C1, TOEFL 110 ≈ C2).
+       - Soft self-descriptors ("professional", "working proficiency",
+         "advanced") map to B2 UNLESS paired with an explicit CEFR
+         qualifier — they're aspirational on resumes too.
        - The candidate's `language` field in preferences, if non-empty,
          lists the language(s) they prefer to work in — assume C2 for
-         each unless the resume says otherwise.
+         each unless the resume/PREFS says otherwise.
        - If the candidate did NOT list the required language at all,
          treat their level as A1 (numeric 1).
        - English: if the resume is written in English OR lists English
-         anywhere, assume at least B2 unless the resume's languages
-         section gives a higher explicit level.
+         anywhere, assume at least B2 unless the resume/PREFS gives a
+         higher explicit level.
 
      Examples:
        - Posting "All classes taught in French (C2 required)". Resume:
@@ -295,26 +351,47 @@ For each posting, you must:
      per seniority step the posting sits ABOVE the candidate's target
      level. Floor at 0. STRICTLY ONE-DIRECTIONAL — postings BELOW the
      candidate's target are NOT penalized here UNLESS the candidate's
-     PREFS text explicitly excludes lower-seniority roles.
+     PREFS text contains an EXPLICIT VETO PHRASE for lower seniority.
 
      Default rule for lower-than-target postings:
-       Treat junior / mid / associate / entry-level postings as a
-       perfectly acceptable seniority fit for a senior candidate (no
-       penalty). Many strong candidates intentionally apply downward
-       to switch domain / company / stack — the bot does not second-
-       guess that.
+       Treat intern / junior / mid / associate / entry-level postings
+       as a PERFECTLY acceptable seniority fit at no penalty. Many
+       strong candidates intentionally apply downward to switch
+       domain / company / stack. The bot does NOT second-guess that.
 
-     ONLY downgrade lower-than-target postings when PREFS explicitly
-     rejects them. Signals to look for inside the PREFS block:
-       * `title_exclude` tokens like "junior", "entry-level", "intern".
-       * Free-text vetoes: "NOT a fit: junior / mid level", "senior or
-         above only", "no associate roles", "must be senior".
+     SOFT phrasing that DOES NOT trigger the below-target penalty
+     (these are aspirational, not vetoes):
+       * "I am a mid-level engineer" / "looking for a mid-level role"
+       * "Mid-level frontend engineer role working primarily in …"
+       * "Senior backend engineer" (candidate self-describing)
+       * "Targeting mid → senior"
+       * The user's stated TARGET being mid/senior is NOT, by itself,
+         a veto of junior postings. Aspirational target ≠ exclusion.
+
+     OVERQUALIFICATION IS NEVER A SCORING PENALTY. Phrases like
+     "candidate is overqualified for this junior role", "X years
+     experience exceeds Y-year requirement", "salary undervalues the
+     candidate" must NOT subtract any points. The candidate decides
+     whether to apply downward — your job is to surface the role,
+     not gate it on their behalf. NEVER write a `why_mismatch` that
+     reads "overqualified", "above the role's bar", "candidate has
+     more experience than required", etc. Skip the rule entirely.
+
+     HARD veto phrases that DO trigger −1 per level below target:
+       * "no junior", "no intern", "no entry-level", "no associate"
+       * "NOT a fit: junior", "NOT a fit: mid level"
+       * "must be senior", "senior or above only", "minimum senior"
+       * `title_exclude` list containing "junior" / "intern" / "entry"
        * Skip-feedback comments (under `[Recent 'not a fit' comments]`)
-         that name the same — "not a fit: too junior".
-     When such a signal IS present, subtract 1 point per level BELOW
-     target (mirrors the above-target rule, but conditional). When NO
-     such signal is present, lower-than-target postings stay at the
-     stack/role base score.
+         like "too junior", "not a fit: too junior"
+     Only these explicit forms count — anything weaker is aspirational
+     and gets no penalty.
+
+     SALARY is NEVER a scoring penalty. Salary is informational only,
+     surfaced in `key_details.salary` for the user to see. Do NOT
+     subtract for "salary undervalues the candidate", "below market",
+     or "compensation range too low" — that is the user's decision to
+     make from the card, not yours.
 
      Seniority ordering (numeric, for the gap math):
        intern/internship       = 0
@@ -919,6 +996,207 @@ def _enrich_one_chunk(
         len(out), len(chunk), batch_idx, total_batches, reason,
     )
     return out, reason
+
+
+def pick_most_relevant_ai(
+    candidates: list[Job],
+    resume_text: str,
+    prefs_text: str,
+    *,
+    timeout_s: int = 240,
+) -> Job | None:
+    """Tie-breaker for the "no matches at floor" fallback path.
+
+    Given >=2 candidates at the same top score, call Sonnet once with
+    the full resume + prefs + each candidate's brief and ask it to
+    pick the SINGLE most relevant one. Returns the chosen Job (or the
+    first candidate as a deterministic fallback when the call fails).
+    """
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    if not resume_text or not resume_text.strip():
+        return candidates[0]
+
+    briefs = [_job_to_brief(j) for j in candidates[:10]]
+    prompt = (
+        "You are picking ONE job posting out of several tied on score "
+        "for ONE candidate. The candidate's daily digest currently has "
+        "NO postings clearing their ⭐ floor; we want to surface the "
+        "single most relevant 'closest' so they don't get an empty "
+        "digest. Be DECISIVE — return the one external_id that best "
+        "matches the candidate's resume + PREFS.\n\n"
+        "Selection rules, in order:\n"
+        "  1. Strongest stack/tooling overlap with the resume.\n"
+        "  2. Best location fit (PREFS onsite/remote constraints).\n"
+        "  3. Closest seniority to the candidate's target.\n"
+        "  4. Most concrete description (avoid generic snippets).\n\n"
+        f"=== CANDIDATE RESUME ===\n{(resume_text or '')[:_MAX_RESUME_PROMPT_CHARS]}\n\n"
+        f"=== CANDIDATE PREFS ===\n{(prefs_text or '')[:_MAX_PREFS_PROMPT_CHARS]}\n\n"
+        f"=== TIED CANDIDATES (JSON) ===\n{json.dumps(briefs, ensure_ascii=False)}\n\n"
+        "Respond with ONE JSON object only — no prose, no fence:\n"
+        "{\"chosen_id\": \"<external_id verbatim>\", "
+        "\"reason\": \"<one short sentence>\"}"
+    )
+    stdout = wrapped_run_p(None, "pick_most_relevant", prompt,
+                          timeout_s=timeout_s, model=MID_MODEL)
+    if not stdout:
+        log.warning("pick_most_relevant_ai: CLI returned None; "
+                    "falling back to first candidate")
+        return candidates[0]
+    body = extract_assistant_text(stdout)
+    data = parse_json_block(body)
+    if not isinstance(data, dict):
+        return candidates[0]
+    chosen = str(data.get("chosen_id") or "").strip()
+    for j in candidates:
+        if j.external_id == chosen:
+            log.info("pick_most_relevant_ai: chose %s (reason=%r)",
+                     j.external_id[:60], str(data.get("reason"))[:120])
+            return j
+    return candidates[0]
+
+
+def reanalyze_scoring_ai(
+    jobs: list[Job],
+    enrichments_by_external_id: dict[str, dict],
+    resume_text: str,
+    prefs_text: str,
+    *,
+    timeout_s: int = 240,
+    model: str = "opus",
+) -> list[dict]:
+    """v2.5 audit stage: re-grade the score-≥1 verdicts with a second
+    opinion model (Opus by default), surface disagreements.
+
+    Runs AFTER `send_per_job_digest` finishes — it's a quality-control
+    stage, not a gating stage. Output goes to forensic + can drive a
+    manual top-up later if a big miss is detected.
+
+    Args:
+      jobs:        Postings the scorer evaluated (score-≥1 subset is
+                   typically passed in; caller decides the cut).
+      enrichments_by_external_id: original verdicts keyed by external_id.
+      resume_text / prefs_text:   same blobs the scorer saw.
+      model:       Defaults to `opus` — different model class than the
+                   Sonnet/Haiku scorer, so it brings an independent
+                   perspective. Operators can swap.
+
+    Returns a list of audit dicts, one per posting:
+        {
+          "id":             "<external_id>",
+          "original_score": <0-5>,
+          "revised_score":  <0-5>,
+          "verdict":        "agree" | "raise" | "lower",
+          "comment":        "<one short sentence>",
+        }
+
+    Empty list on any failure (CLI missing, parse error). Never raises.
+    """
+    if not jobs:
+        return []
+    if not resume_text or not resume_text.strip():
+        return []
+
+    review_items = []
+    for j in jobs:
+        enr = enrichments_by_external_id.get(j.external_id) or {}
+        review_items.append({
+            "id": j.external_id,
+            "title": (j.title or "")[:140],
+            "company": (j.company or "")[:100],
+            "url": (j.url or "")[:200],
+            "snippet": (j.snippet or "").replace("\n", " ")[:1200],
+            "original_score": int(enr.get("match_score") or 0),
+            "original_why_match": (enr.get("why_match") or "")[:240],
+            "original_why_mismatch": (enr.get("why_mismatch") or "")[:240],
+        })
+
+    prompt = (
+        "You are a SCORING AUDITOR reviewing match-score verdicts "
+        "produced by another model for ONE candidate. Your job is to "
+        "verify each score against the same scoring rules and flag "
+        "disagreements.\n\n"
+        "Scale (same as the scorer used):\n"
+        "  0 = clearly wrong fit · 1 = poor · 2 = weak · 3 = OK / "
+        "acceptable stretch · 4 = strong · 5 = perfect.\n\n"
+        "Audit each posting. Output for each:\n"
+        "  verdict      — 'agree' / 'raise' / 'lower'\n"
+        "  revised_score — your independent integer 0-5\n"
+        "  comment       — ONE short sentence (≤ 240 chars) explaining\n"
+        "                  WHY you raised or lowered. For 'agree' it\n"
+        "                  can be empty.\n\n"
+        "Doctrines the scorer is required to follow (use these as\n"
+        "your audit lens):\n"
+        "  A) NEVER penalize 'overqualified'. A Senior candidate vs a\n"
+        "     Junior role gets NO subtraction. Raise scores that hit\n"
+        "     this drift.\n"
+        "  B) NEVER stack seniority + years penalties on the SAME\n"
+        "     upward gap. Only ONE may fire. Raise scores that hit\n"
+        "     this drift.\n"
+        "  C) Generic '<Stack> Developer (Remote)' titles whose body\n"
+        "     describes AI rating / data labeling / LLM evaluation /\n"
+        "     prompt engineering tasks → score=0. Lower scores that\n"
+        "     missed this.\n\n"
+        "Other common mis-scores to catch:\n"
+        "  • Soft-trigger CEFR penalties on words like 'proficient'\n"
+        "    or 'professional working' that don't strictly mean C1.\n"
+        "    Raise.\n"
+        "  • Missed hard mismatches: posting body shows '5+ years' /\n"
+        "    'senior only' / 'must speak German' that the original\n"
+        "    why_match didn't notice. Lower.\n"
+        "  • Wrong onsite-city vetoes — the posting is hybrid in a\n"
+        "    city outside the candidate's onsite list but the\n"
+        "    original verdict didn't reject. Lower.\n\n"
+        "Output STRICT JSON only, no prose, no fence:\n"
+        "{\"reviews\": [\n"
+        "  {\"id\": \"<external_id>\", \"verdict\": \"agree|raise|lower\", "
+        "\"revised_score\": <0-5>, \"comment\": \"...\"}\n"
+        "]}\n\n"
+        f"=== CANDIDATE RESUME ===\n{resume_text[:_MAX_RESUME_PROMPT_CHARS]}\n\n"
+        f"=== CANDIDATE PREFS ===\n{prefs_text[:_MAX_PREFS_PROMPT_CHARS]}\n\n"
+        f"=== VERDICTS TO AUDIT ({len(review_items)} items) ===\n"
+        f"{json.dumps(review_items, ensure_ascii=False)}"
+    )
+    stdout = wrapped_run_p(None, "scoring_audit", prompt,
+                          timeout_s=timeout_s, model=model)
+    if not stdout:
+        log.warning("reanalyze_scoring_ai: CLI returned None — audit skipped")
+        return []
+    body = extract_assistant_text(stdout)
+    data = parse_json_block(body)
+    if not isinstance(data, dict) or not isinstance(data.get("reviews"), list):
+        log.error("reanalyze_scoring_ai: unparseable audit response (head=%r)",
+                  (body or "")[:200])
+        return []
+
+    out: list[dict] = []
+    valid_ids = {j.external_id for j in jobs}
+    for r in data["reviews"]:
+        if not isinstance(r, dict):
+            continue
+        ext_id = str(r.get("id") or "").strip()
+        if ext_id not in valid_ids:
+            continue
+        original = int(enrichments_by_external_id.get(ext_id, {}).get("match_score") or 0)
+        try:
+            revised = max(0, min(5, int(r.get("revised_score") or original)))
+        except (TypeError, ValueError):
+            revised = original
+        verdict = str(r.get("verdict") or "").strip().lower()
+        if verdict not in {"agree", "raise", "lower"}:
+            verdict = "agree" if revised == original else (
+                "raise" if revised > original else "lower"
+            )
+        out.append({
+            "id": ext_id,
+            "original_score": original,
+            "revised_score": revised,
+            "verdict": verdict,
+            "comment": fix_mojibake(str(r.get("comment") or "").strip())[:240],
+        })
+    return out
 
 
 def _is_empty_result_envelope(stdout: str) -> bool:
