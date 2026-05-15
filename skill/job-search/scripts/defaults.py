@@ -103,6 +103,16 @@ DEFAULTS: dict = {
     # 1-2× claude subprocesses at peak.
     "ai_source_workers": 6,
 
+    # v2.5 scoring-audit stage. AFTER the digest cards ship, re-grade
+    # the score-≥1 verdicts with a second-opinion model (Opus). Catches
+    # scoring drift without blocking the user-facing send. Output lands
+    # in forensic as `scoring_audit.review` lines — operators can grep
+    # disagreements for patterns. ai_scoring_audit_model can be
+    # overridden to sonnet/haiku for cost trade-offs.
+    "ai_scoring_audit":          True,
+    "ai_scoring_audit_model":    "opus",
+    "ai_scoring_audit_timeout_s": 480,
+
     # Liveness verifier moved to send-time (telegram_client) in v2.1 —
     # only the postings that survived scoring + ⭐ floor get a Haiku
     # WebFetch verification. Per-pool pre-enrich verification was 90+ min

@@ -35,12 +35,79 @@ Fallback:
 from __future__ import annotations
 
 import logging
+import re
+from datetime import date, timedelta
 from typing import Any
 
 from claude_cli import run_p, extract_assistant_text, parse_json_block
 from instrumentation.wrappers import wrapped_run_p, wrapped_run_p_with_tools
 from dedupe import Job
 from text_utils import fix_mojibake
+
+
+# Relative-date patterns Claude (or a search snippet) sometimes emits
+# verbatim when the page doesn't show a clean ISO date. Adapter
+# normalizes them to ISO "YYYY-MM-DD" so the downstream age gate
+# (`_is_within_age_window` in telegram_client) parses them reliably.
+_REL_DAY_RE = re.compile(r"(\d+)\s*day", re.IGNORECASE)
+_REL_WEEK_RE = re.compile(r"(\d+)\s*week", re.IGNORECASE)
+_REL_HOUR_RE = re.compile(r"(\d+)\s*hour", re.IGNORECASE)
+_REL_YESTERDAY_RE = re.compile(r"\byesterday\b", re.IGNORECASE)
+_REL_TODAY_RE = re.compile(r"\b(today|just now|moments? ago|recently)\b", re.IGNORECASE)
+_ISO_DATE_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
+
+
+def _normalize_posted_at(raw: str) -> str:
+    """Best-effort: turn whatever Claude returned in `posted_at` into a
+    YYYY-MM-DD ISO date.
+
+    Empty input → today's ISO date (so the age gate admits the posting;
+    the prompt asks Claude to never return empty, this is a guard
+    against rule-following lapses). The cheaper send-time URL/liveness
+    gates take care of staleness for postings the prompt couldn't date.
+
+    The age gate (`_is_within_age_window`) parses many formats already,
+    but parsing only ISO here keeps the contract crisp.
+    """
+    s = (raw or "").strip()
+    today = date.today()
+    if not s:
+        return today.isoformat()
+
+    # ISO already.
+    m = _ISO_DATE_RE.search(s)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+
+    # Relative phrases.
+    if _REL_TODAY_RE.search(s):
+        return today.isoformat()
+    if _REL_YESTERDAY_RE.search(s):
+        return (today - timedelta(days=1)).isoformat()
+    m = _REL_HOUR_RE.search(s)
+    if m:
+        # Anything in "hours" maps to today.
+        return today.isoformat()
+    m = _REL_DAY_RE.search(s)
+    if m:
+        try:
+            days = int(m.group(1))
+        except ValueError:
+            days = 0
+        return (today - timedelta(days=max(days, 0))).isoformat()
+    m = _REL_WEEK_RE.search(s)
+    if m:
+        try:
+            weeks = int(m.group(1))
+        except ValueError:
+            weeks = 0
+        return (today - timedelta(days=max(weeks, 0) * 7)).isoformat()
+
+    # Unparseable freeform text — pass through and let the age-gate's
+    # own parser try (it handles common formats like "May 10, 2026",
+    # ISO timestamps, RFC 822). If that also fails, the gate's
+    # `missing_policy` decides — see telegram_client._is_within_age_window.
+    return s
 
 log = logging.getLogger(__name__)
 
@@ -92,7 +159,31 @@ Your mission in this single run:
      listings. For each one, call WebFetch on the posting's URL (or the
      nearest canonical detail page) to pull: exact title, company,
      location, snippet (1-3 sentences), posting URL (absolute https), and
-     the posted_at string if the page shows one.
+     a `posted_at` value (REQUIRED — see step 2a).
+
+  2a. EXTRACT `posted_at` AGGRESSIVELY. Downstream sources use this for
+      a 7-day freshness gate; an empty value gets the listing dropped
+      before scoring. Look for the date in this priority order:
+
+       (i)   schema.org JSON-LD: <script type="application/ld+json"> with
+             JobPosting.datePosted → ISO date ("2026-05-10").
+       (ii)  og: / twitter: meta tags: og:published_time,
+             article:published_time, datePosted, datePublished.
+       (iii) Visible-text date phrases on the page:
+               "Posted on May 10, 2026"   → "2026-05-10"
+               "Posted 3 days ago"        → today − 3d (ISO)
+               "Posted 5 hours ago"       → today's ISO date
+               "Yesterday"                → today − 1d
+               "Just now" / "Today"       → today's ISO date
+               "1 week ago"               → today − 7d
+       (iv)  Search-result snippet date (Google often shows "X days ago"
+             beneath the title) — fall back to this when the WebFetch'd
+             page itself is JS-only and renders blank.
+
+      ALWAYS return SOMETHING for `posted_at` — if you genuinely cannot
+      determine the date from any of the above, return today's ISO date
+      ("YYYY-MM-DD"). Returning an EMPTY string is forbidden; that
+      causes the downstream age gate to drop the posting.
 
   3. Apply these filters on your side (do NOT return rejected postings):
        - Match the candidate's role/stack/seniority above. When in doubt,
@@ -128,7 +219,7 @@ Your mission in this single run:
     "company": "...",
     "location": "...",
     "url": "...",
-    "posted_at": "",
+    "posted_at": "2026-05-10",
     "snippet": "..."}}
 ]}}
 
@@ -365,7 +456,45 @@ def fetch(
             company=fix_mojibake(str(r.get("company") or ""))[:80],
             location=fix_mojibake(str(r.get("location") or "Remote"))[:80],
             url=url,
-            posted_at=str(r.get("posted_at") or ""),
+            # Normalize whatever Claude returned into a clean ISO date
+            # (or pass through freeform when we can't tell). Always
+            # non-empty so the downstream age-gate's missing_policy
+            # branch doesn't drop the posting for being undated. Fix #1
+            # for the age-gate-drops-all-web-search bug.
+            posted_at=_normalize_posted_at(str(r.get("posted_at") or "")),
             snippet=fix_mojibake(str(r.get("snippet") or ""))[:400],
         ))
+
+    # Algorithm v2.4: web_search subagent returns its own search-engine
+    # snippets (often <100 chars). Sonnet needs the full posting body to
+    # score reliably — bare title + 70-char snippet was leaving real
+    # candidates at score 3 because the scorer had nothing concrete to
+    # evaluate (Sismo / Leadtech ran into this 2026-05-15). Pull the
+    # detail body via the shared `_detail_fetch` helper, concurrent
+    # across all collected URLs. Failures fall back to the original
+    # subagent snippet — never regress.
+    if out:
+        try:
+            from sources._detail_fetch import fetch_many_bodies
+            body_map = fetch_many_bodies(
+                [j.url for j in out], max_chars=4000, workers=8,
+            )
+            enriched_n = 0
+            for i, j in enumerate(out):
+                body = body_map.get(j.url, "")
+                if body and len(body) > len(j.snippet or ""):
+                    out[i] = Job(
+                        source=j.source, external_id=j.external_id,
+                        title=j.title, company=j.company,
+                        location=j.location, url=j.url,
+                        posted_at=j.posted_at, snippet=body,
+                        salary=getattr(j, "salary", ""),
+                    )
+                    enriched_n += 1
+            log.info(
+                "web_search: detail-page bodies fetched for %d/%d postings",
+                enriched_n, len(out),
+            )
+        except Exception:
+            log.exception("web_search: detail-page fetch raised; continuing")
     return out

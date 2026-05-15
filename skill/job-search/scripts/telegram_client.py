@@ -750,33 +750,69 @@ def _web_search_listing_still_open(
         return (None, "unknown:claude_cli_import")
 
     prompt = (
-        "You are verifying whether a job posting is still accepting "
-        "applications.\n\n"
-        "1. Use WebFetch on the URL below.\n"
-        "2. If the page renders empty or as a JS-only SPA shell (common "
-        "for Ashby / Greenhouse / Lever), use WebSearch to look for the "
-        "same role on the company's current careers page or a reputable "
-        "job board, and decide from that.\n\n"
-        f"URL: {job.url}\n"
-        f"Title: {(job.title or '')[:200]}\n"
+        "You verify whether a job posting is still accepting applications.\n"
+        "Be decisive — when in doubt, return `closed` rather than "
+        "`unknown`. A wrong `open` ships a dead URL to the user; a wrong "
+        "`closed` silently drops one posting (cheap miss). Bias toward "
+        "`closed` on ambiguous signals.\n\n"
+        "PROCEDURE:\n"
+        "  1. WebFetch the URL below.\n"
+        "  2. Scan the rendered text for the signals listed below.\n"
+        "  3. If the page is empty / JS-only SPA shell AND the title is\n"
+        "     specific (not generic 'Careers'), run ONE WebSearch:\n"
+        "       \"<company> <title>\"\n"
+        "     If the role appears in the top results pointing to the\n"
+        "     company's current careers/ATS page → open.\n"
+        "     If results only show third-party aggregators or the\n"
+        "     role is absent from the company's current list → closed.\n"
+        f"\nURL:     {job.url}\n"
+        f"Title:   {(job.title or '')[:200]}\n"
         f"Company: {(job.company or '')[:120]}\n\n"
-        "Pick exactly ONE verdict:\n"
-        "  open    — page has an Apply button OR the role is on the "
-        "company's current job board.\n"
-        "  closed  — page says no longer accepting / position filled / "
-        "404 / removed, OR the role is missing from the company's "
-        "current job board.\n"
-        "  unknown — cannot tell (page is empty/blocked AND search is "
-        "inconclusive).\n\n"
-        "Respond with one JSON object only, no prose, no markdown fence:\n"
+        "VERDICT SIGNALS (case-insensitive match):\n"
+        "  CLOSED if the page text contains ANY of:\n"
+        "    \"no longer accepting\", \"no longer available\",\n"
+        "    \"position has been filled\", \"position is closed\",\n"
+        "    \"this job is no longer accepting applications\",\n"
+        "    \"role is no longer open\", \"applications are closed\",\n"
+        "    \"closed for applications\", \"this position is closed\",\n"
+        "    \"the role you're looking for is no longer\",\n"
+        "    \"sorry, the position\", \"job has expired\", \"expired\",\n"
+        "    \"404\", \"page not found\", \"posting not found\",\n"
+        "    \"role not found\", \"job not found\", \"oops\",\n"
+        "    \"this opening has been removed\".\n"
+        "  Also CLOSED if it's an ATS page (workable / greenhouse /\n"
+        "  lever / ashby / smartrecruiters / personio / teamtailor /\n"
+        "  recruitee / bamboohr / myworkday) AND there is NO visible\n"
+        "  Apply button / 'Apply for this job' link / application form.\n\n"
+        "  OPEN if the page shows ANY of:\n"
+        "    \"Apply\", \"Apply now\", \"Apply for this job\",\n"
+        "    \"Submit application\", an embedded application form,\n"
+        "    a clearly visible job description with apply CTA,\n"
+        "    posted_at or 'X days ago' date alongside an apply control.\n\n"
+        "  UNKNOWN only when WebFetch gives almost no usable text\n"
+        "  (e.g. <500 chars, just nav chrome and footer) AND the\n"
+        "  fallback WebSearch step above is genuinely inconclusive.\n\n"
+        "Respond with ONE JSON object only — no prose, no markdown fence:\n"
         "{\"status\": \"open\"|\"closed\"|\"unknown\", "
-        "\"reason\": \"<≤20 words>\"}"
+        "\"reason\": \"<≤20 words citing the matched phrase>\"}"
     )
+    # v2.3: pin liveness to Haiku. The check is high-volume (one call per
+    # surviving posting per user per run) and low-complexity (binary
+    # open/closed decision from a single WebFetch). Haiku finishes in
+    # ~10-25s versus Sonnet's 30-90s, and the verdict quality is good
+    # enough for the open/closed/unknown trichotomy. SMALLEST_MODEL is
+    # the same "haiku" alias the scorer used before v2.1's Sonnet
+    # promotion.
+    try:
+        from claude_cli import SMALLEST_MODEL as _LIVENESS_MODEL
+    except ImportError:
+        _LIVENESS_MODEL = "haiku"
     stdout = run_p_with_tools(
         prompt,
         allowed_tools="WebFetch WebSearch",
         timeout_s=timeout_s,
         output_format="json",
+        model=_LIVENESS_MODEL,
     )
     if stdout is None:
         return (None, "unknown:cli_unavailable")
@@ -1698,6 +1734,133 @@ def sort_jobs_for_digest(
     return sorted(jobs, key=_sort_key_no_enrichments, reverse=True)
 
 
+def prefilter_for_send(
+    jobs: list[Job],
+    chat_id: int,
+    forensic=None,
+) -> tuple[list[Job], dict[str, int]]:
+    """Run the age / dead-URL / forum / LLM-liveness gates on `jobs`.
+
+    Extracted from `send_per_job_digest` so `search_jobs.run` can call
+    it BEFORE deciding whether to fall back to the closest miss when
+    the floor-survivors all die at the send-time gates (algorithm v2.4
+    fallback path).
+
+    Returns `(alive, drop_counts)` where `drop_counts` carries:
+        too_old_count, dead_url_count, forum_url_count,
+        web_search_closed_count.
+
+    `forensic` is the forensic module (passed through to avoid a hard
+    import cycle from this module's top level — the original code
+    imported it lazily inside `send_per_job_digest`).
+    """
+    alive_jobs: list[Job] = []
+    too_old_count = 0
+    dead_url_count = 0
+    forum_url_count = 0
+    web_search_closed_count = 0
+
+    for job in jobs:
+        if not JOB_AGE_FILTER_OFF:
+            is_web_search = (job.source or "").strip().lower() == "web_search"
+            max_days = 7 if is_web_search else MAX_JOB_AGE_DAYS
+            missing_policy = "reject" if is_web_search else JOB_AGE_MISSING_POLICY
+            allowed, reason = _is_within_age_window(
+                job.posted_at or "",
+                max_days=max_days,
+                missing_policy=missing_policy,
+            )
+            if not allowed:
+                too_old_count += 1
+                age_days_val: int | None = None
+                if reason.startswith("too_old:"):
+                    try:
+                        age_days_val = int(reason.split(":", 1)[1].rstrip("d"))
+                    except (ValueError, IndexError):
+                        age_days_val = None
+                if forensic is not None:
+                    forensic.log_step(
+                        "job.too_old",
+                        input={
+                            "job_id": job.job_id, "source": job.source,
+                            "posted_at": job.posted_at or "",
+                            "title": (job.title or "")[:120],
+                        },
+                        output={"age_days": age_days_val, "reason": reason},
+                        chat_id=chat_id,
+                    )
+                log.info("prefilter_for_send: dropping %s (%s) — too old: %s",
+                         job.job_id, job.source, reason)
+                continue
+
+        if not URL_VALIDATION_OFF and (job.url or "").strip():
+            alive_flag, reason = _url_is_alive(
+                job.url, timeout_s=URL_VALIDATION_TIMEOUT_S,
+            )
+            if not alive_flag:
+                dead_url_count += 1
+                if forensic is not None:
+                    forensic.log_step(
+                        "telegram.url_dead",
+                        input={
+                            "job_id": job.job_id, "source": job.source,
+                            "url": job.url, "title": (job.title or "")[:120],
+                        },
+                        output={"reason": reason},
+                        chat_id=chat_id,
+                    )
+                log.info("prefilter_for_send: dropping %s (%s) — dead URL: %s",
+                         job.job_id, job.source, reason)
+                continue
+
+        if not FORUM_FILTER_OFF and (job.url or "").strip():
+            real, reason = _url_is_real_posting(job.url, job.source or "")
+            if not real:
+                forum_url_count += 1
+                if forensic is not None:
+                    forensic.log_step(
+                        "job.forum_url",
+                        input={
+                            "job_id": job.job_id, "source": job.source,
+                            "url": job.url, "title": (job.title or "")[:120],
+                        },
+                        output={"reason": reason},
+                        chat_id=chat_id,
+                    )
+                log.info("prefilter_for_send: dropping %s (%s) — forum URL: %s",
+                         job.job_id, job.source, reason)
+                continue
+
+        if not WEB_SEARCH_VERIFY_OFF and (job.url or "").strip():
+            ws_status, ws_reason = _web_search_listing_still_open(
+                job, timeout_s=WEB_SEARCH_VERIFY_TIMEOUT_S,
+            )
+            if ws_status is False:
+                web_search_closed_count += 1
+                if forensic is not None:
+                    forensic.log_step(
+                        "telegram.web_search_closed",
+                        input={
+                            "job_id": job.job_id, "source": job.source,
+                            "url": job.url, "title": (job.title or "")[:120],
+                        },
+                        output={"reason": ws_reason},
+                        chat_id=chat_id,
+                    )
+                log.info("prefilter_for_send: dropping %s (listing closed) — %s",
+                         job.job_id, ws_reason)
+                continue
+
+        alive_jobs.append(job)
+
+    return alive_jobs, {
+        "too_old_count": too_old_count,
+        "dead_url_count": dead_url_count,
+        "forum_url_count": forum_url_count,
+        "web_search_closed_count": web_search_closed_count,
+    }
+
+
 def send_per_job_digest(
     tg: TelegramClient,
     chat_id: int,
@@ -1713,6 +1876,9 @@ def send_per_job_digest(
     dropped_below_score: int = 0,
     lower_count_at_step: int = 0,
     skip_header: bool = False,
+    fallback_mode: bool = False,
+    fallback_top_score: int = 0,
+    pre_filtered: bool = False,
 ) -> int:
     """Send one message per job, each with its own inline keyboard.
 
@@ -1798,107 +1964,23 @@ def send_per_job_digest(
     # ----------------------------------------------------------------
     # PREFILTER PASS (algorithm v2.2): apply age, dead-URL, forum, and
     # LLM-liveness gates BEFORE the header card so the count line and
-    # the pig sticker reflect what the user actually receives. Previous
-    # behavior was "send header with N count, then drop K at send time,
-    # leaving the user with N-K cards and a header that lied." See
-    # send_per_job_digest docstring for per-gate semantics.
+    # the pig sticker reflect what the user actually receives. When
+    # `pre_filtered=True`, caller already ran `prefilter_for_send` and
+    # the input `jobs` ARE the alive subset — skip the second pass.
     # ----------------------------------------------------------------
-    alive_jobs: list[Job] = []
+    if pre_filtered:
+        alive_jobs: list[Job] = list(jobs)
+        drop_counts: dict[str, int] = {
+            "too_old_count": 0, "dead_url_count": 0,
+            "forum_url_count": 0, "web_search_closed_count": 0,
+        }
+    else:
+        alive_jobs, drop_counts = prefilter_for_send(jobs, chat_id, _forensic)
     fail_count = 0
-    dead_url_count = 0
-    too_old_count = 0
-    forum_url_count = 0
-    web_search_closed_count = 0
-    for job in jobs:
-        if not JOB_AGE_FILTER_OFF:
-            is_web_search = (job.source or "").strip().lower() == "web_search"
-            max_days = 7 if is_web_search else MAX_JOB_AGE_DAYS
-            missing_policy = "reject" if is_web_search else JOB_AGE_MISSING_POLICY
-            allowed, reason = _is_within_age_window(
-                job.posted_at or "",
-                max_days=max_days,
-                missing_policy=missing_policy,
-            )
-            if not allowed:
-                too_old_count += 1
-                age_days_val: int | None = None
-                if reason.startswith("too_old:"):
-                    try:
-                        age_days_val = int(reason.split(":", 1)[1].rstrip("d"))
-                    except (ValueError, IndexError):
-                        age_days_val = None
-                if _forensic is not None:
-                    _forensic.log_step(
-                        "job.too_old",
-                        input={
-                            "job_id": job.job_id, "source": job.source,
-                            "posted_at": job.posted_at or "",
-                            "title": (job.title or "")[:120],
-                        },
-                        output={"age_days": age_days_val, "reason": reason},
-                        chat_id=chat_id,
-                    )
-                log.info("send_per_job_digest: dropping %s (%s) — too old: %s",
-                         job.job_id, job.source, reason)
-                continue
-
-        if not URL_VALIDATION_OFF and (job.url or "").strip():
-            alive, reason = _url_is_alive(job.url, timeout_s=URL_VALIDATION_TIMEOUT_S)
-            if not alive:
-                dead_url_count += 1
-                if _forensic is not None:
-                    _forensic.log_step(
-                        "telegram.url_dead",
-                        input={
-                            "job_id": job.job_id, "source": job.source,
-                            "url": job.url, "title": (job.title or "")[:120],
-                        },
-                        output={"reason": reason},
-                        chat_id=chat_id,
-                    )
-                log.info("send_per_job_digest: dropping %s (%s) — dead URL: %s",
-                         job.job_id, job.source, reason)
-                continue
-
-        if not FORUM_FILTER_OFF and (job.url or "").strip():
-            real, reason = _url_is_real_posting(job.url, job.source or "")
-            if not real:
-                forum_url_count += 1
-                if _forensic is not None:
-                    _forensic.log_step(
-                        "job.forum_url",
-                        input={
-                            "job_id": job.job_id, "source": job.source,
-                            "url": job.url, "title": (job.title or "")[:120],
-                        },
-                        output={"reason": reason},
-                        chat_id=chat_id,
-                    )
-                log.info("send_per_job_digest: dropping %s (%s) — forum URL: %s",
-                         job.job_id, job.source, reason)
-                continue
-
-        if not WEB_SEARCH_VERIFY_OFF and (job.url or "").strip():
-            ws_status, ws_reason = _web_search_listing_still_open(
-                job, timeout_s=WEB_SEARCH_VERIFY_TIMEOUT_S,
-            )
-            if ws_status is False:
-                web_search_closed_count += 1
-                if _forensic is not None:
-                    _forensic.log_step(
-                        "telegram.web_search_closed",
-                        input={
-                            "job_id": job.job_id, "source": job.source,
-                            "url": job.url, "title": (job.title or "")[:120],
-                        },
-                        output={"reason": ws_reason},
-                        chat_id=chat_id,
-                    )
-                log.info("send_per_job_digest: dropping %s (listing closed) — %s",
-                         job.job_id, ws_reason)
-                continue
-
-        alive_jobs.append(job)
+    too_old_count = drop_counts.get("too_old_count", 0)
+    dead_url_count = drop_counts.get("dead_url_count", 0)
+    forum_url_count = drop_counts.get("forum_url_count", 0)
+    web_search_closed_count = drop_counts.get("web_search_closed_count", 0)
 
     # ----------------------------------------------------------------
     # Pig sticker decision — moved inline so it reflects the ALIVE count,
@@ -1927,12 +2009,25 @@ def send_per_job_digest(
                 current_floor=int(min_score or 0),
                 lower_count=int(lower_count_at_step or 0),
             )
-            header_text = digest_header_mdv2() + "\n\n" + _count_line(
-                alive_jobs,
-                min_score=min_score,
-                enriched_count=enriched_count,
-                dropped_below_score=dropped_below_score,
-            )
+            if fallback_mode:
+                # v2.4 "no matches at floor" fallback. alive_jobs has
+                # exactly 1 entry — the closest miss the picker chose.
+                header_text = (
+                    "🐷 *No matches today*\n\n"
+                    + mdv2_escape(
+                        f"Nothing cleared your filter "
+                        f"({int(min_score)} of 5). Showing the closest "
+                        f"miss instead — best available score "
+                        f"{int(fallback_top_score)} of 5."
+                    )
+                )
+            else:
+                header_text = digest_header_mdv2() + "\n\n" + _count_line(
+                    alive_jobs,
+                    min_score=min_score,
+                    enriched_count=enriched_count,
+                    dropped_below_score=dropped_below_score,
+                )
             tg.send_message(chat_id, header_text, reply_markup=kb)
         except Exception as e:
             header_status = "error"

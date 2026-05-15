@@ -156,9 +156,17 @@ def _one_search(
     err_payload = None
     body_head = None
     rate_limited = False
+    # `body_resolved` distinguishes "LinkedIn doesn't recognize this geo"
+    # (returns a ~26-byte empty placeholder) from "geo resolves fine but
+    # this query has no hits today" (returns a normal ~30k-byte page
+    # with 0 result cards). The geo-blacklist in fetch_for_user only
+    # fires when body_resolved=False so we don't starve sibling queries
+    # over an unrelated zero-result event.
+    body_resolved = False
     try:
         resp = requests.get(SEARCH, params=params, headers=UA, timeout=20)
         status_code = resp.status_code
+        body_resolved = len(resp.text or "") > 500
         if resp.status_code == 429:
             log.warning("linkedin: rate-limited (429) on q=%r, skipping", q)
             rate_limited = True
@@ -224,10 +232,11 @@ def _one_search(
                 "count": len(out),
                 "sample_titles": [j.title[:80] for j in out[:3]],
                 "body_head_on_zero": body_head,
+                "body_resolved": body_resolved,
             },
             error=err_payload,
         )
-    return out
+    return out, body_resolved
 
 
 class _RateLimited(Exception):
@@ -407,7 +416,7 @@ def fetch_for_user(filters: dict, user_seeds: dict | None) -> list[Job]:
                 time.sleep(PACE_SECONDS)
             request_idx += 1
             try:
-                batch = _one_search(
+                batch, body_resolved = _one_search(
                     q=query["q"],
                     geo=query["geo"],
                     f_TPR=query["f_TPR"],
@@ -428,12 +437,16 @@ def fetch_for_user(filters: dict, user_seeds: dict | None) -> list[Job]:
                 q_idx + 1, len(queries), query["q"], query["geo"],
                 start, len(batch), per_query_total, len(combined),
             )
-            # Empty PAGE 1 with a non-blank geo → mark that geo dead
-            # for this run so sibling (q, geo) combos skip ahead.
-            if not batch and start == 0 and query["geo"]:
+            # Blacklist the geo ONLY when LinkedIn's response was the
+            # empty placeholder (`body_resolved=False`) — that means
+            # the geo string didn't resolve to anything in LinkedIn's
+            # internal entity registry. A normal 30 KB response with 0
+            # result cards just means THIS QUERY had no hits today;
+            # the geo is fine and sibling queries should keep running.
+            if not batch and start == 0 and query["geo"] and not body_resolved:
                 dead_geos.add(query["geo"])
                 log.warning(
-                    "linkedin: geo %r did not resolve on page 1 — "
+                    "linkedin: geo %r did not resolve (empty body) — "
                     "blacklisted for the remainder of this run",
                     query["geo"],
                 )
