@@ -454,6 +454,17 @@ def fetch_for_user(filters: dict, user_seeds: dict | None) -> list[Job]:
             if not batch:
                 break
 
+    # Cross-geo requisition dedupe. LinkedIn cross-posts the same global
+    # remote-first role across N country pages (Primer, Stripe etc. observed
+    # producing 4-8 dupes per run). URL-level dedupe doesn't catch this —
+    # each country page gets its own /pt/ /pl/ /ro/ /hu/ URL with a
+    # different job-id. Collapse by (company_lc, normalized_title) keeping
+    # the FIRST occurrence (preserves the canonical /www.linkedin.com/
+    # entry when present). Snippet rarely differs across mirrors, so we
+    # don't gate the merge on body equality.
+    if combined:
+        combined = _dedupe_cross_geo(combined)
+
     # Algorithm v2.2 — Option 4: LinkedIn search cards only carry title +
     # company + location. Without the detail-page body, Sonnet scored every
     # LinkedIn posting 0 even on perfectly targeted queries (594-job run
@@ -465,6 +476,64 @@ def fetch_for_user(filters: dict, user_seeds: dict | None) -> list[Job]:
         combined = _fetch_detail_bodies(combined)
 
     return combined
+
+
+def _normalize_title_for_dedupe(title: str) -> str:
+    """Lowercase, strip seniority modifiers + punctuation + whitespace so
+    "Frontend Developer", "frontend-developer", and " Frontend Developer "
+    collapse to the same key. We keep the seniority prefix as part of the
+    key — a "Senior Frontend" and a "Frontend" posting at the same company
+    are different roles, not dupes. We do strip trailing geo/branding tags
+    ("(Remote)", "- Remote", " | Acme", "/m/f/d", etc.) since the same req
+    often gets re-tagged per-geo.
+    """
+    t = (title or "").lower().strip()
+    # Strip common trailing tags.
+    for tag in (
+        " (remote)", " - remote", " · remote", " — remote",
+        " (m/f/d)", " (m/w/d)", " (f/m/d)", " (m/f/x)",
+        " (h/f)", " (h/m)", " (w/m/d)", " (m/f)", " (f/m)",
+        " - hybrid", " - onsite", " (hybrid)", " (onsite)",
+        " - eu remote", " - europe", " - 100% remote",
+        " - full time", " - part time", " - contract",
+        " (full-time)", " (part-time)", " (contract)",
+    ):
+        if t.endswith(tag):
+            t = t[: -len(tag)].strip()
+    # Collapse multiple spaces, strip surrounding punctuation.
+    t = re.sub(r"\s+", " ", t)
+    t = t.strip(" -—·|/,.")
+    return t
+
+
+def _dedupe_cross_geo(jobs: list[Job]) -> list[Job]:
+    """Collapse same-req-different-country-page dupes.
+
+    Key: (lowercased company, normalized title). First entry wins.
+    Logs the suppression count.
+    """
+    seen: set[tuple[str, str]] = set()
+    out: list[Job] = []
+    dropped = 0
+    for j in jobs:
+        co = (j.company or "").strip().lower()
+        title_key = _normalize_title_for_dedupe(j.title or "")
+        if not co or not title_key:
+            out.append(j)
+            continue
+        key = (co, title_key)
+        if key in seen:
+            dropped += 1
+            continue
+        seen.add(key)
+        out.append(j)
+    if dropped:
+        log.info(
+            "linkedin: cross-geo dedupe collapsed %d duplicate requisitions "
+            "(same company+title across LinkedIn country pages)",
+            dropped,
+        )
+    return out
 
 
 # LinkedIn's public detail page (`/jobs/view/...`) is gated — anonymous

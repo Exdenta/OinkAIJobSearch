@@ -322,7 +322,7 @@ def fetch_all(
 
 # ---------- main ----------
 
-def run(dry_run: bool = False, only_chat: int | None = None) -> int:
+def run(dry_run: bool = False, only_chat: int | None = None, no_send: bool = False) -> int:
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -826,38 +826,61 @@ def run(dry_run: bool = False, only_chat: int | None = None) -> int:
                 # reflects the actual count the user will see, not the
                 # pre-gate score-floor count.
 
-                try:
-                    _sent_jobs_this_run: list[str] = []
-                    def _on_sent(mid, j, _cid=chat_id, _sink=_sent_jobs_this_run):
-                        db.log_sent(_cid, mid, j.job_id)
-                        _sink.append(j.job_id)
-                    sent = send_per_job_digest(
-                        tg, chat_id, user_jobs, filters,
-                        on_sent=_on_sent,
-                        enrichments=enrichments_by_job_id,
-                        min_score=min_score,
-                        run_id=pctx.run_id,
-                        enriched_count=enriched_count,
-                        dropped_below_score=dropped_below_score,
-                        lower_count_at_step=lower_count_at_step,
-                        fallback_mode=fallback_mode,
-                        fallback_top_score=fallback_top_score,
-                        pre_filtered=True,
+                if no_send:
+                    # Preview path: print what would be sent, skip Telegram
+                    # delivery + sent_messages persistence + the post-send
+                    # scoring_audit pass.
+                    print(
+                        f"\n=== NO-SEND PREVIEW · chat={chat_id} · "
+                        f"{len(user_jobs)} jobs would be sent "
+                        f"(min_score={min_score}) ===\n"
                     )
-                    total_sent += sent
-                    if _sent_jobs_this_run:
-                        try:
-                            db.mark_digest_jobs_sent(
-                                chat_id, pctx.run_id, _sent_jobs_this_run,
-                                floor=min_score,
-                            )
-                        except Exception:
-                            log.debug("mark_digest_jobs_sent failed; continuing", exc_info=True)
-                except Exception as e:
-                    log.exception("Failed to send digest to %s: %s", chat_id, e)
-                    pctx.incr_errors(1)
-                    send_failed_chat = chat_id
-                    break
+                    scored = []
+                    for j in user_jobs:
+                        enr = enrichments_by_job_id.get(j.job_id) or {}
+                        score = int(enr.get("match_score") or 0)
+                        scored.append((score, j, enr))
+                    scored.sort(key=lambda t: -t[0])
+                    for score, j, enr in scored:
+                        why = (enr.get("why_match") or "")[:120]
+                        print(f"  [{score}⭐] [{j.source}] {j.title} @ {j.company}")
+                        if why:
+                            print(f"        why: {why}")
+                        print(f"        {j.url}")
+                    print()
+                else:
+                    try:
+                        _sent_jobs_this_run: list[str] = []
+                        def _on_sent(mid, j, _cid=chat_id, _sink=_sent_jobs_this_run):
+                            db.log_sent(_cid, mid, j.job_id)
+                            _sink.append(j.job_id)
+                        sent = send_per_job_digest(
+                            tg, chat_id, user_jobs, filters,
+                            on_sent=_on_sent,
+                            enrichments=enrichments_by_job_id,
+                            min_score=min_score,
+                            run_id=pctx.run_id,
+                            enriched_count=enriched_count,
+                            dropped_below_score=dropped_below_score,
+                            lower_count_at_step=lower_count_at_step,
+                            fallback_mode=fallback_mode,
+                            fallback_top_score=fallback_top_score,
+                            pre_filtered=True,
+                        )
+                        total_sent += sent
+                        if _sent_jobs_this_run:
+                            try:
+                                db.mark_digest_jobs_sent(
+                                    chat_id, pctx.run_id, _sent_jobs_this_run,
+                                    floor=min_score,
+                                )
+                            except Exception:
+                                log.debug("mark_digest_jobs_sent failed; continuing", exc_info=True)
+                    except Exception as e:
+                        log.exception("Failed to send digest to %s: %s", chat_id, e)
+                        pctx.incr_errors(1)
+                        send_failed_chat = chat_id
+                        break
 
                 # --- v2.5 audit stage --------------------------------
                 # AFTER the cards have shipped, re-grade the score-≥1
@@ -868,7 +891,7 @@ def run(dry_run: bool = False, only_chat: int | None = None) -> int:
                 # `scoring_audit.review` lines so we can grep for
                 # systematic misses post-hoc and decide whether a
                 # follow-up manual top-up is warranted.
-                if filters.get("ai_scoring_audit", True) and enrichments_by_job_id:
+                if (not no_send) and filters.get("ai_scoring_audit", True) and enrichments_by_job_id:
                     try:
                         ext_to_job = {j.external_id: j for j in user_pool}
                         # Audit score-≥1 only — score-0s are firmly
@@ -967,7 +990,7 @@ def run(dry_run: bool = False, only_chat: int | None = None) -> int:
         log.exception("search_jobs.run: top-level failure (escaped error_capture)")
         exit_code = 3
 
-    if run_id_for_summary is not None:
+    if run_id_for_summary is not None and not no_send:
         try:
             deliver_daily_summary(tg, store, run_id_for_summary)
         except Exception:
@@ -980,5 +1003,14 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--dry-run", action="store_true", help="Print results, don't post or persist sends.")
     ap.add_argument("--chat-id", type=int, default=None, help="Send only to this one chat_id.")
+    ap.add_argument(
+        "--no-send",
+        action="store_true",
+        help=(
+            "Run full pipeline (fetch + score) but skip Telegram send, sent_messages "
+            "persistence, and the post-send scoring_audit pass. Use to validate "
+            "what would be sent and to inspect AI spend before delivering."
+        ),
+    )
     args = ap.parse_args()
-    sys.exit(run(dry_run=args.dry_run, only_chat=args.chat_id))
+    sys.exit(run(dry_run=args.dry_run, only_chat=args.chat_id, no_send=args.no_send))

@@ -62,6 +62,7 @@ filtering happens downstream in the per-user fit analyzer.
 from __future__ import annotations
 
 import logging
+import re
 from contextlib import contextmanager
 from typing import Any, Iterator
 
@@ -190,6 +191,37 @@ def _run_claude(prompt: str, *, timeout_s: int) -> str | None:
 
 LANDING = "https://www.devex.com/jobs/search"
 
+
+# DevEx slug patterns observed across postings:
+#   .../jobs/<role-slug>-at-<org-slug>-<id>      ← preferred (org tail)
+#   .../jobs/<role-slug>-<id>                    ← no org in slug
+#   .../jobs/<role-slug>-<m-f-d>-<id>            ← diversity suffix
+_DEVEX_URL_AT_RE = re.compile(r"/jobs/[^/?#]*?-at-([a-z0-9-]+?)-\d+/?$", re.I)
+
+
+def _extract_employer_from_url(url: str) -> str:
+    """Pull the employer name out of the DevEx URL slug.
+
+    Returns the title-cased org name on success, "" on failure. We only
+    parse the canonical `-at-<org>-<id>` shape; other shapes are too
+    ambiguous to risk a false extraction.
+    """
+    if not url:
+        return ""
+    m = _DEVEX_URL_AT_RE.search(url.split("?", 1)[0])
+    if not m:
+        return ""
+    raw = m.group(1).replace("-", " ").strip()
+    if not raw:
+        return ""
+    # Title-case each token. Acronyms (UNHCR, IRC, etc.) will render as
+    # "Unhcr" / "Irc"; that's a cosmetic miss but still strictly better
+    # than the placeholder "DevEx (employer not specified in snippet)".
+    # The scorer doesn't care about case; the user-facing card uses
+    # whatever this returns plus whatever the scorer wrote into
+    # `key_details`.
+    return " ".join(p.capitalize() for p in raw.split())
+
 _PROMPT = """You are a job-discovery assistant.
 
 Goal: surface the latest job postings on DevEx (https://www.devex.com/jobs)
@@ -213,15 +245,52 @@ Suggested search strategy (run 2-4 of these, dedupe URLs):
 
 For each unique posting URL, extract:
   - title: from the Google result title (strip the trailing " | Devex")
-  - company: the employer/organization name; if the search snippet names
-    a UN agency, NGO, think-tank, or contractor, use that. If unclear,
-    use "DevEx (employer not specified in snippet)".
+  - company: the employer/organization name. EXTRACT IT — never write
+    "DevEx (employer not specified in snippet)" or any placeholder.
+    Priority:
+      (i)   If snippet starts with "<Org> is hiring", "<Org> is
+            seeking", "<Org> is looking for", "Position at <Org>",
+            "<Org> | Devex" → "<Org>" is the employer.
+      (ii)  If the URL slug contains the employer hint (e.g.
+            ".../jobs/research-officer-at-international-rescue-
+            committee-518185" → "International Rescue Committee";
+            URL pattern `-at-<org-slug>-<id>` is common on DevEx),
+            extract from the slug.
+      (iii) If snippet names a UN agency (UNHCR, UNDP, UNESCO, IOM,
+            FAO, WFP, WHO, UNICEF), NGO, think-tank, donor agency
+            (USAID, GIZ, DFAT, FCDO, SIDA), university, or
+            consultancy → use that name.
+      (iv)  If snippet says "posted by <Org>" or "Organization:
+            <Org>" → extract.
+      (v)   If absolutely nothing identifies the employer → use the
+            string "Unknown employer" (NOT a "DevEx" placeholder).
+            But this should be RARE — DevEx postings almost always
+            name the org in the title slug or snippet head.
   - location: from the snippet if visible (city, country, "Remote", etc.);
     otherwise "" (empty string).
   - url: the absolute https://www.devex.com/jobs/<slug>-<id> URL exactly
     as Google indexed it.
-  - posted_at: from the snippet if it shows a date ("Posted ...",
-    "Published ..."), else "".
+  - posted_at: aggressive extraction REQUIRED. DevEx postings frequently
+    have visible dates in Google's search snippet. Priority:
+      (i)   Explicit date in snippet: "Posted on May 10, 2026",
+            "Published 2 weeks ago", "Posted Jan 15, 2020" — convert
+            to ISO ("YYYY-MM-DD"). "X weeks ago" → today - 7*X days.
+            "X months ago" → today - 30*X days.
+      (ii)  Relative: "Yesterday" → today-1; "Today" → today;
+            "Hours ago" / "Just now" → today.
+      (iii) Deadline mention in snippet ("Deadline: 18 May 2026" /
+            "Apply by 30/06/2026") — use that as a freshness proxy
+            ONLY if no posted date is visible; assume posted_at =
+            deadline - 30 days.
+      (iv)  If none of the above and the URL contains a high job-id
+            (>1000000) → guess "today". If the URL has a LOW job-id
+            (<700000) → guess a date 12+ months ago (these are
+            historical postings DevEx never closed; the downstream
+            age gate should drop them).
+    Always return SOMETHING for posted_at, even if best-guess. NEVER
+    return empty string for DevEx postings — the age gate's
+    missing_policy will let them through and stale 2020 postings
+    will leak. Be conservative: if uncertain, guess OLD, not new.
   - snippet: a one-sentence trimmed version of the Google search snippet.
 
 Return STRICT JSON (no commentary, no markdown fences, no prose before or
@@ -381,11 +450,23 @@ def fetch(filters: dict) -> list[Job]:
             if not external_id.isdigit():
                 external_id = url
 
+            company = fix_mojibake(str(r.get("company") or "")).strip()
+            # Reject placeholder employer strings the subagent might still
+            # emit despite the prompt update — fall back to URL slug
+            # extraction so user sees a real org name, not "DevEx (...)".
+            if (
+                not company
+                or company.lower().startswith("devex (")
+                or company.lower() == "devex"
+                or "employer not specified" in company.lower()
+            ):
+                company = _extract_employer_from_url(url) or "Unknown employer"
+
             out.append(Job(
                 "devex",                         # source
                 external_id,                     # external_id
                 title[:140],                     # title
-                fix_mojibake(str(r.get("company") or "")).strip()[:120],  # company
+                company[:120],                   # company
                 fix_mojibake(str(r.get("location") or "")).strip()[:120], # location
                 url,                             # url
                 str(r.get("posted_at") or ""),   # posted_at

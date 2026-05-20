@@ -81,7 +81,19 @@ _BATCH_PARSE_ERROR = "parse_error"      # body wasn't a JSON object / no `result
 _BATCH_PARTIAL = "partial"              # results parsed but fewer verdicts than postings sent
 
 
-_PROMPT = """You are a careful job-match analyst working for ONE candidate.
+_PROMPT = """OUTPUT STYLE — caveman english
+==============================
+For every natural-language field you emit (especially `why_match` and
+`key_details.standout`): drop articles (a/an/the), filler ("just",
+"really", "actually", "simply", "basically", "essentially"),
+pleasantries, hedging. Fragments OK. Use short synonyms ("fix" not
+"implement a solution for"; "big" not "extensive"; "use" not
+"leverage"; "show" not "demonstrate"). Technical terms stay exact.
+DO NOT apply this style to: numbers, code, URLs, JSON keys, schema
+field names, enum values, IDs, raw extracted titles, company names,
+or location strings — those pass through verbatim.
+
+You are a careful job-match analyst working for ONE candidate.
 
 You are the SOLE gate deciding whether a posting should be shown to this
 candidate. There are no keyword pre-filters upstream — every posting that
@@ -238,6 +250,36 @@ For each posting, you must:
             * Fully un-tagged remote ("Remote", "Anywhere") → assume
               the candidate's TZ band; pass the V4 check; let the TZ
               penalty handle further filtering.
+            * RECLASSIFY-AS-HYBRID rule: if the posting describes
+              itself as "remote within <one country>" AND ALSO
+              imposes MANDATORY periodic in-person attendance at a
+              named place (e.g. "Home based in Poland with 1-2
+              in-person meetings per quarter", "Remote Germany,
+              monthly team day in Berlin HQ", "Fully remote in the
+              UK with quarterly on-site weeks in London", "remote
+              with occasional travel to <city>"), treat the posting
+              as `remote_policy = hybrid` at THAT country/city for
+              V4 purposes. Apply the onsite branch of V4 — country/
+              city MUST match `onsite_locations` or SCORE=0. The
+              user committed to in-person at their `onsite_locations`
+              cities only; cross-border travel for "occasional"
+              meetings is exactly what they ruled out.
+              Signals that trigger reclassification:
+                * "X in-person <events> per <period>" (any frequency).
+                * "monthly / quarterly / bi-annual team day(s)".
+                * "occasional travel to <named place>" as a job
+                  requirement, not a perk.
+                * "home based in <country>, ideally <city>".
+                * "remote within <country>" coupled with any of the
+                  above.
+              Signals that DO NOT trigger reclassification:
+                * "Optional offsites", "annual company retreat
+                  (travel covered, attendance encouraged)" — perk,
+                  not requirement.
+                * "may include occasional travel" with no fixed
+                  cadence and no named hub.
+                * "We are a fully distributed team" with no in-
+                  person requirement.
        - `remote_policy` unknown / not stated:
             * If posting names a city/country, treat as onsite for V4.
             * If posting offers no geo signal at all → pass V4.
@@ -259,6 +301,87 @@ For each posting, you must:
          * Posting: remote · Germany → Germany ∈ europe (macro) → V4 OK.
          * Posting: remote · USA → USA ∉ remote_regions → SCORE=0.
          * Posting: fully remote, no country tag → V4 OK.
+         * Posting: "Home based in Poland (ideally Warsaw, flexible
+           nationwide) with occasional in-person meetings (1-2 per
+           quarter)" → reclassify as hybrid Poland → Poland ∉
+           onsite_locations → SCORE=0. (Even though Poland ∈ EU,
+           the mandatory quarterly in-person at Poland breaks the
+           remote-EU branch.)
+         * Posting: "Remote within Germany, monthly team day in
+           Berlin office" → reclassify hybrid Berlin → Berlin ∉
+           onsite_locations → SCORE=0.
+         * Posting: "Fully distributed, optional annual retreat" →
+           NO reclassification → stays remote · (no country) →
+           V4 OK.
+
+     V4 EXTENSIONS — also reach SCORE=0 via the LOCATION axis:
+
+       (V4a) KNOWN-COUNTRY-RESTRICTED COMPANIES. Some companies are
+       infamous for hiring in a single country/region only despite
+       calling roles "remote". Treat these as `remote · <their hiring
+       country>` for V4 purposes, REGARDLESS of how the posting tags
+       location. The posting body / careers FAQ usually confirms this
+       in a sentence like "we are unable to sponsor visas", "you must
+       have authorization to work in <country>", "we only hire within
+       <country/region>".
+       Signals to recognise (not exhaustive — judge per posting):
+         * Body explicitly says "we hire only in <country>" or
+           equivalent.
+         * Body explicitly says "no sponsorship", "no visa support",
+           "no relocation assistance" alongside a single country tag.
+         * Company is one of the well-known US-only hirers for SWE
+           roles (Linear, Vanta, Stripe, Brex, Ramp, Mercury, Coda,
+           Notion, Figma, Plaid, Airtable, Anthropic, OpenAI etc. —
+           confirm against current posting; companies grow into new
+           geos over time).
+       Apply: reclassify posting as `remote · <hiring country>`.
+       Country must be in `remote_regions` macro-expanded, else
+       SCORE=0.
+
+       (V4b) NO-SPONSORSHIP COUNTRY-LOCKED VETO. A posting that says
+       "Remote · <country X>" + ANY of:
+           "no sponsorship", "no visa sponsorship",
+           "no visa support", "must have existing work authorization
+           in <X>", "no relocation assistance", "we cannot relocate",
+           "must reside in <X>"
+       is effectively hiring ONLY people who already live + have
+       work authorization in country X. Treat as effectively onsite
+       country X for V4. Country X must be in `remote_regions`
+       (macro-expanded) AND the candidate must plausibly reside in X
+       (assume candidate resides in any of their `onsite_locations`
+       countries OR Spain if onsite_locations is Spain-only). If X
+       is not the candidate's residence country → SCORE=0.
+       Example: candidate in Bilbao, Spain. Posting "Frontend
+       Developer · Remote · Poland · no sponsorship" → X=Poland,
+       candidate not resident in Poland → SCORE=0. Even though
+       Poland ∈ EU, the no-sponsorship clause means the role is
+       only open to existing Polish residents.
+
+       (V4c) US-ONSITE / US-HUB-RADIUS VETO. Postings tagged
+       "Remote · USA" / "US-based" / listing US cities only / "hub-
+       radius hybrid" across US cities → treat as remote · USA.
+       USA must be in `remote_regions` (or macro `north america`)
+       OR SCORE=0.
+       Additional US-onsite signals to catch:
+         * "<N> US hub locations" / "must live within 50 miles of
+           one of: <US cities>".
+         * US state-university research centers (UCLA, Harvard,
+           Stanford, NYU, MIT, USC, U-Michigan, U-Penn etc.) →
+           default to US-onsite unless posting explicitly says
+           "fully remote, global" or "remote within EU".
+         * US federal / state agencies → US-onsite.
+         * US-based non-profits with no remote callout → assume
+           US-onsite.
+
+     V4 PRECEDENCE (geography-first weighting): apply V4 (and V4a,
+     V4b, V4c) BEFORE topical / stack / domain fit. NEVER let a
+     strong topical match override a V4 veto. The candidate cannot
+     teleport. A "perfect topical fit" in a country the candidate
+     cannot work in is a 0, not a 4 or 5. Re-read the candidate's
+     `onsite_locations` and `remote_regions` BEFORE deciding the
+     posting's location is acceptable. When in doubt about location,
+     default to VETO rather than pass — the candidate ranks 50
+     fewer false-positives over 1 missed real positive.
 
      TIME-ZONE PENALTY (remote postings only):
        - Inputs: candidate `time_zone_band` (e.g. "UTC-1..UTC+3"),
@@ -487,7 +610,11 @@ For each posting, you must:
 
      Order of application:
        1. HARD VETOES (V1 title-exclude, V2 body-exclude, V3 company-
-          exclude, V4 LOCATION) — if ANY hits → score = 0, return.
+          exclude, V4 LOCATION + V4a country-restricted company,
+          V4b no-sponsorship country-locked, V4c US-onsite/hub-
+          radius) — if ANY hits → score = 0, return. APPLY V4
+          BEFORE ANY TOPICAL FIT — never let topical strength
+          override a location veto.
        2. Role/stack base score (1-5).
        3. TIME-ZONE PENALTY (-2 zero overlap, -1 < 4h overlap).
        4. LANGUAGE PENALTY (-1 per CEFR level the candidate is below
@@ -660,31 +787,38 @@ def enrich_jobs_ai(
 
     prefs_text = (prefs_text or "").strip()
 
-    # Algorithm v2.1: scoring runs on Sonnet by default. Haiku was too
-    # noisy at the 4-vs-3 boundary (missed years-experience + onsite-
-    # location vetoes consistently). Sonnet's prompt-following is the
-    # quality gate. Operators can fall back to Haiku via env override on
-    # CLAUDE_MID_MODEL/SMALLEST_MODEL.
-    primary_model = MID_MODEL
-    primary_label = "sonnet"
-    haiku_out = _enrich_pool(
+    # Model selection:
+    #   * single-pass (two_pass=False): Sonnet for every job. v2.1 default
+    #     because Haiku was noisy at the 4-vs-3 boundary on its own.
+    #   * two-pass (two_pass=True): Haiku triages every job cheap, then
+    #     Sonnet re-scores only survivors at `triage_floor`. Cost cut
+    #     ~5-8× vs single-pass Sonnet; Sonnet still arbitrates the
+    #     borderline cases where Haiku is unreliable.
+    if two_pass:
+        primary_model = SMALLEST_MODEL  # haiku
+        primary_label = "haiku"
+    else:
+        primary_model = MID_MODEL       # sonnet
+        primary_label = "sonnet"
+
+    first_out = _enrich_pool(
         jobs, resume_text, prefs_text, timeout_s,
         max_jobs_per_call, model=primary_model, pass_label=primary_label,
         workers=workers,
     )
 
     if not two_pass:
-        return haiku_out
+        return first_out
 
     survivors: list[Job] = [
         j for j in jobs
-        if int((haiku_out.get(j.external_id) or {}).get("match_score") or 0)
+        if int((first_out.get(j.external_id) or {}).get("match_score") or 0)
            >= triage_floor
     ]
     if not survivors:
         log.info("enrich_jobs_ai: two-pass — 0 survivors at triage_floor=%d",
                  triage_floor)
-        return haiku_out
+        return first_out
 
     log.info(
         "enrich_jobs_ai: two-pass — %d/%d jobs survived Haiku triage "
@@ -698,10 +832,10 @@ def enrich_jobs_ai(
     )
 
     # Merge: Sonnet overwrites Haiku where present, else Haiku stands.
-    merged = dict(haiku_out)
+    merged = dict(first_out)
     upgrades = downgrades = unchanged = 0
     for ext_id, sonnet_v in sonnet_out.items():
-        prev = (haiku_out.get(ext_id) or {}).get("match_score") or 0
+        prev = (first_out.get(ext_id) or {}).get("match_score") or 0
         new = (sonnet_v or {}).get("match_score") or 0
         merged[ext_id] = sonnet_v
         if new > prev:

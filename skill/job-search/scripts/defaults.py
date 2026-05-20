@@ -73,14 +73,17 @@ DEFAULTS: dict = {
     # room without inviting indefinite hangs.
     "ai_enrich_timeout_s":  1200,
 
-    # Two-pass scoring. Default OFF in algorithm v2 — Haiku gets a smaller,
-    # cleaner per-batch prompt (raw resume + raw prefs.txt + 5 jobs) plus
-    # the new why_mismatch field, which empirically gives Haiku enough
-    # context to score reliably without a Sonnet re-score. Operators can
-    # flip this back on if Haiku noise returns.
-    #   ai_two_pass:        master toggle. False → single-pass Haiku.
-    #   ai_triage_floor:    only meaningful when two_pass=True.
-    "ai_two_pass":        False,
+    # Two-pass scoring. Default ON as of 2026-05-19 — single-pass Sonnet
+    # was 63% of monthly AI spend. Two-pass: Haiku triages every posting
+    # cheap, Sonnet re-scores only postings >= triage_floor. Cost cut
+    # ~5-8× vs single-pass Sonnet; Sonnet still arbitrates the borderline
+    # 3-vs-4 boundary where Haiku alone was noisy.
+    #   ai_two_pass:        master toggle. False → single-pass Sonnet.
+    #                       True  → Haiku triage + Sonnet rescore.
+    #   ai_triage_floor:    Haiku score threshold for promotion to Sonnet.
+    #                       2 keeps anything plausibly relevant; raise to
+    #                       3 for an even tighter funnel if cost still high.
+    "ai_two_pass":        True,
     "ai_triage_floor":    2,
 
     # Per-batch chunk size (algorithm v2.1). Bumped from 5 → 10 once we

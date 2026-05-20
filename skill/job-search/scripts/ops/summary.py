@@ -74,6 +74,60 @@ def _chunk_chips(chips: list[str], per_row: int = 3) -> list[str]:
     return rows
 
 
+def _render_ai_cost_block(store: Any, days: int = 30, top_n: int = 6) -> list[str]:
+    """Per-agent AI cost share over the last `days`. MDv2 lines.
+
+    Returns an empty list (block omitted) when there are no rows, the
+    store doesn't implement the cost-by-caller query yet (older deploys),
+    or the query raises. Cost numbers are the `cost_estimate_us` surrogate
+    — disclaim in the header so the operator doesn't read them as exact
+    billing.
+    """
+    try:
+        since = time.time() - days * 86400
+        rows = store.claude_call_cost_by_caller(since)
+    except AttributeError:
+        return []
+    except Exception:
+        log.exception("summary: claude_call_cost_by_caller failed")
+        return []
+    if not rows:
+        return []
+
+    total_us   = sum(int(r.get("cost_us", 0)) for r in rows)
+    total_calls = sum(int(r.get("n", 0)) for r in rows)
+    if total_us <= 0:
+        return []
+
+    top  = list(rows[:top_n])
+    rest = list(rows[top_n:])
+    if rest:
+        top.append({
+            "caller":  f"other ({len(rest)})",
+            "cost_us": sum(int(r.get("cost_us", 0)) for r in rest),
+            "n":       sum(int(r.get("n", 0)) for r in rest),
+        })
+
+    chips: list[str] = []
+    for r in top:
+        cost_us = int(r.get("cost_us", 0))
+        share   = 100.0 * cost_us / total_us
+        usd     = cost_us / 1_000_000.0
+        chips.append(
+            f"{mdv2_escape(str(r['caller']))} "
+            f"{mdv2_escape(f'${usd:.2f}')} "
+            f"{mdv2_escape(f'({share:.0f}%)')}"
+        )
+
+    total_usd = total_us / 1_000_000.0
+    header = (
+        f"🤖 *AI cost · {days}d* — "
+        f"{mdv2_escape(f'${total_usd:.2f}')} · {total_calls} calls "
+        f"{mdv2_escape('(surrogate ±25%)')}"
+    )
+    return [header, *_chunk_chips(chips, per_row=2)]
+
+
 def build_daily_summary(store: Any, run_id: int) -> str:
     """Render the MarkdownV2 daily-digest summary for the operator.
 
@@ -209,6 +263,9 @@ def build_daily_summary(store: Any, run_id: int) -> str:
         f"{mdv2_escape(duration)} · exit {mdv2_escape(exit_str)}"
     )
 
+    # ---- AI cost share (30d, per agent) ----
+    ai_lines = _render_ai_cost_block(store, days=30)
+
     # ---- assemble ----
     lines: list[str] = [header, "", line_summary, ""]
     lines.extend(blocks)
@@ -216,6 +273,9 @@ def build_daily_summary(store: Any, run_id: int) -> str:
         # Anomalies are user-derived ("linkedin 0 results × 3 runs"), MDv2-escape.
         lines.append("")
         lines.append(f"⚠️ *Anomalies:* {mdv2_escape(' · '.join(anomalies))}")
+    if ai_lines:
+        lines.append("")
+        lines.extend(ai_lines)
     lines.append("")
     lines.append(line_footer)
     return "\n".join(lines)
