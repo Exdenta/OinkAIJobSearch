@@ -361,6 +361,46 @@ class MonitorStore:
             "by_status": by_status,
         }
 
+    def claude_call_cost_by_caller(self, since_ts: float) -> list[dict]:
+        """Per-caller cost + volume aggregation in [since_ts, now).
+
+        Returns rows sorted by cost_us DESC so callers can render the
+        heaviest spenders first. Used by ops/summary to add a monthly
+        per-agent share block to the daily digest.
+
+            [
+              {caller, n, cost_us, prompt_chars, output_chars, elapsed_ms},
+              ...
+            ]
+        """
+        with self._db._conn() as c:
+            rows = c.execute(
+                """
+                SELECT caller,
+                       COUNT(*)                            AS n,
+                       COALESCE(SUM(cost_estimate_us), 0)  AS cost_us,
+                       COALESCE(SUM(prompt_chars), 0)      AS prompt_chars,
+                       COALESCE(SUM(output_chars), 0)      AS output_chars,
+                       COALESCE(SUM(elapsed_ms), 0)        AS elapsed_ms
+                FROM claude_calls
+                WHERE finished_at >= ?
+                GROUP BY caller
+                ORDER BY cost_us DESC
+                """,
+                (float(since_ts),),
+            ).fetchall()
+        return [
+            {
+                "caller":       r["caller"],
+                "n":            int(r["n"]),
+                "cost_us":      int(r["cost_us"]),
+                "prompt_chars": int(r["prompt_chars"]),
+                "output_chars": int(r["output_chars"]),
+                "elapsed_ms":   int(r["elapsed_ms"]),
+            }
+            for r in rows
+        ]
+
     def recent_errors(self, since_ts: float) -> list[sqlite3.Row]:
         """error_events with `occurred_at >= since_ts`, newest first."""
         with self._db._conn() as c:

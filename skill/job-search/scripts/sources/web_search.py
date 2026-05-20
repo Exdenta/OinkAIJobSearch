@@ -185,6 +185,35 @@ Your mission in this single run:
       ("YYYY-MM-DD"). Returning an EMPTY string is forbidden; that
       causes the downstream age gate to drop the posting.
 
+  2b. EXTRACT `title` VERBATIM from the posting page — DO NOT paraphrase,
+      summarize, or rewrite. The downstream scorer reads seniority from
+      the title prefix ("Senior Frontend Engineer" → senior, gap penalty
+      fires; "Frontend Engineer" → no penalty). Dropping "Senior" /
+      "Lead" / "Staff" / "Principal" / "Junior" silently misranks the
+      posting. Source priority:
+
+       (i)   <h1> on the posting page (Workable, Ashby, Greenhouse,
+             Lever, Personio etc. all render the job title as the
+             FIRST h1 on the apply page).
+       (ii)  schema.org JSON-LD JobPosting.title.
+       (iii) og:title meta tag (strip company suffix like " - Leadtech"
+             or " | Acme Inc.").
+       (iv)  <title> tag (strip ATS / company suffix).
+
+      RULES:
+        - Copy the title CHARACTER-FOR-CHARACTER from the chosen source.
+          Preserve seniority prefix, parenthetical stack notes, location
+          tags. Only strip surrounding company/ATS branding suffix.
+        - If the H1 says "Senior Frontend Engineer (TypeScript)", return
+          "Senior Frontend Engineer (TypeScript)" — NOT "Frontend
+          Engineer (React / TypeScript)" or any reshuffle.
+        - If the search-result snippet title and the page H1 disagree,
+          ALWAYS prefer the page H1. Search snippets sometimes truncate
+          the seniority prefix.
+        - If the page is JS-only and you cannot read any of (i)-(iv),
+          return the search-result title verbatim — do not invent or
+          improve it.
+
   3. Apply these filters on your side (do NOT return rejected postings):
        - Match the candidate's role/stack/seniority above. When in doubt,
          err on the side of INCLUDING — the downstream pipeline has its

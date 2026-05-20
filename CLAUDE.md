@@ -1,6 +1,7 @@
 # FindJobs — Claude instructions
 
 Telegram job-alert bot. See `README.md` for architecture, setup, and command reference.
+Always use /caveman skill.
 
 ## Knowledge wiki
 
