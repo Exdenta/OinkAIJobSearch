@@ -70,7 +70,10 @@ import json
 import logging
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -551,9 +554,13 @@ def propose_patch(
 # Look for a unified diff anywhere in the model's reply (in case it
 # slipped a stray newline before the `---` line). We require the
 # canonical `--- a/<path>` / `+++ b/<path>` pair targeted at our file.
+# We extend to end-of-input rather than stopping at the first blank line
+# — diff bodies legitimately contain whitespace-only context lines (e.g.
+# a context line that is literally `" \n"`), and a non-greedy boundary
+# at `\n\s*$` would truncate the diff there and silently drop trailing
+# context, which `git apply --check` would then reject.
 _DIFF_RE = re.compile(
-    r"(?P<diff>^--- a/skill/job-search/scripts/job_enrich\.py.*?)"
-    r"(?:\n\s*$|\Z)",
+    r"(?P<diff>^--- a/skill/job-search/scripts/job_enrich\.py.*)\Z",
     flags=re.DOTALL | re.MULTILINE,
 )
 
@@ -567,7 +574,11 @@ def _extract_diff(body: str) -> str | None:
     diff doesn't include both `--- a/` and `+++ b/` lines, or there's
     no `@@` hunk header.
     """
-    s = (body or "").strip()
+    s = (body or "")
+    # Lstrip safely (no in-diff content there) but only trim trailing
+    # newlines from the right — a literal " \n" line is a real unified-
+    # diff context line, and `.strip()` would eat it.
+    s = s.lstrip().rstrip("\n")
     if not s:
         return None
     # Allow surrounding code fences ("```diff ... ```").
@@ -575,11 +586,17 @@ def _extract_diff(body: str) -> str | None:
         s = s.strip("`")
         if s.lower().startswith("diff"):
             s = s[4:]
-        s = s.strip("`").strip()
+        s = s.strip("`").lstrip().rstrip("\n")
     m = _DIFF_RE.search(s)
     if not m:
         return None
-    diff = m.group("diff").rstrip()
+    # Preserve trailing whitespace-only context lines (`" \n"` is a real
+    # context line in unified diff format — stripping it would silently
+    # drop trailing context that `git apply --check` requires). Only trim
+    # one trailing newline to normalize the ending.
+    diff = m.group("diff")
+    if diff.endswith("\n"):
+        diff = diff[:-1]
     if "--- a/skill/job-search/scripts/job_enrich.py" not in diff:
         return None
     if "+++ b/skill/job-search/scripts/job_enrich.py" not in diff:
@@ -617,23 +634,75 @@ def diff_anchor_lines(diff: str) -> list[str]:
     return out
 
 
-def anchors_match_prompt(diff: str, prompt_body: str) -> bool:
-    """True iff every context line in the diff appears verbatim in the prompt.
+def anchors_match_prompt(diff: str, job_enrich_path: Path) -> bool:
+    """True iff `git apply --check` accepts `diff` against `job_enrich_path`.
 
-    This is the key SAFETY property: a diff whose anchors don't exist
-    will fail `git apply --check` for the operator. We refuse to write
-    such a diff to disk in the first place.
+    This is the key SAFETY property: a diff we hand the operator MUST
+    apply cleanly with `git apply <file>`. Earlier revisions of this
+    function did a set-membership check ("every context line in the diff
+    appears somewhere in the prompt"), which is UNSOUND — it accepts
+    diffs whose context lines are reordered or pulled from far-apart
+    regions of the file, both of which `git apply --check` rejects.
+
+    Implementation: build a hermetic sandbox under the OS tmp dir
+    containing a copy of `job_enrich_path` at the relative path the diff
+    addresses (`skill/job-search/scripts/job_enrich.py`), write the
+    candidate diff to a sibling tempfile, and shell out to
+    `git apply --check <tempfile>` with cwd=sandbox. Exit 0 ⇒ apply-safe.
+
+    `git apply --check` is READ-ONLY — it does not modify any file in
+    the sandbox, and the sandbox is torn down on exit regardless of
+    outcome. This does NOT violate the script's "no autonomous edits to
+    in-repo files" boundary: the live `job_enrich.py` is never touched,
+    only a copy in a tmp dir.
     """
-    anchors = diff_anchor_lines(diff)
-    if not anchors:
+    if not diff:
         return False
-    # `prompt_body` is the raw body of the `_PROMPT` triple-quoted string.
-    # We match anchors line-by-line.
-    body_lines = set(prompt_body.splitlines())
-    for a in anchors:
-        if a not in body_lines:
+    if shutil.which("git") is None:
+        log.warning("audit_patch: `git` binary not found on PATH; cannot verify "
+                    "diff applicability — rejecting candidate as a safety default")
+        return False
+    try:
+        live_src = job_enrich_path.read_text(encoding="utf-8")
+    except OSError as e:
+        log.warning("audit_patch: can't read %s for apply-check: %s",
+                    job_enrich_path, e)
+        return False
+    # The diff is rooted at `skill/job-search/scripts/job_enrich.py` (the
+    # `--- a/...` / `+++ b/...` lines we enforce in `_extract_diff`).
+    rel_target = Path("skill/job-search/scripts/job_enrich.py")
+    sandbox = Path(tempfile.mkdtemp(prefix="audit_patch_check_"))
+    try:
+        target = sandbox / rel_target
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(live_src, encoding="utf-8")
+        # Patch lives in the sandbox root so the relative paths inside
+        # the diff resolve against `sandbox` when cwd=sandbox.
+        patch_path = sandbox / "candidate.patch"
+        # `git apply` is line-ending sensitive; ensure trailing newline.
+        patch_text = diff if diff.endswith("\n") else diff + "\n"
+        patch_path.write_text(patch_text, encoding="utf-8")
+        try:
+            proc = subprocess.run(
+                ["git", "apply", "--check", str(patch_path)],
+                cwd=str(sandbox),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            log.warning("audit_patch: `git apply --check` invocation failed: %s", e)
             return False
-    return True
+        if proc.returncode == 0:
+            return True
+        stderr = (proc.stderr or proc.stdout or "").strip()
+        log.info(
+            "audit_patch: reject: git apply --check failed: %s",
+            stderr[:200],
+        )
+        return False
+    finally:
+        shutil.rmtree(sandbox, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -948,10 +1017,10 @@ def synthesize(
         if not diff:
             log.info("audit_patch: cluster=%s — no diff proposed; skipping", name)
             continue
-        if not anchors_match_prompt(diff, prompt_body):
+        if not anchors_match_prompt(diff, job_enrich_path):
             log.warning(
-                "audit_patch: cluster=%s — diff anchors don't match current "
-                "_PROMPT; skipping (operator would have to fix the diff anyway)",
+                "audit_patch: cluster=%s — `git apply --check` rejected the "
+                "proposed diff; skipping (operator would have to fix it anyway)",
                 name,
             )
             continue
