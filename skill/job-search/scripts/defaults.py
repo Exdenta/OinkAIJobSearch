@@ -115,6 +115,28 @@ DEFAULTS: dict = {
     "ai_scoring_audit":          True,
     "ai_scoring_audit_model":    "opus",
     "ai_scoring_audit_timeout_s": 480,
+    # v2.6 batched-audit-with-critic. Split the audit pool into
+    # small batches dispatched in parallel; each batch is paired with
+    # a runtime Opus "critic" that re-verifies the scorer's output
+    # for FORMAT + INTERNAL CONSISTENCY (score in [0,5], verdict
+    # matches the score delta, exactly one review per id, etc.).
+    # Scorer + critic loop until the critic approves OR the round
+    # cap fires — never blocks the audit on a stalemate.
+    #   batch_size:    items per scorer call. 10 keeps Opus prompts
+    #                  comfortable and matches the existing
+    #                  enrich_jobs_ai chunk size.
+    #   workers:       parallel worker pool over batches. Mirrors
+    #                  ai_enrich_workers.
+    #   critic_rounds: max scorer↔critic rounds per batch before
+    #                  falling back to the last scorer output.
+    #   critic_model:  may differ from the scorer model in future
+    #                  (e.g. critic on cheaper sonnet). Defaults to
+    #                  opus today so format checks share the scorer's
+    #                  judgement class.
+    "ai_scoring_audit_batch_size":    10,
+    "ai_scoring_audit_workers":       4,
+    "ai_scoring_audit_critic_rounds": 3,
+    "ai_scoring_audit_critic_model":  "opus",
 
     # Liveness verifier moved to send-time (telegram_client) in v2.1 —
     # only the postings that survived scoring + ⭐ floor get a Haiku
