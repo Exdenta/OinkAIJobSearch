@@ -19,6 +19,8 @@ forensic dir with a single hand-rolled log line.
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -345,13 +347,41 @@ def test_malformed_opus_output_skipped(tmp_path, monkeypatch, caplog):
     assert not output_root.exists()
 
 
-def test_patch_anchors_match_current_prompt(tmp_path, monkeypatch):
-    """A diff whose context lines DON'T appear verbatim in _PROMPT is REJECTED.
+def _git_apply_check(patch_path: Path, job_enrich_path: Path) -> tuple[int, str]:
+    """Build a hermetic sandbox and run `git apply --check` for real.
 
-    This is the safety property: the operator must be able to `git
-    apply` the patch without manual fixup. We never write a diff whose
-    anchors won't apply.
+    Mirrors what `audit_patch_synthesize.anchors_match_prompt` does
+    internally, but lets the test assert the same property end-to-end on
+    the file the synthesizer wrote. Returns (exit_code, stderr).
     """
+    assert shutil.which("git"), "git binary required for these tests"
+    sandbox = Path(__import__("tempfile").mkdtemp(prefix="audit_patch_test_"))
+    try:
+        target = sandbox / "skill/job-search/scripts/job_enrich.py"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(job_enrich_path.read_text(encoding="utf-8"), encoding="utf-8")
+        proc = subprocess.run(
+            ["git", "apply", "--check", str(patch_path)],
+            cwd=str(sandbox),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return proc.returncode, (proc.stderr or proc.stdout or "")
+    finally:
+        shutil.rmtree(sandbox, ignore_errors=True)
+
+
+def test_patch_anchors_match_current_prompt(tmp_path, monkeypatch):
+    """End-to-end safety property: a well-formed additions-only diff is
+    accepted AND the persisted .patch file applies cleanly with
+    `git apply --check`. A diff with bogus anchors is rejected (no .patch
+    file written).
+
+    This is the key correctness contract: the operator must be able to
+    `git apply` whatever the synthesizer wrote, without manual fixup.
+    """
+    # ----- positive case: valid diff → .patch persisted → applies cleanly.
     forensic_dir = tmp_path / "forensic_logs"
     _write_forensic(forensic_dir, [
         _audit_record(f"j{i}") for i in range(6)
@@ -359,26 +389,16 @@ def test_patch_anchors_match_current_prompt(tmp_path, monkeypatch):
     output_root = tmp_path / "audit_patches"
     stub_enrich = _write_job_enrich_stub(tmp_path, PROMPT_SAMPLE)
 
-    # A diff with context lines that do NOT appear in PROMPT_SAMPLE.
-    bad_diff = (
-        "--- a/skill/job-search/scripts/job_enrich.py\n"
-        "+++ b/skill/job-search/scripts/job_enrich.py\n"
-        "@@ -1,3 +1,4 @@\n"
-        " THIS LINE IS NOT IN THE PROMPT\n"
-        " NEITHER IS THIS\n"
-        " OR THIS\n"
-        "+But we propose to ADD this line.\n"
-    )
     cluster_json = json.dumps({
         "clusters": [{
-            "cluster_name": "bogus-anchors",
-            "doctrine_violated": "other",
+            "cluster_name": "doctrine-b-stacked-penalties",
+            "doctrine_violated": "B",
             "n_disagreements": 6,
             "sample_ids": [f"j{i}" for i in range(6)],
-            "root_cause_hypothesis": "Hypothesis text.",
+            "root_cause_hypothesis": "Scorer stacks seniority + years penalties.",
         }]
     })
-    runner = _make_canned_runner([cluster_json, bad_diff])
+    runner = _make_canned_runner([cluster_json, _make_well_formed_diff()])
     monkeypatch.setattr(aps, "run_p", runner)
 
     result = aps.synthesize(
@@ -388,14 +408,158 @@ def test_patch_anchors_match_current_prompt(tmp_path, monkeypatch):
         min_cluster_size=5,
         notify=False,
     )
+    assert result.n_patches_written == 1
+    patches = list(result.output_dir.glob("*.patch"))
+    assert len(patches) == 1
+    rc, stderr = _git_apply_check(patches[0], stub_enrich)
+    assert rc == 0, (
+        "synthesizer persisted a diff that `git apply --check` rejected:\n"
+        f"  patch: {patches[0]}\n"
+        f"  stderr: {stderr}"
+    )
 
+    # ----- negative case: bogus anchors → cluster skipped, nothing written.
+    output_root2 = tmp_path / "audit_patches_2"
+    bad_diff = (
+        "--- a/skill/job-search/scripts/job_enrich.py\n"
+        "+++ b/skill/job-search/scripts/job_enrich.py\n"
+        "@@ -1,3 +1,4 @@\n"
+        " THIS LINE IS NOT IN THE PROMPT\n"
+        " NEITHER IS THIS\n"
+        " OR THIS\n"
+        "+But we propose to ADD this line.\n"
+    )
+    runner2 = _make_canned_runner([
+        json.dumps({"clusters": [{
+            "cluster_name": "bogus-anchors",
+            "doctrine_violated": "other",
+            "n_disagreements": 6,
+            "sample_ids": [f"j{i}" for i in range(6)],
+            "root_cause_hypothesis": "Hypothesis text.",
+        }]}),
+        bad_diff,
+    ])
+    monkeypatch.setattr(aps, "run_p", runner2)
+    result2 = aps.synthesize(
+        forensic_dir=forensic_dir,
+        output_root=output_root2,
+        job_enrich_path=stub_enrich,
+        min_cluster_size=5,
+        notify=False,
+    )
+    assert result2.n_patches_written == 0
+    assert result2.output_dir is None
+    assert not output_root2.exists()
+
+    # ----- direct unit-check of the helper.
+    assert aps.anchors_match_prompt(_make_well_formed_diff(), stub_enrich) is True
+    assert aps.anchors_match_prompt(bad_diff, stub_enrich) is False
+
+
+def test_anchor_reorder_rejected(tmp_path, monkeypatch):
+    """COUNTER-EXAMPLE A: anchor lines are present in the file but in the
+    WRONG ORDER. The old set-membership check accepted such diffs; the
+    real `git apply --check` rejects them. The synthesizer must too.
+    """
+    forensic_dir = tmp_path / "forensic_logs"
+    _write_forensic(forensic_dir, [
+        _audit_record(f"j{i}") for i in range(6)
+    ])
+    output_root = tmp_path / "audit_patches"
+    stub_enrich = _write_job_enrich_stub(tmp_path, PROMPT_SAMPLE)
+
+    # DOCTRINE A, B, C are all present in PROMPT_SAMPLE — but here we
+    # swap B and C. Every anchor line individually appears in the file,
+    # so a set-membership test would pass. `git apply --check` rejects.
+    reorder_diff = (
+        "--- a/skill/job-search/scripts/job_enrich.py\n"
+        "+++ b/skill/job-search/scripts/job_enrich.py\n"
+        "@@ -7,6 +7,8 @@\n"
+        " DOCTRINE A — NEVER penalize \"overqualification\". Anywhere.\n"
+        " DOCTRINE C — Generic titles describing data labeling → score=0.\n"
+        " DOCTRINE B — NEVER stack penalties on the SAME underlying fact.\n"
+        "+\n"
+        "+DOCTRINE D — added rule.\n"
+        " \n"
+        " ═════════════════════════════════════════════════════════════════════\n"
+        " \n"
+    )
+    runner = _make_canned_runner([
+        json.dumps({"clusters": [{
+            "cluster_name": "reorder",
+            "doctrine_violated": "other",
+            "n_disagreements": 6,
+            "sample_ids": [f"j{i}" for i in range(6)],
+            "root_cause_hypothesis": "Hypothesis.",
+        }]}),
+        reorder_diff,
+    ])
+    monkeypatch.setattr(aps, "run_p", runner)
+
+    result = aps.synthesize(
+        forensic_dir=forensic_dir,
+        output_root=output_root,
+        job_enrich_path=stub_enrich,
+        min_cluster_size=5,
+        notify=False,
+    )
     assert result.n_patches_written == 0
     assert result.output_dir is None
     assert not output_root.exists()
+    # Direct helper call.
+    assert aps.anchors_match_prompt(reorder_diff, stub_enrich) is False
 
-    # Also unit-check the helper directly.
-    assert aps.anchors_match_prompt(_make_well_formed_diff(), PROMPT_SAMPLE) is True
-    assert aps.anchors_match_prompt(bad_diff, PROMPT_SAMPLE) is False
+
+def test_non_contiguous_anchors_rejected(tmp_path, monkeypatch):
+    """COUNTER-EXAMPLE B: anchor lines pulled from FAR-APART regions of
+    the file. Each line is verbatim in `_PROMPT`, but they're not
+    adjacent, so the hunk header's positional claim can't be satisfied
+    and `git apply --check` rejects.
+    """
+    forensic_dir = tmp_path / "forensic_logs"
+    _write_forensic(forensic_dir, [
+        _audit_record(f"j{i}") for i in range(6)
+    ])
+    output_root = tmp_path / "audit_patches"
+    stub_enrich = _write_job_enrich_stub(tmp_path, PROMPT_SAMPLE)
+
+    # Lines 1, 7, and 13 of PROMPT_SAMPLE — far apart. Each is real, but
+    # they don't sit on consecutive lines, so the hunk can't apply.
+    noncontig_diff = (
+        "--- a/skill/job-search/scripts/job_enrich.py\n"
+        "+++ b/skill/job-search/scripts/job_enrich.py\n"
+        "@@ -1,5 +1,6 @@\n"
+        " OUTPUT STYLE — caveman english\n"
+        " DOCTRINE A — NEVER penalize \"overqualification\". Anywhere.\n"
+        " For each posting, you must:\n"
+        "+DOCTRINE D — Added rule.\n"
+        "   1. Score how well it matches THIS candidate, on an integer 0-5 scale.\n"
+        "   4. Extract `key_details`.\n"
+    )
+    runner = _make_canned_runner([
+        json.dumps({"clusters": [{
+            "cluster_name": "non-contig",
+            "doctrine_violated": "other",
+            "n_disagreements": 6,
+            "sample_ids": [f"j{i}" for i in range(6)],
+            "root_cause_hypothesis": "Hypothesis.",
+        }]}),
+        noncontig_diff,
+    ])
+    monkeypatch.setattr(aps, "run_p", runner)
+
+    result = aps.synthesize(
+        forensic_dir=forensic_dir,
+        output_root=output_root,
+        job_enrich_path=stub_enrich,
+        min_cluster_size=5,
+        notify=False,
+    )
+    assert result.n_patches_written == 0
+    assert result.output_dir is None
+    assert not output_root.exists()
+    # Direct helper call.
+    assert aps.anchors_match_prompt(noncontig_diff, stub_enrich) is False
 
 
 def test_dry_run_writes_nothing(tmp_path, monkeypatch):
