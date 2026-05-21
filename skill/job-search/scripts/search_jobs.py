@@ -934,9 +934,25 @@ def run(dry_run: bool = False, only_chat: int | None = None, no_send: bool = Fal
                             audit_model = str(
                                 filters.get("ai_scoring_audit_model") or "opus"
                             )
+                            audit_batch_size = int(
+                                filters.get("ai_scoring_audit_batch_size") or 10
+                            )
+                            audit_workers = int(
+                                filters.get("ai_scoring_audit_workers") or 4
+                            )
+                            audit_critic_rounds = int(
+                                filters.get("ai_scoring_audit_critic_rounds") or 3
+                            )
+                            audit_critic_model = str(
+                                filters.get("ai_scoring_audit_critic_model") or "opus"
+                            )
                             reviews = reanalyze_scoring_ai(
                                 audit_jobs, ext_enr, resume_text, prefs_text,
                                 timeout_s=audit_timeout, model=audit_model,
+                                batch_size=audit_batch_size,
+                                workers=audit_workers,
+                                critic_rounds=audit_critic_rounds,
+                                critic_model=audit_critic_model,
                             )
                             disagreements = [
                                 r for r in reviews
