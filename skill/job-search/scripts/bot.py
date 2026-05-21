@@ -796,6 +796,14 @@ def _clear_prefs(tg: TelegramClient, db: DB, chat_id: int) -> None:
         db.clear_user_profile(chat_id)
         note = "🧹 Preferences cleared — your digest will use the global defaults."
 
+    # Clearing the prefs flips the user's profile_hash, so any cached
+    # verdicts under the old hash would never hit again. Drop them now
+    # rather than waiting for the TTL sweep — keeps the table small.
+    try:
+        db.purge_job_scores_for_user(chat_id)
+    except Exception:
+        log.debug("purge_job_scores_for_user failed in _clear_prefs", exc_info=True)
+
     tg.send_message(chat_id, mdv2_escape(note), reply_markup=REPLY_KEYBOARD)
 
 
@@ -1029,6 +1037,14 @@ def _execute_clean_data(
                 n_fit = db.delete_fit_analyses(chat_id)
             except Exception:
                 log.exception("resume wipe: delete_fit_analyses failed")
+            # Same logic applies to the per-user score cache: every cached
+            # verdict was scored against the now-deleted resume, so a hit
+            # under the new resume's profile_hash is impossible anyway.
+            # Purge eagerly to keep job_scores small.
+            try:
+                db.purge_job_scores_for_user(chat_id)
+            except Exception:
+                log.exception("resume wipe: purge_job_scores_for_user failed")
             for name in ("resume.pdf", "resume.txt"):
                 p = udir / name
                 try:
@@ -1071,6 +1087,12 @@ def _execute_clean_data(
 
         elif kind == "profile":
             db.clear_user_profile(chat_id)
+            # Prefs are part of the profile_hash; wiping them invalidates
+            # every cached verdict for this user.
+            try:
+                db.purge_job_scores_for_user(chat_id)
+            except Exception:
+                log.exception("profile wipe: purge_job_scores_for_user failed")
             summary_lines.append(
                 "🤖 Profile + free-text prefs wiped. Resume survives; upload /prefs "
                 "again (or /rebuildprofile) to produce a fresh profile."
