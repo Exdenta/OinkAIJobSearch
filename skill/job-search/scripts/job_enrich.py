@@ -743,6 +743,8 @@ def enrich_jobs_ai(
     two_pass: bool = False,
     triage_floor: int = 2,
     workers: int = 4,
+    db=None,
+    chat_id: int | None = None,
 ) -> dict[str, dict]:
     """Return a {external_id → enrichment dict} map.
 
@@ -772,6 +774,13 @@ def enrich_jobs_ai(
                        re-score on Haiku survivors at `triage_floor`.
                        Operator can flip this on if Haiku noise returns.
       triage_floor:    Only meaningful when `two_pass=True`.
+      db, chat_id:     Optional persistent score-cache wiring. When BOTH
+                       are provided, we look up cached verdicts (keyed
+                       by Job.job_id + the current profile_hash) before
+                       calling the model, and persist fresh verdicts
+                       back after scoring. Either being None falls back
+                       to the un-cached path so unit tests and ad-hoc
+                       callers keep working.
 
     Returns an empty dict on any failure. Caller MUST tolerate missing entries
     (e.g. the model dropped some IDs).
@@ -786,6 +795,51 @@ def enrich_jobs_ai(
         return {}
 
     prefs_text = (prefs_text or "").strip()
+
+    # ----- Persistent score cache (lookup) ----------------------------
+    # When db+chat_id are both threaded through, fetch cached verdicts
+    # for this user at the CURRENT profile_hash (resume + prefs). Any
+    # edit to either input flips the hash → automatic invalidation.
+    # Cache is keyed by Job.job_id (stable sha1 of source+url); we
+    # rebuild the external_id→enrichment surface at the boundary so
+    # the function's public return shape is unchanged.
+    cache_enabled = db is not None and chat_id is not None
+    cached_by_ext: dict[str, dict] = {}
+    to_score: list[Job] = list(jobs)
+    phash: str | None = None
+    if cache_enabled:
+        try:
+            from db import profile_hash as _profile_hash
+            phash = _profile_hash(resume_text, prefs_text)
+            job_ids = [j.job_id for j in jobs]
+            cached_by_job_id = db.get_cached_scores(int(chat_id), job_ids, phash)
+        except Exception:
+            log.exception("enrich_jobs_ai: cache lookup failed; "
+                          "falling back to full scoring")
+            cached_by_job_id = {}
+            phash = None
+        if cached_by_job_id:
+            still_needs: list[Job] = []
+            for j in jobs:
+                hit = cached_by_job_id.get(j.job_id)
+                if hit is None:
+                    still_needs.append(j)
+                else:
+                    cached_by_ext[j.external_id] = hit
+            to_score = still_needs
+            log.info(
+                "enrich_jobs_ai: cache hit %d/%d, scoring %d new",
+                len(cached_by_ext), len(jobs), len(to_score),
+            )
+        else:
+            log.info(
+                "enrich_jobs_ai: cache hit 0/%d, scoring %d new",
+                len(jobs), len(to_score),
+            )
+
+    if not to_score:
+        # Everyone was cached.
+        return cached_by_ext
 
     # Model selection:
     #   * single-pass (two_pass=False): Sonnet for every job. v2.1 default
@@ -802,28 +856,43 @@ def enrich_jobs_ai(
         primary_label = "sonnet"
 
     first_out = _enrich_pool(
-        jobs, resume_text, prefs_text, timeout_s,
+        to_score, resume_text, prefs_text, timeout_s,
         max_jobs_per_call, model=primary_model, pass_label=primary_label,
         workers=workers,
     )
 
     if not two_pass:
-        return first_out
+        # Persist freshly-scored verdicts before merging back with cache.
+        if cache_enabled and phash and first_out:
+            _persist_scores(db, int(chat_id), phash, first_out,
+                            to_score, primary_label)
+        # Merge cached hits + new verdicts. Cached entries never collide
+        # with fresh ones because to_score == jobs - cached.
+        merged_out = dict(cached_by_ext)
+        merged_out.update(first_out)
+        return merged_out
 
     survivors: list[Job] = [
-        j for j in jobs
+        j for j in to_score
         if int((first_out.get(j.external_id) or {}).get("match_score") or 0)
            >= triage_floor
     ]
     if not survivors:
         log.info("enrich_jobs_ai: two-pass — 0 survivors at triage_floor=%d",
                  triage_floor)
-        return first_out
+        # No Sonnet pass: the only verdicts produced were Haiku's. Persist
+        # them under the haiku label.
+        if cache_enabled and phash and first_out:
+            _persist_scores(db, int(chat_id), phash, first_out,
+                            to_score, primary_label)
+        merged_out = dict(cached_by_ext)
+        merged_out.update(first_out)
+        return merged_out
 
     log.info(
         "enrich_jobs_ai: two-pass — %d/%d jobs survived Haiku triage "
         "(floor=%d), re-scoring with %s",
-        len(survivors), len(jobs), triage_floor, MID_MODEL,
+        len(survivors), len(to_score), triage_floor, MID_MODEL,
     )
     sonnet_out = _enrich_pool(
         survivors, resume_text, prefs_text, timeout_s,
@@ -849,7 +918,69 @@ def enrich_jobs_ai(
         "(survivors not re-scored: %d)",
         upgrades, downgrades, unchanged, len(survivors) - len(sonnet_out),
     )
-    return merged
+
+    # ----- Persist freshly-scored verdicts back to the cache ----------
+    # Each row's `model` reflects the final pass that produced its
+    # verdict: "sonnet" for entries Sonnet re-scored, else "haiku".
+    if cache_enabled and phash and merged:
+        sonnet_ext_ids = set(sonnet_out.keys())
+        _persist_scores(
+            db, int(chat_id), phash, merged, to_score,
+            primary_label,  # default ("haiku")
+            sonnet_ext_ids=sonnet_ext_ids,
+        )
+
+    # Merge cached hits into the final return (cached entries are
+    # disjoint from to_score by construction).
+    merged_out = dict(cached_by_ext)
+    merged_out.update(merged)
+    return merged_out
+
+
+def _persist_scores(
+    db,
+    chat_id: int,
+    profile_hash_value: str,
+    verdicts_by_ext: dict[str, dict],
+    scored_jobs: list[Job],
+    default_label: str,
+    *,
+    sonnet_ext_ids: set[str] | None = None,
+) -> None:
+    """Translate the {external_id → enrichment} dict produced this run
+    into {job_id → enrichment} and bulk-upsert into job_scores.
+
+    Cache rows are keyed by Job.job_id (stable sha1 of source+url) so
+    a job is reusable across re-runs even if its external_id rotates.
+    `sonnet_ext_ids`, when provided, marks the entries that survived
+    a Sonnet re-score so they're tagged "sonnet" instead of the
+    default model label.
+    """
+    ext_to_job_id = {j.external_id: j.job_id for j in scored_jobs}
+    by_job_id_local: dict[str, dict] = {}
+    for ext_id, enr in verdicts_by_ext.items():
+        if not isinstance(enr, dict):
+            continue
+        jid = ext_to_job_id.get(ext_id)
+        if not jid:
+            # Verdicts the model emitted for IDs we didn't ask about;
+            # `_enrich_one_chunk` already filters these but belt-and-
+            # braces here so a future regression can't corrupt the cache.
+            continue
+        row = dict(enr)
+        if sonnet_ext_ids is not None:
+            row["model"] = "sonnet" if ext_id in sonnet_ext_ids else default_label
+        else:
+            row["model"] = default_label
+        by_job_id_local[jid] = row
+    if not by_job_id_local:
+        return
+    try:
+        db.upsert_scores(chat_id, profile_hash_value, by_job_id_local,
+                         default_label)
+    except Exception:
+        log.exception("enrich_jobs_ai: cache upsert failed; "
+                      "verdicts still returned to caller")
 
 
 def _enrich_pool(
