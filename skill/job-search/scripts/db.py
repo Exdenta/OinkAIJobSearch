@@ -14,12 +14,27 @@ volume personal bot, no need for async.
 """
 from __future__ import annotations
 
+import hashlib
 import json as _json
 import sqlite3
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable, Iterator
+
+
+def profile_hash(resume_text: str, prefs_text: str) -> str:
+    """Stable cache key over the inputs that drive scoring.
+
+    sha1 truncated to 16 hex chars is plenty at our scale (≪ 2^32 cached
+    profiles per user) and keeps the per-row overhead in `job_scores`
+    small. Strips both inputs first so trivial whitespace edits don't
+    invalidate the cache.
+    """
+    resume = (resume_text or "").strip()
+    prefs = (prefs_text or "").strip()
+    blob = f"{resume}\n----\n{prefs}".encode("utf-8")
+    return hashlib.sha1(blob).hexdigest()[:16]
 
 
 SCHEMA = """
@@ -162,6 +177,26 @@ CREATE TABLE IF NOT EXISTS digest_run_jobs (
     recorded_at     REAL    NOT NULL,
     PRIMARY KEY (chat_id, run_id, job_id)
 );
+-- Persistent per-user score cache, keyed by (chat_id, job_id,
+-- profile_hash). Lets a re-run skip the Haiku/Sonnet two-pass for any
+-- (user, job) we've already scored against the user's CURRENT profile
+-- inputs (resume + prefs). `profile_hash` is the 16-char sha1 prefix
+-- produced by `profile_hash()` above; any edit to either input
+-- invalidates the cache for that user automatically. `model` records
+-- the final pass that produced the verdict ("haiku" or "sonnet") so
+-- we can audit cache content post-hoc.
+CREATE TABLE IF NOT EXISTS job_scores (
+    chat_id       INTEGER NOT NULL,
+    job_id        TEXT    NOT NULL,
+    profile_hash  TEXT    NOT NULL,
+    match_score   INTEGER NOT NULL,
+    why_match     TEXT    NOT NULL DEFAULT '',
+    why_mismatch  TEXT    NOT NULL DEFAULT '',
+    key_details   TEXT    NOT NULL DEFAULT '{}',
+    model         TEXT    NOT NULL DEFAULT '',
+    scored_at     REAL    NOT NULL,
+    PRIMARY KEY (chat_id, job_id, profile_hash)
+);
 -- Per-(user, job) record of "View posting" link clicks. Populated by the
 -- in-process redirect server when a user taps the URL button on a job
 -- card. Multiple clicks for the same (chat, job) produce multiple rows
@@ -182,6 +217,10 @@ CREATE INDEX IF NOT EXISTS idx_profile_builds_chat ON profile_builds(chat_id, bu
 CREATE INDEX IF NOT EXISTS idx_research_runs_chat ON research_runs(chat_id, finished_at DESC);
 CREATE INDEX IF NOT EXISTS idx_digest_run_chat ON digest_run_jobs(chat_id, run_id DESC);
 CREATE INDEX IF NOT EXISTS idx_digest_run_age ON digest_run_jobs(recorded_at);
+-- Covers the cache-lookup query: fetch all (job_id, …) rows for one
+-- user at their current profile_hash in a single index scan.
+CREATE INDEX IF NOT EXISTS idx_job_scores_lookup ON job_scores(chat_id, profile_hash);
+CREATE INDEX IF NOT EXISTS idx_job_scores_age ON job_scores(scored_at);
 CREATE INDEX IF NOT EXISTS idx_posting_clicks_user ON posting_clicks(chat_id, clicked_at DESC);
 CREATE INDEX IF NOT EXISTS idx_posting_clicks_job ON posting_clicks(job_id);
 """
@@ -923,6 +962,7 @@ class DB:
             c.execute("DELETE FROM fit_analyses    WHERE chat_id = ?", (chat_id,))
             c.execute("DELETE FROM profile_builds  WHERE chat_id = ?", (chat_id,))
             c.execute("DELETE FROM research_runs   WHERE chat_id = ?", (chat_id,))
+            c.execute("DELETE FROM job_scores      WHERE chat_id = ?", (chat_id,))
             c.execute("DELETE FROM users           WHERE chat_id = ?", (chat_id,))
 
     def count_user_data(self, chat_id: int) -> dict:
@@ -1457,6 +1497,151 @@ class DB:
                 (cutoff,),
             )
             return cur.rowcount or 0
+
+    # ---------- job_scores (persistent per-user score cache) ----------
+
+    def get_cached_scores(
+        self,
+        chat_id: int,
+        job_ids: list[str],
+        profile_hash: str,
+    ) -> dict[str, dict]:
+        """Bulk-lookup cached enrichment verdicts for one user.
+
+        Returns ``{job_id: enrichment_dict}`` for every cache hit. Missing
+        job_ids are simply absent from the returned dict — callers
+        partition by membership. The enrichment shape mirrors what
+        `enrich_jobs_ai` produces:
+            {"match_score": int, "why_match": str, "why_mismatch": str,
+             "key_details": dict, "model": str}
+        """
+        if not job_ids or not profile_hash:
+            return {}
+        out: dict[str, dict] = {}
+        # SQLite has a host-parameter cap (default 999 on older builds, 32766
+        # on modern ones); chunk to stay well under both.
+        chunk_size = 500
+        seen_ids = [str(j) for j in job_ids if j]
+        with self._conn() as c:
+            for start in range(0, len(seen_ids), chunk_size):
+                chunk = seen_ids[start:start + chunk_size]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = c.execute(
+                    f"""
+                    SELECT job_id, match_score, why_match, why_mismatch,
+                           key_details, model
+                      FROM job_scores
+                     WHERE chat_id = ?
+                       AND profile_hash = ?
+                       AND job_id IN ({placeholders})
+                    """,
+                    (int(chat_id), str(profile_hash), *chunk),
+                ).fetchall()
+                for r in rows:
+                    try:
+                        kd = _json.loads(r["key_details"] or "{}")
+                        if not isinstance(kd, dict):
+                            kd = {}
+                    except (TypeError, ValueError):
+                        kd = {}
+                    out[r["job_id"]] = {
+                        "match_score": int(r["match_score"] or 0),
+                        "why_match":   r["why_match"] or "",
+                        "why_mismatch": r["why_mismatch"] or "",
+                        "key_details": kd,
+                        "model":       r["model"] or "",
+                    }
+        return out
+
+    def upsert_scores(
+        self,
+        chat_id: int,
+        profile_hash: str,
+        scores: dict[str, dict],
+        model: str,
+    ) -> int:
+        """Bulk INSERT-OR-REPLACE of enrichment verdicts.
+
+        `scores` is ``{job_id: enrichment_dict}``. `model` is the label
+        that produced the verdict ("haiku" / "sonnet"). Returns rows
+        written. Skips entries whose value isn't a dict so a partial /
+        malformed batch can't corrupt the table.
+        """
+        if not scores or not profile_hash:
+            return 0
+        now = time.time()
+        rows: list[tuple] = []
+        for jid, enr in scores.items():
+            if not isinstance(enr, dict):
+                continue
+            try:
+                score = int(enr.get("match_score") or 0)
+            except (TypeError, ValueError):
+                score = 0
+            kd = enr.get("key_details") or {}
+            if not isinstance(kd, dict):
+                kd = {}
+            try:
+                kd_json = _json.dumps(kd, ensure_ascii=False)
+            except (TypeError, ValueError):
+                kd_json = "{}"
+            # Allow caller to record a per-row model override (Sonnet
+            # re-score on top of an initial Haiku pass); fall back to
+            # the bulk `model` arg otherwise.
+            row_model = enr.get("model")
+            if not isinstance(row_model, str) or not row_model:
+                row_model = model or ""
+            rows.append((
+                int(chat_id), str(jid), str(profile_hash),
+                max(0, min(5, score)),
+                str(enr.get("why_match") or ""),
+                str(enr.get("why_mismatch") or ""),
+                kd_json,
+                row_model,
+                now,
+            ))
+        if not rows:
+            return 0
+        with self._conn() as c:
+            c.executemany(
+                """
+                INSERT OR REPLACE INTO job_scores
+                  (chat_id, job_id, profile_hash, match_score,
+                   why_match, why_mismatch, key_details, model, scored_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+        return len(rows)
+
+    def purge_job_scores_for_user(self, chat_id: int) -> int:
+        """Drop every cached score row for one user. Returns rows removed.
+
+        Called from /cleardata branches that invalidate the user's
+        scoring inputs (resume or prefs reset) — `clear_resume` and
+        `clear_user_profile`.
+        """
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM job_scores WHERE chat_id = ?",
+                (int(chat_id),),
+            )
+            return int(cur.rowcount or 0)
+
+    def purge_job_scores_older_than(self, max_age_seconds: float) -> int:
+        """TTL sweep: drop rows whose `scored_at` is older than the cutoff.
+
+        Returns rows removed. Wired into `search_jobs.py:run` alongside
+        the existing `digest_run_jobs` purge so the cache can't grow
+        unbounded across long stretches of inactivity.
+        """
+        cutoff = time.time() - float(max_age_seconds)
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM job_scores WHERE scored_at < ?",
+                (cutoff,),
+            )
+            return int(cur.rowcount or 0)
 
     # ---------- resume_suggestions ----------
 
