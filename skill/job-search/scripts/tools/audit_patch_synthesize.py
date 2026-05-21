@@ -573,6 +573,14 @@ def _extract_diff(body: str) -> str | None:
     `--- a/...` header anchored to `job_enrich.py` is present, or the
     diff doesn't include both `--- a/` and `+++ b/` lines, or there's
     no `@@` hunk header.
+
+    Also enforces the ADDITIONS-ONLY constraint at parse time: any
+    hunk-body line beginning with `-` (i.e. a deletion) causes the
+    candidate to be rejected. The patch-proposer prompt asks the model
+    to never emit deletions, but trusting the prompt alone is
+    insufficient — an operator running `git apply` on a smuggled `-`
+    line would silently mutate `_PROMPT`. Headers (`--- a/`, `+++ b/`)
+    are excluded from this check.
     """
     s = (body or "")
     # Lstrip safely (no in-diff content there) but only trim trailing
@@ -606,6 +614,25 @@ def _extract_diff(body: str) -> str | None:
     # Reject the explicit "no patch" sentinel header.
     if re.search(r"^@@ -0,0 \+0,0 @@", diff, flags=re.MULTILINE):
         return None
+    # Enforce additions-only: walk the diff and reject any `-`-prefixed
+    # line that sits inside a hunk body (i.e. between an `@@` header and
+    # the next `@@`/EOF), ignoring the `--- a/...` file header itself.
+    in_hunk = False
+    for line in diff.splitlines():
+        if line.startswith("--- ") or line.startswith("+++ "):
+            in_hunk = False
+            continue
+        if line.startswith("@@"):
+            in_hunk = True
+            continue
+        if not in_hunk:
+            continue
+        if line.startswith("-"):
+            log.info(
+                "audit_patch: reject: diff contains '-' line "
+                "(additions-only constraint violated)"
+            )
+            return None
     return diff + "\n"
 
 
