@@ -614,3 +614,34 @@ def test_extract_diff_accepts_fenced_diff():
     out = aps._extract_diff(fenced)
     assert out is not None
     assert out.startswith("--- a/skill/job-search/scripts/job_enrich.py")
+
+
+def test_extract_diff_rejects_deletion_lines():
+    """The patch-proposer prompt says additions-only, but trusting the
+    prompt isn't enough — the parser must REJECT any candidate whose
+    hunk body contains a `-`-prefixed line. Otherwise an operator
+    running `git apply` would silently mutate `_PROMPT`.
+    """
+    with_deletion = (
+        "--- a/skill/job-search/scripts/job_enrich.py\n"
+        "+++ b/skill/job-search/scripts/job_enrich.py\n"
+        "@@ -7,4 +7,4 @@\n"
+        " DOCTRINE A — NEVER penalize \"overqualification\". Anywhere.\n"
+        "-DOCTRINE B — NEVER stack penalties on the SAME underlying fact.\n"
+        "+DOCTRINE B — Never EVER stack penalties on the SAME upward gap.\n"
+        " DOCTRINE C — Generic titles describing data labeling → score=0.\n"
+        " \n"
+    )
+    assert aps._extract_diff(with_deletion) is None
+
+    # Sanity: the same diff but with the `-` line removed parses fine.
+    additions_only = (
+        "--- a/skill/job-search/scripts/job_enrich.py\n"
+        "+++ b/skill/job-search/scripts/job_enrich.py\n"
+        "@@ -7,3 +7,4 @@\n"
+        " DOCTRINE A — NEVER penalize \"overqualification\". Anywhere.\n"
+        " DOCTRINE B — NEVER stack penalties on the SAME underlying fact.\n"
+        " DOCTRINE C — Generic titles describing data labeling → score=0.\n"
+        "+DOCTRINE D — additional rule.\n"
+    )
+    assert aps._extract_diff(additions_only) is not None
