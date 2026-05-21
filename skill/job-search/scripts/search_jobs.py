@@ -356,6 +356,19 @@ def run(dry_run: bool = False, only_chat: int | None = None, no_send: bool = Fal
             log.info("digest_run_jobs: purged %d rows older than 7 days", purged)
     except Exception:
         log.debug("digest_run_jobs purge raised; continuing", exc_info=True)
+    # Persistent score cache. 30 days is far enough out that a stale
+    # verdict's contribution is mostly noise (the user's profile has
+    # likely changed; a stale row at the old profile_hash is dead
+    # weight anyway). Larger horizon than digest_run_jobs because score
+    # rows are cheap and a hit on a 3-week-old re-run is still a
+    # meaningful win.
+    try:
+        purged_scores = db.purge_job_scores_older_than(30 * 86400)
+        if purged_scores:
+            log.info("job_scores: purged %d rows older than 30 days",
+                     purged_scores)
+    except Exception:
+        log.debug("job_scores purge raised; continuing", exc_info=True)
     job_store = JobStore(db)
     # Telemetry store. Cheap to construct (just wraps db); used in both the
     # dry-run preview path (untelemetered) and the live path (wrapped in
@@ -618,6 +631,8 @@ def run(dry_run: bool = False, only_chat: int | None = None, no_send: bool = Fal
                                 two_pass=bool(filters.get("ai_two_pass", False)),
                                 triage_floor=int(filters.get("ai_triage_floor") or 2),
                                 workers=int(filters.get("ai_enrich_workers") or 4),
+                                db=db,
+                                chat_id=chat_id,
                             )
                             enrichments_by_job_id = by_job_id(raw, user_jobs)
                             # Summary only. Per-verdict detail is emitted as
