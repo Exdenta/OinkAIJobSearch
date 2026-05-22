@@ -106,6 +106,18 @@ DEFAULTS: dict = {
     # 1-2× claude subprocesses at peak.
     "ai_source_workers": 6,
 
+    # Algorithm v2.7 / P2: minimum age (seconds) before a (source, query,
+    # page, location) cell is eligible for re-fetch. Threaded into
+    # linkedin / justjoinit / nofluffjobs / builtin / web_search via
+    # `db.next_page_for`. 21600s = 6h gives the continuous scheduler
+    # (P3, runs every ~2h) three iterations to walk pages 1..N before
+    # circling back to page 1 of a given source — long enough that we
+    # don't burn calls on stale repetition, short enough that fresh
+    # listings re-appear within the day. Per-adapter max_page caps live
+    # in each adapter (linkedin=10, justjoinit/nofluffjobs/builtin=5,
+    # web_search=3).
+    "source_min_revisit_age_s": 21600,
+
     # v2.5 scoring-audit stage. AFTER the digest cards ship, re-grade
     # the score-≥1 verdicts with a second-opinion model (Opus). Catches
     # scoring drift without blocking the user-facing send. Output lands

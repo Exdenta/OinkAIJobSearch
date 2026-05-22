@@ -323,6 +323,16 @@ def post_filter(jobs: list[Job], filters: dict) -> list[Job]:
 
 # ---------- fetch ----------
 
+# Algorithm v2.7 / P2: adapters that accept page-memory cursor kwargs
+# (`db=` / `min_revisit_age_s=`). The cursor lives in the `search_fetches`
+# table; only these three are threaded via the global-pass dispatcher.
+# `linkedin` and `web_search` get the same treatment at their per-user
+# call sites further down. Other adapters (HN, RemoteOK, etc.) don't
+# paginate natively and stay on the cursor-less `mod.fetch(filters)`
+# code path.
+_CURSOR_AWARE_SOURCES = frozenset({"justjoinit", "nofluffjobs", "builtin"})
+
+
 def _fetch_one_source(
     key: str,
     mod,
@@ -330,13 +340,29 @@ def _fetch_one_source(
     *,
     store: MonitorStore | None = None,
     pipeline_run_id: int | None = None,
+    db=None,
 ) -> tuple[str, list[Job], str | None]:
     """Run ONE source adapter inside its telemetry contexts.
 
     Returns (key, jobs, err_str). `err_str=None` on success; string
     summary on failure (adapter exception) — the parallel orchestrator
     collects errors and surfaces them via the legacy `errors` list.
+
+    `db` is forwarded to cursor-aware adapters (`_CURSOR_AWARE_SOURCES`)
+    so they can advance their `search_fetches` cursor; the other adapters
+    keep their legacy `fetch(filters)` signature untouched.
     """
+    min_revisit_age_s = int(filters.get("source_min_revisit_age_s") or 21600)
+
+    def _call_adapter() -> list[Job]:
+        if db is not None and key in _CURSOR_AWARE_SOURCES:
+            return mod.fetch(
+                filters,
+                db=db,
+                min_revisit_age_s=min_revisit_age_s,
+            ) or []
+        return mod.fetch(filters) or []
+
     try:
         with forensic.step(
             f"sources.{key}.fetch",
@@ -344,15 +370,16 @@ def _fetch_one_source(
                 "max_age_hours": filters.get("max_age_hours"),
                 "max_per_source": filters.get("max_per_source"),
                 "sources_enabled": list((filters.get("sources") or {}).keys()),
+                "cursor_enabled": db is not None and key in _CURSOR_AWARE_SOURCES,
             },
             run_id=pipeline_run_id,
         ) as fctx:
             if store is not None and pipeline_run_id is not None:
                 with source_run(store, pipeline_run_id, key) as sctx:
-                    fetched = mod.fetch(filters) or []
+                    fetched = _call_adapter()
                     sctx.set_count(len(fetched))
             else:
-                fetched = mod.fetch(filters) or []
+                fetched = _call_adapter()
             fctx.set_output({
                 "count": len(fetched),
                 "sample_titles": [getattr(j, "title", "")[:80] for j in fetched[:5]],
@@ -369,6 +396,7 @@ def fetch_all(
     *,
     store: MonitorStore | None = None,
     pipeline_run_id: int | None = None,
+    db=None,
 ) -> tuple[list[Job], list[str]]:
     """Fan out to every enabled global source adapter, IN PARALLEL.
 
@@ -417,7 +445,7 @@ def fetch_all(
         for key, mod in tasks:
             _k, fetched, err = _fetch_one_source(
                 key, mod, filters,
-                store=store, pipeline_run_id=pipeline_run_id,
+                store=store, pipeline_run_id=pipeline_run_id, db=db,
             )
             all_jobs.extend(fetched)
             if err is not None:
@@ -428,7 +456,7 @@ def fetch_all(
         futures = [
             pool.submit(
                 _fetch_one_source, key, mod, filters,
-                store=store, pipeline_run_id=pipeline_run_id,
+                store=store, pipeline_run_id=pipeline_run_id, db=db,
             )
             for key, mod in tasks
         ]
@@ -504,7 +532,7 @@ def run(dry_run: bool = False, only_chat: int | None = None, no_send: bool = Fal
 
     # ----- Dry-run preview (no telemetry, no Telegram) --------------------
     if dry_run:
-        jobs_raw, errors = fetch_all(filters)
+        jobs_raw, errors = fetch_all(filters, db=db)
         log.info("Raw fetched across static sources: %d postings", len(jobs_raw))
         new_in_db = job_store.save_all(jobs_raw)
         log.info("DB: %d newly-inserted jobs, %d already known",
@@ -549,7 +577,9 @@ def run(dry_run: bool = False, only_chat: int | None = None, no_send: bool = Fal
         with pipeline_run(store, "daily_digest") as pctx:
             run_id_for_summary = pctx.run_id
 
-            jobs_raw, errors = fetch_all(filters, store=store, pipeline_run_id=pctx.run_id)
+            jobs_raw, errors = fetch_all(
+                filters, store=store, pipeline_run_id=pctx.run_id, db=db,
+            )
             log.info("Raw fetched across static sources: %d postings", len(jobs_raw))
             new_in_db = job_store.save_all(jobs_raw)
             log.info("DB: %d newly-inserted jobs, %d already known",
@@ -649,7 +679,14 @@ def run(dry_run: bool = False, only_chat: int | None = None, no_send: bool = Fal
                             run_id=pctx.run_id,
                         ) as fctx:
                             with source_run(store, pctx.run_id, "linkedin", user_chat_id=chat_id) as li_sctx:
-                                extra_li = linkedin.fetch_for_user(effective, li_seeds) or []
+                                extra_li = linkedin.fetch_for_user(
+                                    effective,
+                                    li_seeds,
+                                    db=db,
+                                    min_revisit_age_s=int(
+                                        effective.get("source_min_revisit_age_s") or 21600
+                                    ),
+                                ) or []
                                 li_sctx.set_count(len(extra_li))
                             fctx.set_output({
                                 "raw_count": len(extra_li),
@@ -693,6 +730,15 @@ def run(dry_run: bool = False, only_chat: int | None = None, no_send: bool = Fal
                                     effective,
                                     user_free_text=free_text or None,
                                     profile_seeds=web_seeds,
+                                    db=db,
+                                    min_revisit_age_s=int(
+                                        effective.get("source_min_revisit_age_s") or 21600
+                                    ),
+                                    # Per-user cursor scope: each user has
+                                    # their own page counter for web_search
+                                    # so the exploration rounds don't bleed
+                                    # across users.
+                                    cursor_key=str(chat_id),
                                 ) or []
                                 ws_sctx.set_count(len(extra))
                             fctx.set_output({
