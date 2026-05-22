@@ -177,12 +177,29 @@ def _parse_offer(item: dict) -> Job | None:
     )
 
 
-def fetch(filters: dict) -> list[Job]:
+# P2 page-memory cursor: cap how far the cursor can walk before wrapping.
+# JustJoin returns 50 offers per page; 5 pages covers the freshest ~250
+# postings per category, which is well beyond what `max_per_source`
+# trims to anyway.
+JUSTJOINIT_MAX_PAGE = 5
+
+
+def fetch(
+    filters: dict,
+    *,
+    db=None,
+    min_revisit_age_s: int = 21600,
+) -> list[Job]:
     """One JSON page per requested category, deduped by slug.
 
     Reads `filters['max_per_source']` for the per-category page size (and the
     final cap). Multiple categories run sequentially; results dedupe by slug.
     Forensic-instrumented per request.
+
+    Cursor mode (`db` provided): each category advances ONE page on the
+    `search_fetches` cursor per call; pages already fetched within
+    `min_revisit_age_s` are skipped (see `db.next_page_for`). Without
+    `db` the adapter always fetches page 1, preserving pre-P2 behaviour.
     """
     cap = int(filters.get("max_per_source") or 30)
     categories = _categories_from_env()
@@ -194,13 +211,34 @@ def fetch(filters: dict) -> list[Job]:
     for cat in categories:
         if len(out) >= cap:
             break
+
+        # Cursor: pick the next page to fetch for this category. Use the
+        # category id as the "query" key so each category has its own
+        # cursor; location is "" (JustJoin is implicitly EU-PL).
+        if db is not None:
+            page_num = db.next_page_for(
+                "justjoinit", str(cat), "",
+                max_page=JUSTJOINIT_MAX_PAGE,
+                min_revisit_age_s=min_revisit_age_s,
+            )
+            if page_num == -1:
+                log.info(
+                    "justjoinit[cat=%s]: all pages 1..%d fresh within %ds — skipping",
+                    cat, JUSTJOINIT_MAX_PAGE, min_revisit_age_s,
+                )
+                continue
+        else:
+            page_num = 1
+
         per_cat_remaining = cap - len(out)
         # JustJoin's API expects array params with bracket syntax
         # (`categories[0]=1`) — single-key `categories=1` returns 400.
+        # `page` is the 1-indexed page selector exposed by the SPA bundle.
         params = [
             ("categories[0]", str(cat)),
             ("perPage", str(min(per_cat_remaining, 50))),
             ("sortBy", "newest"),
+            ("page", str(page_num)),
         ]
         offers: list[dict] = []
         status_code: int | None = None
@@ -224,6 +262,7 @@ def fetch(filters: dict) -> list[Job]:
         status_codes.append(status_code)
 
         added = 0
+        cat_seen_ids: list[str] = []
         for item in offers:
             if len(out) >= cap:
                 break
@@ -234,16 +273,34 @@ def fetch(filters: dict) -> list[Job]:
             job = _parse_offer(item)
             if job is None:
                 continue
+            cat_seen_ids.append(f"justjoinit:{slug}")
             out.append(job)
             added += 1
-        log.info("justjoinit[cat=%s] status=%s offers=%d added=%d (total=%d)",
-                 cat, status_code, len(offers), added, len(out))
+        log.info("justjoinit[cat=%s page=%s] status=%s offers=%d added=%d (total=%d)",
+                 cat, page_num, status_code, len(offers), added, len(out))
+
+        # Record cursor advancement + jobs_seen / jobs_new telemetry.
+        if db is not None:
+            try:
+                existing = db.count_existing_jobs(cat_seen_ids) if cat_seen_ids else 0
+                db.record_fetch(
+                    "justjoinit", str(cat), int(page_num), "",
+                    jobs_seen=len(cat_seen_ids),
+                    jobs_new=max(0, len(cat_seen_ids) - existing),
+                )
+            except Exception:
+                log.debug("justjoinit: db.record_fetch raised; continuing",
+                          exc_info=True)
 
         if forensic is not None:
             try:
                 forensic.log_step(
                     "sources.justjoinit.page",
-                    input={"category": cat, "perPage": dict(params).get("perPage")},
+                    input={
+                        "category": cat,
+                        "perPage": dict(params).get("perPage"),
+                        "page": page_num,
+                    },
                     output={
                         "status_code": status_code,
                         "offers_seen": len(offers),

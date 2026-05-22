@@ -408,10 +408,28 @@ def _parse_jobs_json(text: str) -> list[dict[str, Any]]:
     return [j for j in jobs if isinstance(j, dict)]
 
 
+# P2 page-memory cursor: web_search doesn't paginate natively — Claude
+# runs WebSearch itself and the "page" is purely a counter of exploration
+# rounds. WEB_SEARCH_MAX_PAGE caps how many distinct exploration rounds
+# we'll trigger before wrapping back to page 1.
+WEB_SEARCH_MAX_PAGE = 3
+
+# The cursor "query" key for web_search. The adapter is per-user (called
+# from search_jobs once per user), but a single fetch covers the whole
+# profile — there's no natural per-query split. We use a single cell
+# keyed by ("", "") so the cursor advances once per user per iteration.
+# Per-user differentiation is handled by the caller passing distinct
+# `cursor_key` values (e.g. user chat_id) — see `fetch` below.
+
+
 def fetch(
     filters: dict,
     user_free_text: str | None = None,
     profile_seeds: dict | None = None,
+    *,
+    db=None,
+    min_revisit_age_s: int = 21600,
+    cursor_key: str = "",
 ) -> list[Job]:
     """Invoke the sub-agent and convert its JSON output into Job objects.
 
@@ -431,6 +449,15 @@ def fetch(
     a profile built yet, or the last build failed), the base candidate-profile
     rows at the bottom of the prompt still drive discovery.
 
+    Cursor mode (`db` provided): web_search has no native pagination, so
+    each "page" is an exploration round. Page 1 runs the normal prompt.
+    Pages 2..N pass previously-recorded titles to the sub-agent as an
+    exclusion set and ask Claude to surface DIFFERENT postings. The
+    `cursor_key` argument scopes the cursor to one caller (typically a
+    per-user chat_id) — without it the single global cell hits the
+    refresh window after one round for every user. When `db` is None the
+    adapter runs the standard discovery round and skips the cursor.
+
     Respects two timeouts:
       - `ai_web_search_timeout_s`: if set, used; otherwise
       - `ai_scrape_timeout_s`: shared with curated_boards; default 240s.
@@ -446,11 +473,51 @@ def fetch(
         or 240
     )
 
+    # Cursor: pick the exploration round. Page 1 = fresh prompt; page N>1
+    # asks Claude to surface different listings than the prior rounds.
+    page_num = 1
+    if db is not None:
+        page_num = db.next_page_for(
+            "web_search", str(cursor_key or ""), "",
+            max_page=WEB_SEARCH_MAX_PAGE,
+            min_revisit_age_s=min_revisit_age_s,
+        )
+        if page_num == -1:
+            log.info(
+                "web_search[%s]: all pages 1..%d fresh within %ds — skipping",
+                cursor_key, WEB_SEARCH_MAX_PAGE, min_revisit_age_s,
+            )
+            return []
+
     prompt = _build_prompt(
         filters,
         user_free_text=user_free_text,
         profile_seeds=profile_seeds,
     )
+
+    # Cursor mode, page > 1: prepend an exclusion preamble that lists the
+    # URLs already returned on previous rounds (drawn from `search_fetches`
+    # via the `jobs` table — `db.count_existing_jobs` only counts; we need
+    # the URL list). The sub-agent is told to surface DIFFERENT postings
+    # this round so multiple iterations actually explore new territory
+    # instead of re-rolling the same Claude search.
+    if db is not None and page_num > 1:
+        try:
+            prior_titles = _recent_web_search_titles(db, limit=40)
+        except Exception:
+            prior_titles = []
+        if prior_titles:
+            exclusion = (
+                "=== EXPLORATION ROUND {page} ===\n"
+                "Prior rounds for this user already surfaced the postings below. "
+                "SKIP any of these URLs / titles; favour different companies, "
+                "different ATS hosts, different role phrasings:\n"
+                "{titles}\n\n"
+            ).format(
+                page=page_num,
+                titles="\n".join(f"  - {t}" for t in prior_titles[:40]),
+            )
+            prompt = exclusion + prompt
     # Use the tool-aware wrapper: WebSearch + WebFetch must be explicitly
     # allowed or the CLI rejects every tool_use and the agent gives up with
     # an empty jobs list.
@@ -526,4 +593,48 @@ def fetch(
             )
         except Exception:
             log.exception("web_search: detail-page fetch raised; continuing")
+
+    # Cursor advancement + jobs_seen / jobs_new telemetry. Done last so
+    # `out` reflects the post-dedupe / post-body-fetch state.
+    if db is not None:
+        try:
+            seen_ids = [f"web_search:{j.url}" for j in out if j.url]
+            existing = db.count_existing_jobs(seen_ids) if seen_ids else 0
+            db.record_fetch(
+                "web_search", str(cursor_key or ""), int(page_num), "",
+                jobs_seen=len(seen_ids),
+                jobs_new=max(0, len(seen_ids) - existing),
+            )
+        except Exception:
+            log.debug("web_search: db.record_fetch raised; continuing",
+                      exc_info=True)
     return out
+
+
+def _recent_web_search_titles(db, limit: int = 40) -> list[str]:
+    """Pull the most-recent web_search posting URLs from the jobs table.
+
+    Used by the exploration-round preamble (page>1) to ask Claude for
+    NEW results. We use URLs (not titles) because URLs are unambiguous
+    while titles repeat across companies; the sub-agent treats the list
+    as a literal block-list. Falls back to an empty list on any DB
+    error — the cursor advances regardless.
+    """
+    try:
+        # Hand-rolled SQL to avoid adding another bespoke DB method for
+        # one caller. `jobs` is small and `first_seen_at` indexed by PK
+        # only — a 40-row LIMIT scan over a single source is cheap.
+        with db._conn() as c:  # noqa: SLF001 — intentional internal use
+            rows = c.execute(
+                """
+                SELECT url
+                  FROM jobs
+                 WHERE source = 'web_search' AND url IS NOT NULL AND url <> ''
+                 ORDER BY first_seen_at DESC
+                 LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        return [r["url"] for r in rows if r["url"]]
+    except Exception:
+        return []
