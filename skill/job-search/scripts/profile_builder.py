@@ -89,7 +89,15 @@ _MAX_RESUME_CHARS = 8000   # the resume fed into the prompt is clipped
 _MAX_TITLE_TOKEN = 40
 _MAX_LINKEDIN_Q = 80
 _MAX_SEED_PHRASE = 120
-_MAX_LINKEDIN_QUERIES = 5
+# Lifted from 5 → 10 (P6-T2 2026-05-23): on a single 1h run the
+# continuous searcher only delivers ~0.3% of LinkedIn candidates above
+# the score-≥4 floor, partly because 5 queries × N geos was too narrow
+# a candidate pool. Opus now picks 8-12 queries (primary-stack variants
+# + secondary-stack + adjacent-role titles + one remote-only variant),
+# and the cross-product still trims to MAX_LINKEDIN_DISPATCHES in
+# `sources/linkedin.py`. Existing 5-query user profiles stay valid —
+# back-compat: old shapes pass `_validate_linkedin_seeds` unchanged.
+_MAX_LINKEDIN_QUERIES = 10
 _MAX_SEED_PHRASES = 12
 
 # Location of the external prompt files.

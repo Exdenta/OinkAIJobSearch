@@ -153,13 +153,13 @@ bad_cases = [
          "web_search": {"seed_phrases": ["x"], "ats_domains": ["evil.example"], "focus_notes": ""},
      }),
      "ats_domains contains disallowed"),
+    # _MAX_LINKEDIN_QUERIES = 10 (P6-T2 bump). 11 entries must trip the
+    # length guard. If you bump the constant again, raise this list too.
     ("linkedin.queries too many",
      lambda: _with(search_seeds={
          "linkedin": {"queries": [
-             {"q": "a", "geo": "Spain", "f_TPR": "r86400"},
-             {"q": "b", "geo": "Spain", "f_TPR": "r86400"},
-             {"q": "c", "geo": "Spain", "f_TPR": "r86400"},
-             {"q": "d", "geo": "Spain", "f_TPR": "r86400"},
+             {"q": f"q{i}", "geo": "Spain", "f_TPR": "r86400"}
+             for i in range(11)
          ]},
          "web_search": {"seed_phrases": [], "ats_domains": [], "focus_notes": ""},
      }),
@@ -383,14 +383,16 @@ dirty["search_seeds"]["linkedin"]["queries"] = [
 
 clean = _clip_profile(dirty)
 check(len(clean["free_text"]) <= 500, "free_text clipped to 500 chars")
-check(len(clean["search_seeds"]["web_search"]["seed_phrases"]) <= 8,
-      "seed_phrases clipped to 8")
+check(len(clean["search_seeds"]["web_search"]["seed_phrases"])
+      <= pb._MAX_SEED_PHRASES,
+      f"seed_phrases clipped to {pb._MAX_SEED_PHRASES}")
 check(
     clean["search_seeds"]["web_search"]["ats_domains"] == ["greenhouse.io", "lever.co"],
     "bad ATS domains stripped",
 )
-check(len(clean["search_seeds"]["linkedin"]["queries"]) == 3,
-      "linkedin.queries clipped to 3")
+# 4 input queries < _MAX_LINKEDIN_QUERIES (10) → no clip; 4 remain.
+check(len(clean["search_seeds"]["linkedin"]["queries"]) == 4,
+      "linkedin.queries kept at 4 (below cap)")
 
 
 # ---------------------------------------------------------------------------
