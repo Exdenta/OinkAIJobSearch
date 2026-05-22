@@ -1321,6 +1321,41 @@ class DB:
             ).fetchone()
             return row is not None
 
+    def user_seen_jobs(
+        self, chat_id: int, job_ids: Iterable[str],
+    ) -> set[str]:
+        """Bulk variant of `user_has_seen_job`.
+
+        Returns the subset of `job_ids` that already appear in
+        `sent_messages` for this `chat_id`. Used by the quality-buffer
+        flush path to defensively drop any queue entry that was already
+        delivered (e.g. in a parallel run) so the row gets cleared
+        instead of lingering forever and inflating queue depth.
+        """
+        ids = [str(j) for j in job_ids if j]
+        if not ids:
+            return set()
+        out: set[str] = set()
+        # Same chunking pattern as `get_jobs_by_ids` / `get_cached_scores`
+        # — stay under SQLite's host-parameter cap on older builds.
+        chunk_size = 500
+        with self._conn() as c:
+            for start in range(0, len(ids), chunk_size):
+                chunk = ids[start:start + chunk_size]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = c.execute(
+                    f"""
+                    SELECT DISTINCT job_id
+                      FROM sent_messages
+                     WHERE chat_id = ?
+                       AND job_id IN ({placeholders})
+                    """,
+                    (int(chat_id), *chunk),
+                ).fetchall()
+                for r in rows:
+                    out.add(r["job_id"])
+        return out
+
     # ---------- posting_clicks (View-posting redirector analytics) ----------
 
     def record_posting_click(
