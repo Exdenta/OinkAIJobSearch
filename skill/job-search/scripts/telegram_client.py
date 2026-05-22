@@ -714,15 +714,23 @@ def _url_is_real_posting(url: str, job_source: str) -> tuple[bool, str]:
 # regardless of whether the posting is open. The age gate only helps when
 # `posted_at` is populated.
 #
-# This gate runs ONLY for `source == "web_search"` postings that survived
-# every cheaper gate (age, HEAD liveness, forum). It spawns a Claude
-# subprocess with WebFetch + WebSearch and asks the agent to decide:
+# This gate runs for postings that survived every cheaper gate (age,
+# HEAD liveness, forum). It first checks the URL shape against a
+# closed-set of known ATS soft-404 surrogate patterns (Workable
+# /oops, ?not_found=true, Lever/Greenhouse/Ashby index pages, LinkedIn
+# /jobs/search/ redirects) — see `_url_pattern_is_soft_404`. Hits drop
+# immediately, saving a Claude call.
+#
+# If the URL passes the structural check, we spawn a Claude subprocess
+# with WebFetch + WebSearch and ask the agent to decide:
 #   - "open"    — page shows Apply / role is on company's current board.
 #   - "closed"  — page says position closed / not on current board.
 #   - "unknown" — page is empty/blocked, web search inconclusive.
 #
-# Drop on "closed". Pass on "open". Skip on "unknown" (NEVER drop on
-# uncertainty). Set WEB_SEARCH_VERIFY_OFF=1 to disable the gate.
+# Drop on "closed" AND on "unknown" (fail-safe — P6-T4 reversal of the
+# original "skip on unknown" policy after three soft-404s shipped to a
+# user with the verifier returning None). Pass only on "open". Set
+# WEB_SEARCH_VERIFY_OFF=1 to disable the gate entirely.
 
 WEB_SEARCH_VERIFY_OFF: bool = os.environ.get("WEB_SEARCH_VERIFY_OFF", "").strip() not in (
     "", "0", "false", "False",
@@ -918,8 +926,9 @@ def _web_search_listing_still_open(
     Returns ``(True, "ok")`` if the agent confirms the listing is open,
     ``(False, "closed:<short reason>")`` if the agent says closed, and
     ``(None, "unknown:<short reason>")`` on any uncertainty (CLI missing,
-    timeout, parse failure, agent unsure). Callers must treat ``None`` as
-    "skip / let through" — we never drop a posting on uncertainty alone.
+    timeout, parse failure, agent unsure). As of P6-T4 the prefilter
+    gate at the call site drops on BOTH False and None — see
+    `prefilter_for_send` for the fail-safe policy reversal.
     """
     if not (job.url or "").strip():
         return (None, "unknown:no_url")
@@ -2077,23 +2086,103 @@ def prefilter_for_send(
                 continue
 
         if not WEB_SEARCH_VERIFY_OFF and (job.url or "").strip():
+            # B. Pre-LLM structural soft-404 check. Match the FINAL URL
+            # (after HEAD redirects) against the closed-set of known ATS
+            # surrogate shapes. A hit drops the job WITHOUT spending a
+            # Claude verifier call. The check is operator-disable-able
+            # via WEB_SEARCH_SOFT_404_GATE_OFF=1 for debugging.
+            if not WEB_SEARCH_SOFT_404_GATE_OFF:
+                final_url = _resolve_final_url(
+                    job.url, timeout_s=URL_VALIDATION_TIMEOUT_S,
+                ) or job.url
+                is_soft, soft_reason = _url_pattern_is_soft_404(final_url)
+                if is_soft:
+                    web_search_closed_count += 1
+                    if forensic is not None:
+                        forensic.log_step(
+                            "telegram.web_search_closed",
+                            input={
+                                "job_id": job.job_id, "source": job.source,
+                                "url": job.url, "final_url": final_url,
+                                "title": (job.title or "")[:120],
+                            },
+                            output={
+                                "reason": soft_reason,
+                                "gate": "soft_404_pattern",
+                            },
+                            chat_id=chat_id,
+                        )
+                    log.info(
+                        "prefilter_for_send: dropping %s (soft-404 pattern) — %s",
+                        job.job_id, soft_reason,
+                    )
+                    continue
+
             ws_status, ws_reason = _web_search_listing_still_open(
                 job, timeout_s=WEB_SEARCH_VERIFY_TIMEOUT_S,
             )
-            if ws_status is False:
+            # C. Forensic entry for EVERY verifier verdict (open / closed
+            # / unknown) so post-hoc analysis can see what the verifier
+            # said for each posting, not just the drops. Op name
+            # `telegram.listing_verify` is new in P6-T4; the old
+            # `telegram.web_search_closed` event continues to fire on
+            # actual drops for operator-grep backward compat.
+            if forensic is not None:
+                if ws_status is True:
+                    verify_status = "open"
+                elif ws_status is False:
+                    verify_status = "closed"
+                else:
+                    verify_status = "unknown"
+                forensic.log_step(
+                    "telegram.listing_verify",
+                    input={
+                        "job_id": job.job_id, "source": job.source,
+                        "url": job.url, "title": (job.title or "")[:120],
+                    },
+                    output={"status": verify_status, "reason": ws_reason},
+                    chat_id=chat_id,
+                )
+            # A. Fail-safe gate: drop on both False (verifier says
+            # closed) and None (verifier uncertain / CLI failure / parse
+            # failure). Yesterday three soft-404 URLs shipped to a user
+            # because the gate only dropped on False — `None` outcomes
+            # leaked through. Reversal in policy: bias toward dropping
+            # uncertain web_search postings rather than shipping a
+            # potentially dead URL.
+            if ws_status is not True:
                 web_search_closed_count += 1
                 if forensic is not None:
                     forensic.log_step(
-                        "telegram.web_search_closed",
+                        # Discriminate by op name so operator greps for
+                        # the old `telegram.web_search_closed` still
+                        # find "verifier said closed" drops, while the
+                        # new `telegram.web_search_uncertain` surfaces
+                        # the fail-safe drops separately.
+                        "telegram.web_search_closed" if ws_status is False
+                        else "telegram.web_search_uncertain",
                         input={
                             "job_id": job.job_id, "source": job.source,
                             "url": job.url, "title": (job.title or "")[:120],
                         },
-                        output={"reason": ws_reason},
+                        output={
+                            "reason": ws_reason,
+                            "verdict": (
+                                "closed" if ws_status is False else "uncertain"
+                            ),
+                        },
                         chat_id=chat_id,
                     )
-                log.info("prefilter_for_send: dropping %s (listing closed) — %s",
-                         job.job_id, ws_reason)
+                if ws_status is False:
+                    log.info(
+                        "prefilter_for_send: dropping %s (listing closed) — %s",
+                        job.job_id, ws_reason,
+                    )
+                else:
+                    log.info(
+                        "prefilter_for_send: dropping %s (listing uncertain) — %s",
+                        job.job_id, ws_reason,
+                    )
                 continue
 
         alive_jobs.append(job)
