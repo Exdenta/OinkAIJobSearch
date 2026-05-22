@@ -393,6 +393,18 @@ class DB:
         if "email_verified_at" not in have_cols:
             c.execute("ALTER TABLE users ADD COLUMN email_verified_at REAL")
 
+        # Auto-rebuild counter (algorithm v2.8, P4 pipeline overhaul).
+        # Bumped on every `append_skip_note` call; the searcher checks
+        # it after each iteration and kicks off a profile rebuild once
+        # the count crosses `auto_rebuild_skip_threshold`. Reset to 0
+        # on successful rebuild. See `bump_skip_events`,
+        # `get_skip_events_since_rebuild`, `reset_skip_events`.
+        if "skip_events_since_rebuild" not in have_cols:
+            c.execute(
+                "ALTER TABLE users ADD COLUMN "
+                "skip_events_since_rebuild INTEGER NOT NULL DEFAULT 0"
+            )
+
         # Refresh; the ADD COLUMN statements above may have changed things.
         have_cols = {r["name"] for r in c.execute("PRAGMA table_info(users)")}
 
@@ -623,6 +635,10 @@ class DB:
         Algorithm v2.2: dual-writes to prefs.txt via
         `user_files.append_skip_note` so the scorer (which reads the
         file) sees the same accumulated rejection signal the DB carries.
+
+        Algorithm v2.8 (P4): also bumps `skip_events_since_rebuild` so
+        the searcher can detect when the user has accumulated enough new
+        rejection signal to justify an Opus profile rebuild.
         """
         t = (text or "").strip()
         if not t:
@@ -641,7 +657,9 @@ class DB:
                     lines.pop(0)
                 joined = "\n".join(lines)
             c.execute(
-                "UPDATE users SET skip_notes_text = ? WHERE chat_id = ?",
+                "UPDATE users SET skip_notes_text = ?, "
+                "skip_events_since_rebuild = COALESCE(skip_events_since_rebuild, 0) + 1 "
+                "WHERE chat_id = ?",
                 (joined, chat_id),
             )
         try:
@@ -655,6 +673,31 @@ class DB:
             logging.getLogger(__name__).debug(
                 "append_skip_note: file mirror write failed; "
                 "DB row already updated", exc_info=True,
+            )
+
+    def get_skip_events_since_rebuild(self, chat_id: int) -> int:
+        """Return the count of skip-feedback events since the last profile
+        rebuild for this user. 0 when the row doesn't exist or the column
+        is NULL (legacy rows pre-migration)."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT skip_events_since_rebuild FROM users "
+                "WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchone()
+        if row is None:
+            return 0
+        return int(row["skip_events_since_rebuild"] or 0)
+
+    def reset_skip_events_since_rebuild(self, chat_id: int) -> None:
+        """Zero the auto-rebuild counter. Called after a successful
+        profile rebuild so the next K events trigger the NEXT rebuild,
+        not the same one again."""
+        with self._conn() as c:
+            c.execute(
+                "UPDATE users SET skip_events_since_rebuild = 0 "
+                "WHERE chat_id = ?",
+                (chat_id,),
             )
 
     def get_skip_notes_text(self, chat_id: int) -> str | None:

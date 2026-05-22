@@ -346,6 +346,80 @@ _COOLDOWN_LOW_CYCLES_BEFORE_DEMOTE = 3
 _COOLDOWN_NOVELTY_WINDOW_S = 24 * 3600
 
 
+def _maybe_auto_rebuild_profile(
+    db,
+    chat_id: int,
+    *,
+    threshold: int,
+    _trigger_rebuild=None,    # injected in tests
+) -> bool:
+    """Kick off a profile rebuild iff the user has accumulated ≥ threshold
+    skip-feedback events since the last rebuild.
+
+    Algorithm v2.8 / P4 pipeline overhaul.
+
+    Reads `db.get_skip_events_since_rebuild(chat_id)`. When the counter
+    is at or above the threshold, calls `profile_builder.rebuild_profile`
+    synchronously (it's already ~30-60s of Opus time; spawning a thread
+    just to fire-and-forget would race against the next iteration's
+    enrichment, which reads the freshly-written profile). On a
+    SUCCESSFUL rebuild (BuildResult.status == 'ok'), zeroes the counter
+    so the NEXT K events trigger the NEXT rebuild — not a re-run of
+    the same one.
+
+    Critical detail: on FAILURE the counter is NOT reset, so a transient
+    CLI / timeout / schema-validation hiccup doesn't silently consume
+    K events. The next iteration retries the rebuild against the same
+    counter value.
+
+    Returns True iff a rebuild was triggered and succeeded.
+    """
+    if db is None or threshold <= 0:
+        return False
+    try:
+        count = int(db.get_skip_events_since_rebuild(chat_id) or 0)
+    except Exception:
+        log.debug(
+            "_maybe_auto_rebuild_profile: get_skip_events_since_rebuild "
+            "failed for chat=%s", chat_id, exc_info=True,
+        )
+        return False
+    if count < threshold:
+        return False
+
+    if _trigger_rebuild is None:
+        from profile_builder import rebuild_profile as _trigger_rebuild  # noqa: WPS433
+
+    try:
+        result = _trigger_rebuild(db, chat_id)
+        status = getattr(result, "status", "exception")
+    except Exception as e:
+        log.exception(
+            "auto-rebuild: rebuild_profile raised for chat=%s: %s",
+            chat_id, e,
+        )
+        log.info(
+            "auto-rebuild: chat_id=%d triggered after %d skip events; "
+            "status=exception",
+            chat_id, count,
+        )
+        return False
+
+    log.info(
+        "auto-rebuild: chat_id=%d triggered after %d skip events; status=%s",
+        chat_id, count, status,
+    )
+    if status == "ok":
+        try:
+            db.reset_skip_events_since_rebuild(chat_id)
+        except Exception:
+            log.exception(
+                "auto-rebuild: counter reset failed for chat=%s", chat_id,
+            )
+        return True
+    return False
+
+
 def should_run_source(
     db,
     source: str,
@@ -1364,6 +1438,30 @@ def run(
                         log.exception("User %s: scoring audit raised; "
                                       "continuing", chat_id)
                 # -----------------------------------------------------
+
+                # Auto profile rebuild (algorithm v2.8 / P4). If the
+                # user has accumulated ≥ K skip-feedback events since
+                # the last rebuild, kick a fresh Opus build now. Runs
+                # at most once per iteration per user; on a transient
+                # failure the counter stays and the next iteration
+                # retries. No-send / dry-run paths still fire — the
+                # rebuild is independent of digest delivery and writes
+                # to the profile, which downstream iterations need.
+                try:
+                    auto_thr = int(
+                        filters.get("auto_rebuild_skip_threshold") or 5
+                    )
+                except (TypeError, ValueError):
+                    auto_thr = 5
+                try:
+                    _maybe_auto_rebuild_profile(
+                        db, chat_id, threshold=auto_thr,
+                    )
+                except Exception:
+                    log.exception(
+                        "User %s: auto-rebuild check raised; continuing",
+                        chat_id,
+                    )
 
             stats["jobs_sent_total"] = total_sent
             log.info(
