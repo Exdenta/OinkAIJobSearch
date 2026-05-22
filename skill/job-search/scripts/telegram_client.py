@@ -1943,6 +1943,7 @@ def send_per_job_digest(
     lower_count_at_step: int = 0,
     skip_header: bool = False,
     pre_filtered: bool = False,
+    force_empty_card: bool = False,
 ) -> int:
     """Send one message per job, each with its own inline keyboard.
 
@@ -1998,6 +1999,15 @@ def send_per_job_digest(
     are legitimately discussion-style (``hackernews``) are exempted by
     source. Set ``FORUM_FILTER_OFF=1`` to skip the gate entirely.
 
+    ``force_empty_card`` (default ``False``, added in P5): when no jobs
+    survive the prefilter (or the caller passed ``jobs=[]``), this
+    function returns 0 immediately and sends NOTHING — no pig sticker,
+    no header card. Set ``force_empty_card=True`` to restore the legacy
+    behavior of shipping the NO_MATCHES pig + a "0 jobs" header even on
+    empty input (useful for daily-digest cron flows that want a daily
+    heartbeat in the chat). Continuous-mode callers always leave this
+    at ``False`` so quiet hours stay quiet.
+
     Returns number of messages sent.
     """
     msg_cfg = cfg.get("message", {})
@@ -2045,6 +2055,22 @@ def send_per_job_digest(
     dead_url_count = drop_counts.get("dead_url_count", 0)
     forum_url_count = drop_counts.get("forum_url_count", 0)
     web_search_closed_count = drop_counts.get("web_search_closed_count", 0)
+
+    # ----------------------------------------------------------------
+    # P5 empty-input guard: in continuous-mode the orchestrator may call
+    # this function with an empty job list (e.g. when the quality buffer
+    # holds). We do NOT want to ship the NO_MATCHES pig + a "0 jobs"
+    # header card every hour — that's spam. Bail out cleanly here unless
+    # the caller explicitly opted into the legacy empty-card behavior
+    # via `force_empty_card=True`. All existing callers default to
+    # False so they get the new no-spam behavior for free.
+    # ----------------------------------------------------------------
+    if not alive_jobs and not jobs and not force_empty_card:
+        log.info(
+            "send_per_job_digest: no jobs to send for chat_id=%s — "
+            "skipping (force_empty_card=False)", chat_id,
+        )
+        return 0
 
     # ----------------------------------------------------------------
     # Pig sticker decision — moved inline so it reflects the ALIVE count,
