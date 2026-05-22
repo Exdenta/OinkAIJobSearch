@@ -328,6 +328,68 @@ def test_flush_purges_leaked_queue_rows(tmp_db):
     assert j_handled.job_id not in surviving
 
 
+def test_flush_hydrates_enrichments_from_cache(tmp_db):
+    """Round 2 regression: buffered jobs enqueued in a PRIOR run have
+    no entry in this iteration's `enrichments_by_job_id` (upstream
+    `filter_new_for` excluded them, so `enrich_jobs_ai` never ran).
+    The send fanout must hydrate them from `job_scores` (T2 cache)
+    before calling `send_per_job_digest`, otherwise the cards ship
+    with no ⭐ score, no why-match, no key-details.
+
+    This test mirrors the hydration step rather than calling
+    `search_jobs.run` end-to-end (which would require Telegram + I/O
+    stubs). It seeds the queue + cache then asserts the same logic
+    that lives in the orchestrator: after the flush, every buffered
+    job has a `match_score` and `why_match` in the hydrated
+    enrichments dict.
+    """
+    chat_id = 51
+    phash = db_module.profile_hash("resume", "prefs")
+    filters = _filters(threshold=5, max_hours=48.0)
+
+    # Five jobs were scored + queued in a previous run; their verdicts
+    # are persisted in `job_scores` for this user/profile.
+    jobs = [_make_job("linkedin", f"old_run_j{n}") for n in range(5)]
+    cached_scores: dict[str, dict] = {}
+    for n, j in enumerate(jobs):
+        _save_job(tmp_db, j)
+        cached_scores[j.job_id] = {
+            "match_score": 4 + (n % 2),  # mix of 4 and 5
+            "why_match": f"why for {j.external_id}",
+            "why_mismatch": "",
+            "key_details": {"role": "Engineer"},
+            "model": "sonnet",
+        }
+        tmp_db.enqueue_match(chat_id, j.job_id, phash, cached_scores[j.job_id]["match_score"])
+    tmp_db.upsert_scores(chat_id, phash, cached_scores, model="sonnet")
+
+    # Decide the flush — depth 5 hits the threshold of 5.
+    out_jobs, flush, depth, _age = search_jobs._decide_buffer_flush(
+        tmp_db, chat_id, [], {}, phash, filters,
+    )
+    assert flush is True
+    assert depth == 5
+    assert {j.job_id for j in out_jobs} == {j.job_id for j in jobs}
+
+    # Now apply the hydration logic from the orchestrator. This run had
+    # no upstream enrichments because every queued id was excluded by
+    # `filter_new_for` (they were processed in the prior run).
+    enrichments_by_job_id: dict[str, dict] = {}
+    buffered_ids = [
+        j.job_id for j in out_jobs
+        if j.job_id not in enrichments_by_job_id
+    ]
+    assert len(buffered_ids) == 5
+    cached = tmp_db.get_cached_scores(chat_id, buffered_ids, phash)
+    enrichments_by_job_id.update(cached)
+
+    # All 5 ids must be present, each with a populated score + why_match.
+    assert set(enrichments_by_job_id) == {j.job_id for j in jobs}
+    for jid, enr in enrichments_by_job_id.items():
+        assert enr["match_score"] in (4, 5)
+        assert enr["why_match"].startswith("why for ")
+
+
 def test_leak_purge_runs_on_hold_path(tmp_db):
     """Even when the flush threshold isn't met, leak rows (handled /
     missing / already-sent) must be purged so they don't permanently

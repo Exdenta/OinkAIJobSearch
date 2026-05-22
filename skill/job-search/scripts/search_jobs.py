@@ -914,6 +914,54 @@ def run(dry_run: bool = False, only_chat: int | None = None, no_send: bool = Fal
                         # contents so the digest reflects what actually
                         # ships.
                         user_jobs = buffer_jobs
+                        # Hydrate enrichments for any buffered job that
+                        # was enqueued in a PRIOR run — that run's
+                        # `enrichments_by_job_id` is gone (this iter's
+                        # `filter_new_for` excluded those ids from
+                        # `user_jobs`, so `enrich_jobs_ai` never ran on
+                        # them). Without this fill, the cards ship with
+                        # no ⭐ score, no why-match, no key-details.
+                        #
+                        # `purge_stale_queue` already ran inside
+                        # `_decide_buffer_flush`, so every surviving
+                        # buffer row shares the user's CURRENT
+                        # profile_hash. `job_scores` is keyed by
+                        # (chat_id, profile_hash, job_id) → the lookup
+                        # below is a clean hit by construction.
+                        buffered_ids = [
+                            j.job_id for j in user_jobs
+                            if j.job_id not in enrichments_by_job_id
+                        ]
+                        if buffered_ids:
+                            try:
+                                cached = db.get_cached_scores(
+                                    chat_id, buffered_ids, user_profile_hash,
+                                )
+                            except Exception:
+                                log.warning(
+                                    "User %s: get_cached_scores failed during "
+                                    "buffer hydration; cards may ship without "
+                                    "enrichments", chat_id, exc_info=True,
+                                )
+                                cached = {}
+                            enrichments_by_job_id.update(cached)
+                            missing = [
+                                jid for jid in buffered_ids if jid not in cached
+                            ]
+                            if missing:
+                                # Defensive: shouldn't happen given the
+                                # profile_hash invariant above, but log
+                                # so we notice if it does. Cards still
+                                # ship — the format path tolerates a
+                                # missing enrichment entry.
+                                log.warning(
+                                    "User %s: %d buffered job(s) had no "
+                                    "cached score under profile_hash=%s; "
+                                    "shipping without enrichment: %s",
+                                    chat_id, len(missing),
+                                    user_profile_hash[:8],
+                                    missing[:5],
+                                )
                 # Header floor reflects the gate that actually fired (user
                 # value if set, otherwise the global default). Surfacing 0
                 # would hide the ⬆ button and lie about what was filtered.
