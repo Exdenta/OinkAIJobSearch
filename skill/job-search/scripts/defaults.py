@@ -189,6 +189,10 @@ DEFAULTS: dict = {
         "include_snippet": True,
         "snippet_chars":   260,
         # Send a "nothing new" ping on empty days so the chat stays alive.
+        # NOTE (P5, v2.6 continuous mode): this knob has NO effect on the
+        # quality-buffer hold branch in search_jobs.run — empty sends are
+        # always suppressed there. Retained for back-compat with operators
+        # who may set it for other reasons.
         "quiet_if_empty":  False,
     },
 

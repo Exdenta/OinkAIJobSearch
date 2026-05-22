@@ -1189,13 +1189,44 @@ def run(
                             int(filters.get("quality_send_threshold", 5)),
                             buffer_oldest_age / 3600.0,
                         )
-                        if quiet:
-                            continue
-                        # When `quiet_if_empty` is off the operator still
-                        # wants the per-user summary; the audit stage at
-                        # the bottom of the loop is harmless on an empty
-                        # send.
-                        user_jobs = []
+                        # P5: in continuous mode the buffer holds nearly
+                        # every iteration. We unconditionally skip the
+                        # per-user send block here so the user never
+                        # receives an empty digest (pig sticker + "0 jobs"
+                        # header card). The `quiet_if_empty` config knob
+                        # is retained in defaults.py for back-compat but
+                        # has NO effect on this branch — empty sends are
+                        # always suppressed on hold.
+                        #
+                        # The v2.5 scoring audit (further down the loop)
+                        # is intentionally SKIPPED on a hold iteration:
+                        # the cards never shipped, so logging
+                        # `scoring_audit.review` entries would falsely
+                        # suggest a send happened. The audit will run on
+                        # the next flush iteration when the enrichments
+                        # are paired with actual delivery.
+                        #
+                        # The auto profile-rebuild check (also further
+                        # down) IS independent of digest delivery and
+                        # should still fire on hold so the skip-feedback
+                        # counter eventually triggers a rebuild even
+                        # during long quiet stretches.
+                        try:
+                            auto_thr = int(
+                                filters.get("auto_rebuild_skip_threshold") or 5
+                            )
+                        except (TypeError, ValueError):
+                            auto_thr = 5
+                        try:
+                            _maybe_auto_rebuild_profile(
+                                db, chat_id, threshold=auto_thr,
+                            )
+                        except Exception:
+                            log.exception(
+                                "User %s: auto-rebuild check raised on "
+                                "buffer-hold; continuing", chat_id,
+                            )
+                        continue
                     else:
                         # Hand the rehydrated, ordered queue downstream
                         # as the final send list. `user_jobs` was the
