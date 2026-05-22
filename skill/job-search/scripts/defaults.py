@@ -209,4 +209,19 @@ DEFAULTS: dict = {
     #     pin the searcher in a hot loop.
     "continuous_interval_seconds": 7200,
     "continuous_min_sleep_seconds":  60,
+
+    # Adaptive source cooldown (algorithm v2.8, P4 pipeline overhaul).
+    # `fetch_all` reads each source's 24h novelty ratio (jobs_new /
+    # jobs_seen across the last 24h of `search_fetches` rows) and, when
+    # the ratio has stayed below this threshold for 3 consecutive
+    # iterations, demotes the source to half-frequency — runs only on
+    # odd cycle_index. Recovery is immediate: one cycle above threshold
+    # flips the source back to 'normal'.
+    #
+    # 0.05 (5%) means "if fewer than 5% of jobs are new per fetch, the
+    # source is wasting tokens." Raise to be more aggressive (cool down
+    # more sources); lower to be more permissive. 0.0 effectively
+    # disables the gate. See `search_jobs.should_run_source` for the
+    # full FSM.
+    "source_low_novelty_threshold": 0.05,
 }

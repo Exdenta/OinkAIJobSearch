@@ -207,8 +207,17 @@ class ContinuousSearcher:
         wrapped in an executor and so subclasses can intercept the call.
         Kwargs are kept narrow on purpose — see the report for the
         single-user-MVP rationale.
+
+        Threads ``cycle_index=self._iterations`` so the P4 source-cooldown
+        FSM in ``search_jobs.fetch_all`` can alternate ``half_freq`` sources
+        on even/odd iterations. The continuous searcher is the natural
+        owner of this counter; daily-cron callers pass nothing and get the
+        default (0).
         """
-        return self._search_run(only_chat=self._chat_id)
+        return self._search_run(
+            only_chat=self._chat_id,
+            cycle_index=self._iterations,
+        )
 
     def _next_sleep(self, elapsed: float) -> float:
         """Return how long to sleep after an iteration that took `elapsed`s.

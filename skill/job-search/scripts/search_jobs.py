@@ -333,6 +333,125 @@ def post_filter(jobs: list[Job], filters: dict) -> list[Job]:
 _CURSOR_AWARE_SOURCES = frozenset({"justjoinit", "nofluffjobs", "builtin"})
 
 
+# Adaptive source cooldown (algorithm v2.8 / P4 pipeline overhaul).
+# Demotion fires only after this many consecutive checks in which the
+# source's 24h novelty ratio sits below `low_novelty_threshold`. One
+# quiet iteration is not enough — sources naturally have lulls.
+_COOLDOWN_LOW_CYCLES_BEFORE_DEMOTE = 3
+
+# Window the cooldown decision reads novelty over. 24h matches the
+# operator's expectation of "is this source still useful TODAY?" while
+# still being long enough that a short outage doesn't immediately
+# demote a productive source.
+_COOLDOWN_NOVELTY_WINDOW_S = 24 * 3600
+
+
+def should_run_source(
+    db,
+    source: str,
+    *,
+    cycle_index: int,
+    low_novelty_threshold: float = 0.05,
+) -> bool:
+    """Decide if `source` should fire this iteration.
+
+    Reads novelty over the last 24h via `db.source_novelty_ratio`. The
+    finite-state machine:
+
+      * If novelty >= ``low_novelty_threshold`` → state becomes 'normal',
+        ``consecutive_low_novelty_cycles`` resets to 0, return True.
+      * If novelty < threshold:
+          - increment ``consecutive_low_novelty_cycles``.
+          - If the counter reaches ``_COOLDOWN_LOW_CYCLES_BEFORE_DEMOTE``,
+            flip ``state`` to 'half_freq'.
+          - In 'half_freq' state, return True only on ODD `cycle_index`
+            (so the source fires every other cycle).
+          - In 'normal' state during the warm-up to demotion, the source
+            still runs every cycle.
+      * No prior row → treat as state='normal' with counter=0.
+
+    The DB row is updated on every call so the FSM is durable across
+    process restarts.
+
+    `cycle_index` strategy
+    ----------------------
+    The CALLER passes in a monotonic counter — for `fetch_all` that's
+    a per-process counter passed down from the continuous searcher,
+    not a clock-derived value. We chose this over `time.time() //
+    interval_seconds` so:
+
+      1. Unit tests can drive the FSM deterministically without
+         monkeypatching the clock.
+      2. The cycle parity stays consistent across a process restart
+         within the same run (no "missed" half_freq iterations because
+         the wall clock crossed an interval boundary mid-fetch).
+      3. The continuous searcher already owns iteration bookkeeping;
+         threading the counter through one more function call is a
+         smaller surface area than baking time-math into both ends.
+
+    The continuous-searcher hook simply increments its own counter on
+    every iteration; for the daily-cron path (one shot per process), 0
+    is fine (treated as 'odd' for half_freq, which simply means a
+    single-shot cron always runs the source — the desired behaviour
+    since the operator started it manually).
+    """
+    if db is None or not source:
+        return True
+    try:
+        novelty = float(
+            db.source_novelty_ratio(source, _COOLDOWN_NOVELTY_WINDOW_S)
+        )
+    except Exception:
+        log.debug(
+            "should_run_source: novelty lookup failed for %s; running",
+            source, exc_info=True,
+        )
+        return True
+
+    try:
+        row = db.get_source_cooldown(source) or {}
+    except Exception:
+        log.debug(
+            "should_run_source: cooldown lookup failed for %s; running",
+            source, exc_info=True,
+        )
+        return True
+    cur_state = str(row.get("state") or "normal")
+    consec = int(row.get("consecutive_low_novelty_cycles") or 0)
+
+    if novelty >= float(low_novelty_threshold):
+        # Recovery — clear the demotion immediately.
+        if cur_state != "normal" or consec != 0:
+            try:
+                db.upsert_source_cooldown(source, "normal", 0)
+            except Exception:
+                log.debug(
+                    "should_run_source: cooldown upsert failed (recovery)",
+                    exc_info=True,
+                )
+        return True
+
+    # Below threshold — bump the counter, possibly demote.
+    consec += 1
+    new_state = cur_state
+    if consec >= _COOLDOWN_LOW_CYCLES_BEFORE_DEMOTE:
+        new_state = "half_freq"
+    try:
+        db.upsert_source_cooldown(source, new_state, consec)
+    except Exception:
+        log.debug(
+            "should_run_source: cooldown upsert failed (demote)",
+            exc_info=True,
+        )
+
+    if new_state == "half_freq":
+        # Every other cycle. Odd cycle runs, even cycle skips.
+        return (int(cycle_index) % 2) == 1
+
+    # Still in 'normal' during the warm-up — keep running.
+    return True
+
+
 def _fetch_one_source(
     key: str,
     mod,
@@ -397,6 +516,7 @@ def fetch_all(
     store: MonitorStore | None = None,
     pipeline_run_id: int | None = None,
     db=None,
+    cycle_index: int = 0,
 ) -> tuple[list[Job], list[str]]:
     """Fan out to every enabled global source adapter, IN PARALLEL.
 
@@ -423,7 +543,12 @@ def fetch_all(
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     enabled = filters.get("sources") or {}
+    try:
+        low_thresh = float(filters.get("source_low_novelty_threshold") or 0.05)
+    except (TypeError, ValueError):
+        low_thresh = 0.05
     tasks: list[tuple[str, object]] = []
+    cooldown_skipped: list[str] = []
     for key, mod in SOURCES.items():
         if key == "remote_boards":
             if not any(enabled.get(k, True) for k in ("remoteok", "remotive", "weworkremotely")):
@@ -433,7 +558,24 @@ def fetch_all(
                 continue
         elif not enabled.get(key, True):
             continue
+        # Adaptive source cooldown (P4): skip when a source's 24h
+        # novelty ratio has been below threshold for 3 consecutive
+        # checks AND this cycle is the OFF half of the alternation.
+        # `db is None` (dry-run path) bypasses the gate so a preview
+        # always reflects the full source set.
+        if db is not None and not should_run_source(
+            db, key, cycle_index=cycle_index,
+            low_novelty_threshold=low_thresh,
+        ):
+            cooldown_skipped.append(key)
+            continue
         tasks.append((key, mod))
+
+    if cooldown_skipped:
+        log.info(
+            "fetch_all: cooldown-skipped %d sources this cycle: %s",
+            len(cooldown_skipped), cooldown_skipped,
+        )
 
     workers = int(filters.get("ai_source_workers") or 6)
     log.info("fetch_all: dispatching %d sources across %d workers",
@@ -477,7 +619,13 @@ def fetch_all(
 
 # ---------- main ----------
 
-def run(dry_run: bool = False, only_chat: int | None = None, no_send: bool = False) -> int:
+def run(
+    dry_run: bool = False,
+    only_chat: int | None = None,
+    no_send: bool = False,
+    *,
+    cycle_index: int = 0,
+) -> int:
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -532,7 +680,10 @@ def run(dry_run: bool = False, only_chat: int | None = None, no_send: bool = Fal
 
     # ----- Dry-run preview (no telemetry, no Telegram) --------------------
     if dry_run:
-        jobs_raw, errors = fetch_all(filters, db=db)
+        # cycle_index isn't passed in dry-run: the cooldown gate is
+        # bypassed (db=None would skip it anyway, and passing db=db is
+        # safe because dry-run doesn't have a running searcher counter).
+        jobs_raw, errors = fetch_all(filters, db=db, cycle_index=cycle_index)
         log.info("Raw fetched across static sources: %d postings", len(jobs_raw))
         new_in_db = job_store.save_all(jobs_raw)
         log.info("DB: %d newly-inserted jobs, %d already known",
@@ -579,6 +730,7 @@ def run(dry_run: bool = False, only_chat: int | None = None, no_send: bool = Fal
 
             jobs_raw, errors = fetch_all(
                 filters, store=store, pipeline_run_id=pctx.run_id, db=db,
+                cycle_index=cycle_index,
             )
             log.info("Raw fetched across static sources: %d postings", len(jobs_raw))
             new_in_db = job_store.save_all(jobs_raw)

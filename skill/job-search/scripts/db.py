@@ -263,6 +263,25 @@ CREATE TABLE IF NOT EXISTS search_fetches (
 CREATE INDEX IF NOT EXISTS idx_search_fetches_last_seen
     ON search_fetches(source, fetched_at);
 
+-- Adaptive source cooldown state (algorithm v2.8, P4 pipeline overhaul).
+-- One row per source. `state` is 'normal' (run every iteration) or
+-- 'half_freq' (run only on odd cycle_index — halves the API + scrape
+-- cost of sources that consistently fail to produce fresh jobs). The
+-- demotion is driven by `source_novelty_ratio` over the last 24h; see
+-- `should_run_source` for the rules.
+--
+-- `consecutive_low_novelty_cycles` counts how many checks in a row the
+-- source has been below the threshold. Demotion fires only after 3
+-- consecutive lows so a single quiet iteration doesn't trip the alarm.
+-- Recovery is immediate: one cycle ≥ threshold flips the state back to
+-- 'normal' and zeros the counter.
+CREATE TABLE IF NOT EXISTS source_cooldowns (
+    source                            TEXT PRIMARY KEY,
+    state                             TEXT NOT NULL DEFAULT 'normal',
+    last_updated                      REAL NOT NULL,
+    consecutive_low_novelty_cycles    INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE INDEX IF NOT EXISTS idx_app_status ON applications(chat_id, status);
 CREATE INDEX IF NOT EXISTS idx_sent_job ON sent_messages(chat_id, job_id);
 CREATE INDEX IF NOT EXISTS idx_profile_builds_chat ON profile_builds(chat_id, built_at DESC);
@@ -2135,6 +2154,66 @@ class DB:
             return 0.0
         new_ = float(row["new_sum"] or 0.0)
         return new_ / seen
+
+    # ---------- source_cooldowns (P4 adaptive cooldown) ----------
+
+    def get_source_cooldown(self, source: str) -> dict | None:
+        """Return the cooldown row for `source`, or None when no row exists.
+
+        Returned dict: ``{"state", "last_updated", "consecutive_low_novelty_cycles"}``.
+        Callers treat None identically to a fresh ``{"state": "normal",
+        "consecutive_low_novelty_cycles": 0}`` — `should_run_source` does
+        this by default.
+        """
+        if not source:
+            return None
+        with self._conn() as c:
+            row = c.execute(
+                """
+                SELECT state, last_updated, consecutive_low_novelty_cycles
+                  FROM source_cooldowns
+                 WHERE source = ?
+                """,
+                (str(source),),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "state": str(row["state"] or "normal"),
+            "last_updated": float(row["last_updated"] or 0.0),
+            "consecutive_low_novelty_cycles": int(
+                row["consecutive_low_novelty_cycles"] or 0
+            ),
+        }
+
+    def upsert_source_cooldown(
+        self,
+        source: str,
+        state: str,
+        consecutive_low_novelty_cycles: int,
+    ) -> None:
+        """INSERT-or-REPLACE the cooldown row for `source`.
+
+        `state` must be 'normal' or 'half_freq' — enforced here so a
+        typo can't poison the table. ``consecutive_low_novelty_cycles``
+        is clamped to ``>= 0``.
+        """
+        if not source:
+            return
+        st = str(state or "normal")
+        if st not in ("normal", "half_freq"):
+            st = "normal"
+        n = max(0, int(consecutive_low_novelty_cycles or 0))
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT OR REPLACE INTO source_cooldowns
+                  (source, state, last_updated,
+                   consecutive_low_novelty_cycles)
+                VALUES (?, ?, ?, ?)
+                """,
+                (str(source), st, time.time(), n),
+            )
 
     def count_existing_jobs(self, job_ids: Iterable[str]) -> int:
         """Return how many of `job_ids` are already present in the `jobs` table.
