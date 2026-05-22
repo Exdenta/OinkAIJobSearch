@@ -191,4 +191,22 @@ DEFAULTS: dict = {
         # Send a "nothing new" ping on empty days so the chat stays alive.
         "quiet_if_empty":  False,
     },
+
+    # Continuous searcher (Phase 3). When bot.py is started with the env var
+    # HRYU_CONTINUOUS_MODE=1 it spawns an in-process searcher loop instead of
+    # relying on the daily cron. The loop calls `search_jobs.run` every
+    # `continuous_interval_seconds` for a single chat_id (set via
+    # HRYU_CONTINUOUS_CHAT_ID). Quality is gated by the P1 buffer; pages are
+    # gated by the P2 cursor memory; this knob just controls how often the
+    # searcher wakes up.
+    #
+    #   continuous_interval_seconds — target gap between iterations. 7200
+    #     (2h) is the operator default; tighter intervals burn API + scrape
+    #     quota without finding much.
+    #   continuous_min_sleep_seconds — back-pressure floor. If an iteration
+    #     takes longer than `continuous_interval_seconds`, the loop still
+    #     pauses this long before the next run, so a degraded source can't
+    #     pin the searcher in a hot loop.
+    "continuous_interval_seconds": 7200,
+    "continuous_min_sleep_seconds":  60,
 }
