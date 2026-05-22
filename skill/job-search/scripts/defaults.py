@@ -224,4 +224,13 @@ DEFAULTS: dict = {
     # disables the gate. See `search_jobs.should_run_source` for the
     # full FSM.
     "source_low_novelty_threshold": 0.05,
+
+    # Auto profile rebuild on accumulated skip feedback (algorithm
+    # v2.8, P4 pipeline overhaul). Each call to `db.append_skip_note`
+    # bumps `users.skip_events_since_rebuild`; after every scoring
+    # iteration the searcher checks the counter and triggers a fresh
+    # `profile_builder.rebuild_profile` once the count crosses this
+    # threshold. Reset to 0 only on a SUCCESSFUL rebuild so transient
+    # CLI / parse failures don't silently consume K events.
+    "auto_rebuild_skip_threshold": 5,
 }

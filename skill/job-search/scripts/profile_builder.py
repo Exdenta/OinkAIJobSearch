@@ -1030,3 +1030,95 @@ class ProfileBuilderQueue:
                 return True
             time.sleep(0.05)
         return False
+
+
+# ---------------------------------------------------------------------------
+# Standalone rebuild trigger (P4 auto-rebuild path)
+# ---------------------------------------------------------------------------
+
+def rebuild_profile(
+    db: Any,
+    chat_id: int,
+    *,
+    sync_builder: Callable = build_search_seeds_sync,
+    timeout_s: int = DEFAULT_TIMEOUT_S,
+    model: str = DEFAULT_MODEL,
+) -> BuildResult:
+    """Run one profile build for `chat_id` synchronously.
+
+    Resolves resume + free-text + accumulated skip-reason notes from the
+    DB exactly the way the bot's `_enqueue_profile_rebuild` does, then
+    calls the chosen sync builder. Returns the `BuildResult` so the
+    caller can decide whether to reset its own bookkeeping (e.g. the P4
+    `skip_events_since_rebuild` counter only resets on `status == "ok"`).
+
+    Raises iff the builder itself raises an uncaught exception — every
+    schema/parse/CLI failure is surfaced as a non-ok BuildResult so
+    `search_jobs` callers can decide ("retry next iteration" vs "reset
+    counter") without try/except gymnastics. Persists the new profile
+    on success.
+    """
+    row = db.get_user(chat_id)
+    if row is None:
+        return BuildResult(
+            status="exception", error="no_user_row", model=model,
+        )
+
+    resume_text = ""
+    try:
+        resume_text = row["resume_text"] or ""
+    except (IndexError, KeyError):
+        resume_text = ""
+    prefs = (db.get_prefs_free_text(chat_id) or "").strip()
+    skip_notes = (db.get_skip_notes_text(chat_id) or "").strip()
+    if skip_notes:
+        sep = "\n\n[Recent 'not a fit' comments]\n"
+        free_text = (prefs + sep + skip_notes) if prefs else (
+            "[Recent 'not a fit' comments]\n" + skip_notes
+        )
+    else:
+        free_text = prefs
+
+    result = sync_builder(
+        resume_text, free_text, timeout_s=timeout_s, model=model,
+    )
+
+    profile_json: str | None = None
+    if result.status == "ok" and result.profile is not None:
+        profile_json = json.dumps(result.profile, ensure_ascii=False)
+    try:
+        db.log_profile_build(
+            chat_id=chat_id,
+            trigger="auto_skip_threshold",
+            status=result.status,
+            elapsed_ms=result.elapsed_ms,
+            resume_sha1=result.resume_sha1,
+            prefs_sha1=result.prefs_sha1,
+            model=result.model,
+            error_head=result.error,
+            profile_json=profile_json,
+        )
+    except Exception:
+        log.exception(
+            "rebuild_profile: audit-log insert failed for chat=%s",
+            chat_id,
+        )
+
+    if result.status == "ok" and result.profile is not None:
+        try:
+            db.set_user_profile(chat_id, profile_json)
+            es = result.profile.get("enabled_sources")
+            if isinstance(es, list) and es:
+                try:
+                    db.set_enabled_sources(chat_id, es)
+                except Exception:
+                    log.exception(
+                        "rebuild_profile: set_enabled_sources failed "
+                        "for chat=%s", chat_id,
+                    )
+        except Exception:
+            log.exception(
+                "rebuild_profile: set_user_profile failed for chat=%s",
+                chat_id,
+            )
+    return result
