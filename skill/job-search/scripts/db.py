@@ -2168,32 +2168,57 @@ class DB:
         self,
         source: str,
         since_seconds_ago: float,
-    ) -> float:
+    ) -> float | None:
         """Returns ``sum(jobs_new) / sum(jobs_seen)`` over the lookback window.
 
-        Exposed now for P4's adaptive source cooldown — a near-zero ratio
+        Exposed for P4's adaptive source cooldown — a near-zero ratio
         signals a source that's not surfacing anything new and can be
-        deprioritised. Returns ``0.0`` when no rows match or when
-        ``jobs_seen`` sums to zero (no division by zero — a quiet source
-        is treated identically to a no-data source for this signal).
+        deprioritised.
+
+        Return contract (P6-T1 — distinguishes "no data" from "real 0%"):
+
+          * Returns a ``float`` in ``[0.0, 1.0]`` when at least one row
+            matches ``(source, fetched_at >= cutoff)``.
+          * Returns ``None`` when ZERO rows match — i.e. the source has
+            never written to ``search_fetches`` (or all rows are older
+            than the window). This signals "we have no instrumentation
+            data for this source"; callers must treat it as "no signal,
+            no decision" rather than "0% novelty".
+          * Returns ``0.0`` when rows exist but ``SUM(jobs_seen) == 0``
+            (a real "we fetched but got nothing" signal) — distinct from
+            no-data.
+
+        The ``None`` channel exists because ~18 of 22 sources never call
+        ``record_fetch`` (P2 only instrumented 5 adapters). Without this
+        distinction the FSM treated them as 0% novelty and demoted them
+        all to ``half_freq`` after 3 cycles — see P6-T1.
         """
         if not source or since_seconds_ago <= 0:
-            return 0.0
+            return None
         cutoff = time.time() - float(since_seconds_ago)
         with self._conn() as c:
             row = c.execute(
                 """
-                SELECT COALESCE(SUM(jobs_seen), 0) AS seen_sum,
-                       COALESCE(SUM(jobs_new),  0) AS new_sum
+                SELECT COUNT(*)                        AS n_rows,
+                       COALESCE(SUM(jobs_seen), 0)     AS seen_sum,
+                       COALESCE(SUM(jobs_new),  0)     AS new_sum
                   FROM search_fetches
                  WHERE source = ? AND fetched_at >= ?
                 """,
                 (str(source), float(cutoff)),
             ).fetchone()
         if row is None:
-            return 0.0
+            return None
+        n_rows = int(row["n_rows"] or 0)
+        if n_rows <= 0:
+            # No instrumentation data at all — caller must treat as "no
+            # signal", not as 0% novelty (see P6-T1).
+            return None
         seen = float(row["seen_sum"] or 0.0)
         if seen <= 0:
+            # Rows exist but jobs_seen sums to zero — a real "we fetched
+            # but the source returned nothing" signal. Distinct from
+            # the no-data channel above.
             return 0.0
         new_ = float(row["new_sum"] or 0.0)
         return new_ / seen

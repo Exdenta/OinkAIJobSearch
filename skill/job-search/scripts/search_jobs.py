@@ -432,6 +432,10 @@ def should_run_source(
     Reads novelty over the last 24h via `db.source_novelty_ratio`. The
     finite-state machine:
 
+      * If novelty is ``None`` (no instrumentation data — see P6-T1)
+        → treat as "no signal": do NOT increment the counter, do NOT
+        demote, and let the source's existing cooldown state decide.
+        State 'normal' runs; state 'half_freq' obeys the parity gate.
       * If novelty >= ``low_novelty_threshold`` → state becomes 'normal',
         ``consecutive_low_novelty_cycles`` resets to 0, return True.
       * If novelty < threshold:
@@ -446,6 +450,19 @@ def should_run_source(
 
     The DB row is updated on every call so the FSM is durable across
     process restarts.
+
+    P6-T1 bug-fix note
+    ------------------
+    Only 5 source adapters (linkedin, justjoinit, nofluffjobs, builtin,
+    web_search) write to ``search_fetches`` via ``record_fetch``. The
+    other ~18 sources never produce novelty data, so
+    ``source_novelty_ratio`` returns ``None`` for them. Pre-fix the FSM
+    coerced the prior ``0.0`` return to "below threshold" and demoted
+    every uninstrumented source after 3 iterations — halving the live
+    search volume. The ``None``-handling branch above preserves
+    cooldown state for uninstrumented sources so they keep running on
+    the default schedule until they're either instrumented or
+    explicitly disabled.
 
     `cycle_index` strategy
     ----------------------
@@ -473,9 +490,7 @@ def should_run_source(
     if db is None or not source:
         return True
     try:
-        novelty = float(
-            db.source_novelty_ratio(source, _COOLDOWN_NOVELTY_WINDOW_S)
-        )
+        novelty = db.source_novelty_ratio(source, _COOLDOWN_NOVELTY_WINDOW_S)
     except Exception:
         log.debug(
             "should_run_source: novelty lookup failed for %s; running",
@@ -494,7 +509,18 @@ def should_run_source(
     cur_state = str(row.get("state") or "normal")
     consec = int(row.get("consecutive_low_novelty_cycles") or 0)
 
-    if novelty >= float(low_novelty_threshold):
+    if novelty is None:
+        # P6-T1: no instrumentation data — do NOT touch the FSM. The
+        # source's prior cooldown state still applies (a half_freq row
+        # left over from a real demotion years ago still gates parity),
+        # but uninstrumented sources never accumulate low-novelty
+        # cycles, so they never get newly demoted by this branch.
+        if cur_state == "half_freq":
+            return (int(cycle_index) % 2) == 1
+        return True
+
+    novelty_f = float(novelty)
+    if novelty_f >= float(low_novelty_threshold):
         # Recovery — clear the demotion immediately.
         if cur_state != "normal" or consec != 0:
             try:
