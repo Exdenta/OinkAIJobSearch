@@ -24,6 +24,7 @@ single-consumer).
 """
 from __future__ import annotations
 
+import asyncio
 import datetime
 import logging
 import os
@@ -2916,6 +2917,103 @@ def _apply_tailor(
         tg.send_plain(chat_id, f"⚠️ Could not send the file: {e}")
 
 
+# ---------- continuous searcher (Phase 3) ----------
+
+# Truthy strings accepted for HRYU_CONTINUOUS_MODE. Anything else (including
+# empty) leaves the searcher OFF — `python bot.py` in dev does NOT start
+# hammering sources. Operators flip this on explicitly via the systemd unit
+# or env file.
+_CONTINUOUS_MODE_TRUTHY = ("1", "true", "yes", "on")
+
+
+def _continuous_mode_enabled() -> bool:
+    return (os.environ.get("HRYU_CONTINUOUS_MODE", "") or "").strip().lower() \
+        in _CONTINUOUS_MODE_TRUTHY
+
+
+def _maybe_start_continuous_searcher(db: DB) -> threading.Thread | None:
+    """Spawn the Phase-3 continuous searcher in a background daemon thread.
+
+    Returns the Thread (for tests / observability) or None when continuous
+    mode is disabled.
+
+    Architecture
+    ------------
+    The main bot loop (`while running: tg.get_updates(...)`) is synchronous
+    blocking IO. The continuous searcher is an `asyncio` coroutine. The
+    simplest, smallest-diff way to host both is to give the searcher its
+    OWN event loop on a daemon thread — bot.py stays untouched apart from
+    this two-call hook. Each `search_jobs.run` invocation opens its own
+    `DB(path)`, so the searcher thread never shares a sqlite connection
+    with the polling thread.
+
+    Daemon=True ensures the process exits cleanly on SIGTERM without us
+    having to plumb a shutdown event into ContinuousSearcher — the OS
+    reaps the thread when main() returns. If we ever need ordered
+    shutdown, the right move is to convert main() to asyncio (option A)
+    and `await` the searcher's CancelledError; for the single-user MVP
+    that complexity is unjustified.
+    """
+    if not _continuous_mode_enabled():
+        return None
+
+    chat_raw = (os.environ.get("HRYU_CONTINUOUS_CHAT_ID", "") or "").strip()
+    try:
+        chat_id = int(chat_raw)
+    except ValueError:
+        chat_id = 0
+    if chat_id <= 0:
+        log.warning(
+            "continuous_mode enabled but HRYU_CONTINUOUS_CHAT_ID missing or "
+            "invalid (got %r) — skipping searcher",
+            chat_raw,
+        )
+        return None
+
+    # Interval — read from defaults at startup so operators can tune it
+    # in one place without touching env vars. defaults.DEFAULTS is the
+    # canonical source; we only fall back to a hard-coded 7200s if the
+    # key disappeared somehow.
+    try:
+        from defaults import DEFAULTS as _DEFAULTS
+        interval = int(_DEFAULTS.get("continuous_interval_seconds", 7200))
+        min_sleep = int(_DEFAULTS.get("continuous_min_sleep_seconds", 60))
+    except Exception:
+        interval, min_sleep = 7200, 60
+
+    from continuous_searcher import ContinuousSearcher
+
+    def _runner():
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            searcher = ContinuousSearcher(
+                db=db,
+                chat_id=chat_id,
+                interval_seconds=interval,
+                min_sleep_seconds=min_sleep,
+            )
+            try:
+                loop.run_until_complete(searcher.run_forever())
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                log.exception("continuous_searcher thread crashed")
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_runner, daemon=True, name="continuous_searcher")
+    t.start()
+    log.info(
+        "continuous_searcher started: chat_id=%d interval=%ds (daemon thread)",
+        chat_id, interval,
+    )
+    return t
+
+
 # ---------- main loop ----------
 
 def main() -> int:
@@ -2942,6 +3040,14 @@ def main() -> int:
         start_redirect_server(db)
     except Exception:
         log.exception("redirect_server: failed to start; continuing without it")
+
+    # Continuous searcher (Phase 3). OFF by default — flip on with
+    # HRYU_CONTINUOUS_MODE=1 + HRYU_CONTINUOUS_CHAT_ID=<chat_id> in the
+    # environment. See README + deploy/README for the production setup.
+    try:
+        _maybe_start_continuous_searcher(db)
+    except Exception:
+        log.exception("continuous_searcher: failed to start; continuing without it")
 
     log.info("Bot started. Polling for updates…")
     running = True
