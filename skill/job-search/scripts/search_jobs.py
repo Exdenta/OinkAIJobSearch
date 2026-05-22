@@ -37,7 +37,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 from dedupe import Job, JobStore                           # noqa: E402
-from db import DB                                          # noqa: E402
+from db import DB, profile_hash as _profile_hash           # noqa: E402
 from defaults import DEFAULTS                              # noqa: E402
 from telegram_client import TelegramClient, send_per_job_digest  # noqa: E402
 from sources import (                                      # noqa: E402
@@ -63,7 +63,6 @@ from log_ttl import cleanup_logs                            # noqa: E402
 from job_enrich import (                                   # noqa: E402
     enrich_jobs_ai,
     by_job_id,
-    pick_most_relevant_ai,
     reanalyze_scoring_ai,
 )
 from user_profile import (                                 # noqa: E402
@@ -135,6 +134,95 @@ def load_env() -> None:
 
 
 # ---------- helpers ----------
+
+def _decide_buffer_flush(
+    db,
+    chat_id: int,
+    alive_floor: list[Job],
+    enrichments_by_job_id: dict[str, dict],
+    profile_hash: str,
+    filters: dict,
+) -> tuple[list[Job], bool, int, float]:
+    """Quality-buffer enqueue + flush decision (algorithm v2.6, P1).
+
+    1. Purge stale-profile queued rows (silently invalidated by a resume
+       or prefs edit since they were enqueued).
+    2. Enqueue every (job_id, score) in `alive_floor` — these already
+       cleared the score floor AND the send-time prefilter, so they're
+       fit to deliver. `enqueue_match` is INSERT OR IGNORE: re-runs on
+       the same posting don't reset its `queued_at` clock.
+    3. Compute depth + oldest_age under the current profile_hash.
+    4. Flush when EITHER depth >= ``quality_send_threshold`` OR
+       oldest_age >= ``max_queue_latency_hours`` (the latency cap).
+    5. On flush: fetch ordered queue, rehydrate `Job` dataclasses from
+       the jobs table, drop any already-actioned by the user (defensive
+       dedupe against `applications`). On hold: return [], flush=False.
+
+    Returns ``(jobs_to_send, flush, depth, oldest_age)``. When
+    ``flush=False``, ``jobs_to_send`` is always ``[]``.
+    """
+    db.purge_stale_queue(chat_id, profile_hash)
+    for j in alive_floor:
+        score = int(
+            (enrichments_by_job_id.get(j.job_id) or {}).get("match_score") or 0
+        )
+        db.enqueue_match(chat_id, j.job_id, profile_hash, score)
+
+    depth = db.queue_depth(chat_id, profile_hash)
+    oldest_age = db.queue_oldest_age_seconds(chat_id, profile_hash) or 0.0
+
+    try:
+        threshold = int(filters.get("quality_send_threshold", 5))
+    except (TypeError, ValueError):
+        threshold = 5
+    try:
+        max_latency_s = float(filters.get("max_queue_latency_hours", 48)) * 3600
+    except (TypeError, ValueError):
+        max_latency_s = 48 * 3600.0
+
+    flush = depth >= threshold or (depth > 0 and oldest_age >= max_latency_s)
+    if not flush:
+        return [], False, depth, oldest_age
+
+    queued_rows = db.fetch_queue(chat_id, profile_hash)
+    if not queued_rows:
+        return [], False, depth, oldest_age
+
+    ids = [r["job_id"] for r in queued_rows]
+    row_by_id = db.get_jobs_by_ids(ids)
+    handled = db.handled_job_ids(chat_id)
+
+    # Carry the queue's ordering (match_score DESC, queued_at ASC) into
+    # the Job list so the digest reaches the user in the same priority
+    # order the buffer accumulated.
+    jobs_to_send: list[Job] = []
+    for entry in queued_rows:
+        jid = entry["job_id"]
+        if jid in handled:
+            # User already actioned this — applied / skipped / interested.
+            # Drop silently so the queue clears on flush.
+            continue
+        row = row_by_id.get(jid)
+        if row is None:
+            # Should not happen: queue rows are only inserted from
+            # alive_floor, which itself came from the jobs table. Treat
+            # as a dead row and let the caller clear it.
+            continue
+        jobs_to_send.append(
+            Job(
+                source=row["source"],
+                external_id=row["external_id"] or "",
+                title=row["title"] or "",
+                company=row["company"] or "",
+                location=row["location"] or "",
+                url=row["url"] or "",
+                posted_at=row["posted_at"] or "",
+                snippet=row["snippet"] or "",
+                salary=row["salary"] or "",
+            )
+        )
+    return jobs_to_send, True, depth, oldest_age
+
 
 def _score_histogram(enrichments_by_job_id: dict[str, dict]) -> dict[str, int]:
     """Score histogram for forensic logging — { '0': 3, '1': 2, ... '5': 1 }."""
@@ -712,12 +800,6 @@ def run(dry_run: bool = False, only_chat: int | None = None, no_send: bool = Fal
                 user_min_score = int(db.get_min_match_score(chat_id) or 0)
                 effective_min_score = user_min_score if user_min_score > 0 else default_min_score
                 dropped_below_score = 0
-                # Keep the pre-floor pool around for the v2.4 fallback
-                # path — when nothing clears the user's ⭐ floor, we still
-                # surface the single most-relevant near-miss.
-                pre_floor_jobs = list(user_jobs)
-                fallback_mode = False
-                fallback_top_score = 0
                 if effective_min_score > 0 and user_jobs:
                     before = len(user_jobs)
                     user_jobs = [
@@ -728,19 +810,15 @@ def run(dry_run: bool = False, only_chat: int | None = None, no_send: bool = Fal
                     gate_source = "user" if user_min_score > 0 else "default"
                     log.info("User %s: min_score ≥ %d (%s) gate %d → %d",
                              chat_id, effective_min_score, gate_source, before, len(user_jobs))
-                    if not user_jobs and quiet:
-                        continue
 
-                # ----- v2.4 fallback (refactored 2026-05-15) ---------
-                # Run the send-time prefilter (age / dead-URL / forum /
-                # LLM-liveness) on the FLOOR-survivors first. Only if
-                # NO job survives the gates do we fall back to the
-                # closest miss from `pre_floor_jobs`. Previous version
-                # checked `if not user_jobs` BEFORE the prefilter, which
-                # skipped the fallback whenever the floor cut returned
-                # at least 1 job — but that job often died inside
-                # `send_per_job_digest`'s inline prefilter, leaving the
-                # user with 0 sent and no fallback.
+                # ----- Send-time prefilter (algorithm v2.6) ----------
+                # Run the age / dead-URL / forum / LLM-liveness gates on
+                # the score-floor survivors. The v2.4 closest-miss
+                # fallback was removed in P1 of the pipeline overhaul —
+                # nothing scoring below the floor reaches the user;
+                # instead, score-and-live matches accumulate in a
+                # per-user quality buffer (queued_matches) and ship in
+                # one batch when depth or latency crosses the threshold.
                 from telegram_client import prefilter_for_send
                 alive_floor: list[Job] = []
                 if user_jobs:
@@ -752,73 +830,51 @@ def run(dry_run: bool = False, only_chat: int | None = None, no_send: bool = Fal
                             "User %s: send-time prefilter %d → %d (gate drops)",
                             chat_id, len(user_jobs), len(alive_floor),
                         )
-                if effective_min_score > 0 and not alive_floor and enrichments_by_job_id and pre_floor_jobs:
-                    # Pull candidates from the pre-floor pool, sorted by
-                    # score DESC. For each score tier with >=2 tied
-                    # candidates, the Sonnet tie-breaker picks the best.
-                    # Then validate the pick via prefilter; on death,
-                    # try the next candidate in the same tier, then the
-                    # next tier.
-                    scored = [
-                        (int((enrichments_by_job_id.get(j.job_id) or {}).get("match_score") or 0), j)
-                        for j in pre_floor_jobs
-                        # Don't re-try jobs we already validated in
-                        # alive_floor above (none survived); they're
-                        # also in pre_floor_jobs.
-                    ]
-                    scored = [(s, j) for s, j in scored if s >= 1]
-                    # Group by score tier (desc).
-                    tiers: dict[int, list[Job]] = {}
-                    for s, j in scored:
-                        tiers.setdefault(s, []).append(j)
-                    picked_fallback = None
-                    picked_score = 0
-                    for tier_score in sorted(tiers.keys(), reverse=True):
-                        candidates = tiers[tier_score]
-                        # Sonnet tie-break when >1; for size 1, no call.
-                        try:
-                            top = pick_most_relevant_ai(
-                                candidates, resume_text, prefs_text,
-                                timeout_s=enrich_timeout_s,
-                            )
-                        except Exception:
-                            log.exception("User %s: fallback picker raised", chat_id)
-                            top = candidates[0]
-                        # Try the Sonnet pick first, then siblings in
-                        # the same tier. Each one through prefilter to
-                        # confirm liveness.
-                        ordered = ([top] if top else []) + [
-                            j for j in candidates if top is None or j.external_id != top.external_id
-                        ]
-                        for cand in ordered:
-                            survivors, _ = prefilter_for_send(
-                                [cand], chat_id, forensic=forensic,
-                            )
-                            if survivors:
-                                picked_fallback = survivors[0]
-                                picked_score = tier_score
-                                break
-                        if picked_fallback is not None:
-                            break
-                    if picked_fallback is not None:
-                        alive_floor = [picked_fallback]
-                        fallback_mode = True
-                        fallback_top_score = picked_score
-                        log.info(
-                            "User %s: floor=%d had 0 alive matches; "
-                            "fallback card top_score=%d title=%s",
-                            chat_id, effective_min_score, picked_score,
-                            picked_fallback.title[:60],
+
+                # ----- Quality buffer (algorithm v2.6, P1) -----------
+                # Enqueue every alive-floor match under the user's
+                # current profile_hash; flush in one batch when depth
+                # or oldest-age crosses the configured thresholds.
+                # On hold: skip this user's send block this iteration.
+                #
+                # The preview path (`--no-send`) deliberately bypasses
+                # the buffer so an operator dry-run never mutates the
+                # queue. They get the per-run alive_floor printed
+                # verbatim instead.
+                buffer_depth = 0
+                buffer_oldest_age = 0.0
+                if no_send:
+                    user_jobs = alive_floor
+                else:
+                    user_profile_hash = _profile_hash(resume_text, prefs_text)
+                    buffer_jobs, flush_now, buffer_depth, buffer_oldest_age = (
+                        _decide_buffer_flush(
+                            db, chat_id, alive_floor, enrichments_by_job_id,
+                            user_profile_hash, filters,
                         )
+                    )
+                    if not flush_now:
+                        log.info(
+                            "User %s: quality-buffer holding %d "
+                            "(threshold=%d, oldest_age=%.1fh) — no send",
+                            chat_id, buffer_depth,
+                            int(filters.get("quality_send_threshold", 5)),
+                            buffer_oldest_age / 3600.0,
+                        )
+                        if quiet:
+                            continue
+                        # When `quiet_if_empty` is off the operator still
+                        # wants the per-user summary; the audit stage at
+                        # the bottom of the loop is harmless on an empty
+                        # send.
+                        user_jobs = []
                     else:
-                        log.info(
-                            "User %s: floor=%d had 0 alive matches AND "
-                            "no living fallback candidate; sending NO_MATCHES",
-                            chat_id, effective_min_score,
-                        )
-                # All downstream stages use `alive_floor` as the final
-                # send list. user_jobs kept for digest_run_jobs caching.
-                user_jobs = alive_floor
+                        # Hand the rehydrated, ordered queue downstream
+                        # as the final send list. `user_jobs` was the
+                        # per-run alive_floor; replace with the buffer
+                        # contents so the digest reflects what actually
+                        # ships.
+                        user_jobs = buffer_jobs
                 # Header floor reflects the gate that actually fired (user
                 # value if set, otherwise the global default). Surfacing 0
                 # would hide the ⬆ button and lie about what was filtered.
@@ -878,8 +934,6 @@ def run(dry_run: bool = False, only_chat: int | None = None, no_send: bool = Fal
                             enriched_count=enriched_count,
                             dropped_below_score=dropped_below_score,
                             lower_count_at_step=lower_count_at_step,
-                            fallback_mode=fallback_mode,
-                            fallback_top_score=fallback_top_score,
                             pre_filtered=True,
                         )
                         total_sent += sent
@@ -891,6 +945,25 @@ def run(dry_run: bool = False, only_chat: int | None = None, no_send: bool = Fal
                                 )
                             except Exception:
                                 log.debug("mark_digest_jobs_sent failed; continuing", exc_info=True)
+                            # Drop the delivered rows from the quality
+                            # buffer. Jobs that failed mid-flush stay
+                            # queued for the next attempt — the
+                            # confirmation is `_on_sent` firing, not
+                            # the call returning.
+                            try:
+                                cleared = db.clear_queue(
+                                    chat_id, _sent_jobs_this_run,
+                                )
+                                log.info(
+                                    "User %s: quality-buffer flushed %d/%d "
+                                    "(threshold=%d, oldest_age=%.1fh)",
+                                    chat_id, cleared, buffer_depth,
+                                    int(filters.get("quality_send_threshold", 5)),
+                                    buffer_oldest_age / 3600.0,
+                                )
+                            except Exception:
+                                log.debug("clear_queue failed; continuing",
+                                          exc_info=True)
                     except Exception as e:
                         log.exception("Failed to send digest to %s: %s", chat_id, e)
                         pctx.incr_errors(1)
