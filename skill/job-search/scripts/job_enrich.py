@@ -1263,66 +1263,6 @@ def _enrich_one_chunk(
     return out, reason
 
 
-def pick_most_relevant_ai(
-    candidates: list[Job],
-    resume_text: str,
-    prefs_text: str,
-    *,
-    timeout_s: int = 240,
-) -> Job | None:
-    """Tie-breaker for the "no matches at floor" fallback path.
-
-    Given >=2 candidates at the same top score, call Sonnet once with
-    the full resume + prefs + each candidate's brief and ask it to
-    pick the SINGLE most relevant one. Returns the chosen Job (or the
-    first candidate as a deterministic fallback when the call fails).
-    """
-    if not candidates:
-        return None
-    if len(candidates) == 1:
-        return candidates[0]
-    if not resume_text or not resume_text.strip():
-        return candidates[0]
-
-    briefs = [_job_to_brief(j) for j in candidates[:10]]
-    prompt = (
-        "You are picking ONE job posting out of several tied on score "
-        "for ONE candidate. The candidate's daily digest currently has "
-        "NO postings clearing their ⭐ floor; we want to surface the "
-        "single most relevant 'closest' so they don't get an empty "
-        "digest. Be DECISIVE — return the one external_id that best "
-        "matches the candidate's resume + PREFS.\n\n"
-        "Selection rules, in order:\n"
-        "  1. Strongest stack/tooling overlap with the resume.\n"
-        "  2. Best location fit (PREFS onsite/remote constraints).\n"
-        "  3. Closest seniority to the candidate's target.\n"
-        "  4. Most concrete description (avoid generic snippets).\n\n"
-        f"=== CANDIDATE RESUME ===\n{(resume_text or '')[:_MAX_RESUME_PROMPT_CHARS]}\n\n"
-        f"=== CANDIDATE PREFS ===\n{(prefs_text or '')[:_MAX_PREFS_PROMPT_CHARS]}\n\n"
-        f"=== TIED CANDIDATES (JSON) ===\n{json.dumps(briefs, ensure_ascii=False)}\n\n"
-        "Respond with ONE JSON object only — no prose, no fence:\n"
-        "{\"chosen_id\": \"<external_id verbatim>\", "
-        "\"reason\": \"<one short sentence>\"}"
-    )
-    stdout = wrapped_run_p(None, "pick_most_relevant", prompt,
-                          timeout_s=timeout_s, model=MID_MODEL)
-    if not stdout:
-        log.warning("pick_most_relevant_ai: CLI returned None; "
-                    "falling back to first candidate")
-        return candidates[0]
-    body = extract_assistant_text(stdout)
-    data = parse_json_block(body)
-    if not isinstance(data, dict):
-        return candidates[0]
-    chosen = str(data.get("chosen_id") or "").strip()
-    for j in candidates:
-        if j.external_id == chosen:
-            log.info("pick_most_relevant_ai: chose %s (reason=%r)",
-                     j.external_id[:60], str(data.get("reason"))[:120])
-            return j
-    return candidates[0]
-
-
 def reanalyze_scoring_ai(
     jobs: list[Job],
     enrichments_by_external_id: dict[str, dict],
