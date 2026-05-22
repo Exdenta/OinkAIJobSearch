@@ -152,6 +152,20 @@ DEFAULTS: dict = {
     # output feels curated.
     "ai_min_match_score": 4,
 
+    # Quality-buffer thresholds (algorithm v2.6, P1 pipeline overhaul).
+    # The continuous searcher enqueues each scored-and-live match that
+    # clears `ai_min_match_score`. The send-decision path flushes the
+    # queue in one batch only when EITHER condition fires:
+    #
+    #   * depth >= quality_send_threshold (enough good matches accumulated)
+    #   * oldest_age >= max_queue_latency_hours (latency budget exceeded)
+    #
+    # This replaces the v2.4 closest-miss fallback: if nothing scores
+    # ≥ floor in a given run, the queue simply doesn't grow — no
+    # substitute card is surfaced.
+    "quality_send_threshold":     5,
+    "max_queue_latency_hours":   48,
+
     # Per-scrape timeout for Claude-CLI-backed adapters (curated_boards).
     "ai_scrape_timeout_s":     180,
     # Web-search agent runs multiple WebSearch+WebFetch calls — needs more.
