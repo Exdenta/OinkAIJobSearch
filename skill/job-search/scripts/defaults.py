@@ -29,7 +29,7 @@ DEFAULTS: dict = {
         "remocate":         True,    # curated boards — Claude CLI required
         "wantapply":        True,
         "remoterocketship": True,
-        "web_search":       True,    # per-user, requires Claude CLI
+        "web_search":       False,   # PAUSED 2026-05-22 — verifier was letting Workable soft-404s (apply.workable.com/oops, ?not_found=true) ship as live jobs. Re-enable once the listing-verifier gate is hardened.
         # Humanitarian + research/academic sources (added 2026-04-30).
         "reliefweb":        True,    # public API — humanitarian sector
         "euraxess":         True,    # EU researcher mobility portal — public API
