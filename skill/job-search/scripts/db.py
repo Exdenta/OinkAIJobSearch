@@ -2283,6 +2283,67 @@ class DB:
                 (str(source), st, time.time(), n),
             )
 
+    def reset_uninstrumented_source_cooldowns(
+        self,
+        instrumented: set[str],
+    ) -> int:
+        """One-shot migration for the P6-T1 bug: reset any cooldown row
+        whose source is NOT in `instrumented` back to
+        ``state='normal'`` with ``consecutive_low_novelty_cycles=0``.
+
+        Returns the number of rows updated.
+
+        Background
+        ----------
+        Pre-fix, ``source_novelty_ratio`` returned 0.0 for sources that
+        never write to ``search_fetches`` (the ~18 P2-uninstrumented
+        adapters). The FSM then demoted them all to ``half_freq`` after
+        3 iterations. After deploying the no-signal fix those rows
+        would otherwise stay stuck at ``half_freq`` forever — the FSM
+        only ever recovers via a real novelty observation, which by
+        definition never arrives for uninstrumented sources.
+
+        Idempotency
+        -----------
+        Rows already at ``state='normal'`` and
+        ``consecutive_low_novelty_cycles=0`` are left untouched (the
+        UPDATE filter excludes them), so subsequent calls return 0.
+        The instrumented-set is supplied by the caller — keeping the
+        P2-specific list of adapter names out of the DB layer.
+        """
+        whitelist = {str(s) for s in (instrumented or set()) if s}
+        with self._conn() as c:
+            if whitelist:
+                placeholders = ",".join("?" for _ in whitelist)
+                params: list = list(whitelist)
+                params.append(time.time())
+                cur = c.execute(
+                    f"""
+                    UPDATE source_cooldowns
+                       SET state                          = 'normal',
+                           consecutive_low_novelty_cycles = 0,
+                           last_updated                   = ?
+                     WHERE source NOT IN ({placeholders})
+                       AND (state != 'normal'
+                            OR consecutive_low_novelty_cycles != 0)
+                    """,
+                    [time.time(), *whitelist],
+                )
+            else:
+                # Empty whitelist — reset every wrongly-demoted row.
+                cur = c.execute(
+                    """
+                    UPDATE source_cooldowns
+                       SET state                          = 'normal',
+                           consecutive_low_novelty_cycles = 0,
+                           last_updated                   = ?
+                     WHERE state != 'normal'
+                        OR consecutive_low_novelty_cycles != 0
+                    """,
+                    (time.time(),),
+                )
+            return int(cur.rowcount or 0)
+
     def count_existing_jobs(self, job_ids: Iterable[str]) -> int:
         """Return how many of `job_ids` are already present in the `jobs` table.
 
