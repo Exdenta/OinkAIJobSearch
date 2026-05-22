@@ -36,7 +36,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-from dedupe import Job, JobStore                           # noqa: E402
+from dedupe import Job, JobStore, dedupe_cross_source      # noqa: E402
 from db import DB, profile_hash as _profile_hash           # noqa: E402
 from defaults import DEFAULTS                              # noqa: E402
 from telegram_client import TelegramClient, send_per_job_digest  # noqa: E402
@@ -765,6 +765,22 @@ def run(dry_run: bool = False, only_chat: int | None = None, no_send: bool = Fal
                 user_jobs = job_store.filter_new_for(chat_id, user_pool)
                 log.info("User %s: %d new postings (of %d after per-user filter + web_search)",
                          chat_id, len(user_jobs), len(user_pool))
+
+                # Cross-source dedupe (algorithm v2.8, P4 pipeline overhaul).
+                # The same posting can show up across multiple feeds
+                # (justjoinit + nofluffjobs + LinkedIn-PL all carry the
+                # Polish/CEE tech roles, for instance). Without this step
+                # we'd call the scorer 3x for one underlying job. Runs at
+                # the TRANSPORT layer — see `dedupe_cross_source` docstring
+                # for the design-principle justification.
+                if user_jobs:
+                    before_xs = len(user_jobs)
+                    user_jobs = dedupe_cross_source(user_jobs)
+                    if before_xs != len(user_jobs):
+                        log.info(
+                            "dedupe_cross_source: %d → %d (collapsed %d duplicate postings)",
+                            before_xs, len(user_jobs), before_xs - len(user_jobs),
+                        )
 
                 if not user_jobs and quiet:
                     continue
