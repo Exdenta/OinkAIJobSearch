@@ -141,11 +141,32 @@ python skill/job-search/scripts/search_jobs.py --dry-run
 
 Prints what would be posted without actually sending or recording anything.
 
-### 6. Schedule the daily digest
+### 6. Schedule searches
 
-Pick any scheduler you like and point it at `search_jobs.py`. Examples:
+Two modes — pick one.
 
-**cron** (Linux / macOS):
+**Continuous mode (recommended).** `bot.py` itself runs the search loop
+every couple of hours for a single chat. Quality is gated by the per-user
+buffer (P1) and pagination by the source-page cursors (P2), so the loop
+never re-fetches the same source page within 6h and only flushes ≥4-scored
+matches. Enable by setting two env vars before launching `bot.py`:
+
+```bash
+export HRYU_CONTINUOUS_MODE=1
+export HRYU_CONTINUOUS_CHAT_ID=433775883     # your Telegram chat_id
+python skill/job-search/scripts/bot.py
+```
+
+With these set, the daily cron entry below is no longer needed — remove
+it (`crontab -e`) before flipping continuous mode on, otherwise the same
+search will run twice. The interval is tunable in `defaults.py`
+(`continuous_interval_seconds`, default 7200).
+
+Continuous mode is single-user — only `HRYU_CONTINUOUS_CHAT_ID` is driven
+by the in-process loop. Other users still use on-demand `/jobs` taps.
+
+**Cron mode (legacy).** Point any scheduler at `search_jobs.py`. Examples:
+
 ```cron
 0 8 * * *  cd /path/to/FindJobs && /usr/bin/python3 skill/job-search/scripts/search_jobs.py >> bot.log 2>&1
 ```
@@ -157,9 +178,9 @@ Pick any scheduler you like and point it at `search_jobs.py`. Examples:
 skill/job-search/scripts/search_jobs.py`) with a `findjobs.timer`
 (`OnCalendar=*-*-* 08:00:00`).
 
-The long-running `bot.py` process is separate from the digest — keep it up
-under systemd / nohup / Docker so `/start`, uploads, and button presses keep
-working between digests.
+The long-running `bot.py` process is separate from the cron-fired digest —
+keep it up under systemd / nohup / Docker so `/start`, uploads, and button
+presses keep working between digests.
 
 ## User experience
 

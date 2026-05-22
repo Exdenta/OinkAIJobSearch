@@ -185,6 +185,42 @@ sudo systemctl reload caddy
 # and restart the affected services:
 ```
 
+## Continuous mode (Phase 3)
+
+The bot can run its own search loop in-process instead of relying on the
+`hryu-digest.timer` cron. Quality is gated by the per-user buffer (P1)
+and pagination by the source-page cursors (P2), so each wake-up only
+flushes ≥4-scored matches and doesn't re-fetch the same source page
+within 6h. Single-user MVP — exactly one chat_id.
+
+Enable on the server:
+
+1. Add two lines to `/home/hryu/.env`:
+   ```bash
+   HRYU_CONTINUOUS_MODE=1
+   HRYU_CONTINUOUS_CHAT_ID=433775883   # the operator's chat_id
+   ```
+2. Disable the cron-fired digest so the same search doesn't run twice:
+   ```bash
+   sudo systemctl disable --now hryu-digest.timer
+   ```
+3. Restart the bot to pick up the env change:
+   ```bash
+   sudo systemctl restart hryu-bot
+   ```
+4. Verify the loop started:
+   ```bash
+   journalctl -u hryu-bot -n 50 | grep continuous_searcher
+   # expect: continuous_searcher started: chat_id=433775883 interval=7200s
+   ```
+
+Tuning lives in `skill/job-search/scripts/defaults.py` —
+`continuous_interval_seconds` (default 7200 / 2h) and
+`continuous_min_sleep_seconds` (default 60s back-pressure floor).
+
+Disable continuous mode and roll back to cron with the inverse: unset the
+two env vars, `systemctl enable --now hryu-digest.timer`, restart the bot.
+
 ## Limitations / known issues
 
   token in the query string. Real SMTP delivery is Phase 3. Do not expose
