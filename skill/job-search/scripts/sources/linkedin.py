@@ -108,6 +108,50 @@ PER_QUERY_CAP = 60
 # unique results per query after URL dedupe.
 PAGINATION_STARTS = (10, 25, 50)
 
+# Algorithm v2.7 / P2: when the search loop is running with a cursor-aware
+# DB, ONE call to `fetch_for_user` advances the cursor by ONE page per
+# (query, geo) combo (the current behaviour walks 4 pages per combo
+# unconditionally). Page N maps to LinkedIn's `start` offset like so:
+#
+#   page 1 → 0          page 6  → 125
+#   page 2 → 10         page 7  → 150
+#   page 3 → 25         page 8  → 175
+#   page 4 → 50         page 9  → 200
+#   page 5 → 75         page 10 → 225
+#
+# Pages 1-4 mirror the legacy (0, *PAGINATION_STARTS) sequence so an
+# adapter that runs page-1-only-each-iteration covers the same offsets the
+# old code did over the first four iterations. Beyond that we extend in
+# steps of 25 — LinkedIn returns 25 cards/page and tops out somewhere
+# around start=300-400 in practice; LINKEDIN_MAX_PAGE bounds it to 10.
+LINKEDIN_MAX_PAGE = 10
+_LINKEDIN_PAGE_TO_START: dict[int, int] = {
+    1: 0,
+    2: 10,
+    3: 25,
+    4: 50,
+    5: 75,
+    6: 125,
+    7: 150,
+    8: 175,
+    9: 200,
+    10: 225,
+}
+
+
+def _linkedin_start_for_page(page: int) -> int:
+    """Map a cursor page index (1..LINKEDIN_MAX_PAGE) to LinkedIn's offset.
+
+    Out-of-range pages clamp to the nearest valid entry — the cursor
+    contract guarantees `1 <= page <= max_page`, so this is defence in
+    depth against a misconfigured caller.
+    """
+    if page <= 1:
+        return 0
+    if page >= LINKEDIN_MAX_PAGE:
+        return _LINKEDIN_PAGE_TO_START[LINKEDIN_MAX_PAGE]
+    return _LINKEDIN_PAGE_TO_START.get(int(page), (int(page) - 1) * 25)
+
 # Polite pause between back-to-back LinkedIn requests. Kept as a named
 # constant so tests can monkeypatch it.
 PACE_SECONDS = 1.5
@@ -347,7 +391,13 @@ def _flatten_user_seeds(user_seeds: dict | None) -> list[dict]:
     return []
 
 
-def fetch_for_user(filters: dict, user_seeds: dict | None) -> list[Job]:
+def fetch_for_user(
+    filters: dict,
+    user_seeds: dict | None,
+    *,
+    db=None,
+    min_revisit_age_s: int = 21600,
+) -> list[Job]:
     """Per-user LinkedIn fetch — dispatches a cross-product of queries × geos.
 
     Two `user_seeds.linkedin` schemas supported:
@@ -367,10 +417,22 @@ def fetch_for_user(filters: dict, user_seeds: dict | None) -> list[Job]:
           profiles built before 2026-05-12 use this shape; they keep
           working.
 
-    Behavior per dispatch:
-      * each (q, geo) combo gets its OWN budget of `PER_QUERY_CAP` postings;
-      * walks pages `0, *PAGINATION_STARTS` (start=0,10,25,50) until the
-        budget fills or LinkedIn returns 0;
+    Two behaviour modes:
+
+      `db=None` (back-compat, default):
+        Each (q, geo) gets its OWN budget of `PER_QUERY_CAP` postings;
+        walks pages 0,10,25,50 until the budget fills or LinkedIn
+        returns 0. Identical to the pre-P2 code path.
+
+      `db=<DB>` (cursor mode, used by the continuous scheduler in P3):
+        Each (q, geo) advances ONE page on the cursor per call —
+        `db.next_page_for(...)` decides which. A 5-iteration sweep
+        therefore walks pages 1..5 of every combo instead of re-fetching
+        page 1 five times. Pages already fetched within
+        `min_revisit_age_s` are skipped. `db.record_fetch(...)` is
+        called after each page with jobs_seen / jobs_new telemetry.
+
+    Behaviour shared by both modes:
       * dedupes on URL across all dispatches and pages;
       * `PACE_SECONDS` sleep between requests;
       * `_RateLimited` aborts the whole batch (returns what we have).
@@ -405,10 +467,36 @@ def fetch_for_user(filters: dict, user_seeds: dict | None) -> list[Job]:
                 q_idx + 1, len(queries), query["geo"],
             )
             continue
+
+        # Pick the page sequence to walk this iteration. In cursor mode
+        # we walk exactly ONE page (chosen by the DB cursor); in legacy
+        # mode we walk the full 4-page sequence as before.
+        if db is not None:
+            next_p = db.next_page_for(
+                "linkedin", query["q"], query["geo"] or "",
+                max_page=LINKEDIN_MAX_PAGE,
+                min_revisit_age_s=min_revisit_age_s,
+            )
+            if next_p == -1:
+                log.info(
+                    "linkedin[user]: skipping query %d/%d %r @ %r — "
+                    "all pages 1..%d fresh within %ds",
+                    q_idx + 1, len(queries), query["q"], query["geo"],
+                    LINKEDIN_MAX_PAGE, min_revisit_age_s,
+                )
+                continue
+            page_seq = [(int(next_p), _linkedin_start_for_page(int(next_p)))]
+        else:
+            # Legacy: start=0,10,25,50 = pages 1-4 of the cursor mapping.
+            page_seq = [
+                (1, 0),
+                (2, 10),
+                (3, 25),
+                (4, 50),
+            ]
+
         per_query_total = 0
-        # Page sequence: start=0 always, then PAGINATION_STARTS if budget
-        # not yet filled. Stops as soon as a page returns 0 (no more results).
-        for start in (0, *PAGINATION_STARTS):
+        for page_num, start in page_seq:
             remaining = PER_QUERY_CAP - per_query_total
             if remaining <= 0:
                 break
@@ -433,17 +521,40 @@ def fetch_for_user(filters: dict, user_seeds: dict | None) -> list[Job]:
             combined.extend(batch)
             per_query_total += len(batch)
             log.info(
-                "linkedin[user]: query %d/%d %r @ %r start=%d → %d jobs (q-total %d, run-total %d)",
+                "linkedin[user]: query %d/%d %r @ %r start=%d (page=%d) → %d jobs (q-total %d, run-total %d)",
                 q_idx + 1, len(queries), query["q"], query["geo"],
-                start, len(batch), per_query_total, len(combined),
+                start, page_num, len(batch), per_query_total, len(combined),
             )
+            # Cursor telemetry: record jobs_seen / jobs_new BEFORE the
+            # cross-geo dedupe + detail-body fetch so the counts reflect
+            # this page's raw output. jobs_new is computed against the
+            # existing `jobs` table (the cross-source dedupe step in P4
+            # happens after this; the count is informational).
+            if db is not None:
+                try:
+                    seen_ids = [
+                        f"linkedin:{j.external_id}"
+                        for j in batch if j.external_id
+                    ]
+                    existing = db.count_existing_jobs(seen_ids) if seen_ids else 0
+                    db.record_fetch(
+                        "linkedin",
+                        query["q"],
+                        page_num,
+                        query["geo"] or "",
+                        jobs_seen=len(batch),
+                        jobs_new=max(0, len(batch) - existing),
+                    )
+                except Exception:
+                    log.debug("linkedin: db.record_fetch raised; continuing",
+                              exc_info=True)
             # Blacklist the geo ONLY when LinkedIn's response was the
             # empty placeholder (`body_resolved=False`) — that means
             # the geo string didn't resolve to anything in LinkedIn's
             # internal entity registry. A normal 30 KB response with 0
             # result cards just means THIS QUERY had no hits today;
             # the geo is fine and sibling queries should keep running.
-            if not batch and start == 0 and query["geo"] and not body_resolved:
+            if not batch and page_num == 1 and query["geo"] and not body_resolved:
                 dead_geos.add(query["geo"])
                 log.warning(
                     "linkedin: geo %r did not resolve (empty body) — "

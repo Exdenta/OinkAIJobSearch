@@ -203,7 +203,18 @@ def _parse_posting(item: dict) -> Job | None:
     )
 
 
-def fetch(filters: dict) -> list[Job]:
+# P2 page-memory cursor: NoFluffJobs returns 50 postings/page; 5 covers
+# the freshest ~250 listings/category which exceeds `max_per_source`
+# trims even on aggressive operator configs.
+NOFLUFFJOBS_MAX_PAGE = 5
+
+
+def fetch(
+    filters: dict,
+    *,
+    db=None,
+    min_revisit_age_s: int = 21600,
+) -> list[Job]:
     """One POST per category, dedupe by (company, title), cap at `max_per_source`.
 
     NoFluffJobs returns one row per (posting, region) pair — the same listing
@@ -213,6 +224,11 @@ def fetch(filters: dict) -> list[Job]:
     which collapses the regional duplicates into one entry while still
     keeping distinct postings from the same company that share neither
     title nor region.
+
+    Cursor mode (`db` provided): each category advances ONE page on the
+    `search_fetches` cursor per call (via `db.next_page_for`). Without
+    `db` the adapter always fetches pageNumber=1, preserving pre-P2
+    behaviour.
     """
     cap = int(filters.get("max_per_source") or 30)
     categories = _categories_from_env()
@@ -223,11 +239,28 @@ def fetch(filters: dict) -> list[Job]:
     for cat in categories:
         if len(out) >= cap:
             break
+
+        # Cursor decides which page this category fetches next.
+        if db is not None:
+            page_num = db.next_page_for(
+                "nofluffjobs", str(cat), "",
+                max_page=NOFLUFFJOBS_MAX_PAGE,
+                min_revisit_age_s=min_revisit_age_s,
+            )
+            if page_num == -1:
+                log.info(
+                    "nofluffjobs[cat=%s]: all pages 1..%d fresh within %ds — skipping",
+                    cat, NOFLUFFJOBS_MAX_PAGE, min_revisit_age_s,
+                )
+                continue
+        else:
+            page_num = 1
+
         size = min(cap - len(out), 50)
         body = {"criteriaSearch": {"category": [cat]}}
         params = {
             "pageSize": str(size),
-            "pageNumber": "1",
+            "pageNumber": str(page_num),
             "salaryCurrency": "EUR",
             "salaryPeriod": "month",
             "region": "pl",
@@ -249,6 +282,7 @@ def fetch(filters: dict) -> list[Job]:
             err_payload = {"class": "JSONDecodeError", "message": str(e)[:300]}
 
         added = 0
+        cat_seen_ids: list[str] = []
         for item in postings:
             if len(out) >= cap:
                 break
@@ -261,16 +295,30 @@ def fetch(filters: dict) -> list[Job]:
             if key in seen_keys:
                 continue
             seen_keys.add(key)
+            cat_seen_ids.append(f"nofluffjobs:{job.external_id}")
             out.append(job)
             added += 1
-        log.info("nofluffjobs[cat=%s] status=%s postings=%d added=%d (total=%d)",
-                 cat, status_code, len(postings), added, len(out))
+        log.info("nofluffjobs[cat=%s page=%s] status=%s postings=%d added=%d (total=%d)",
+                 cat, page_num, status_code, len(postings), added, len(out))
+
+        # Cursor advancement + jobs_seen / jobs_new telemetry.
+        if db is not None:
+            try:
+                existing = db.count_existing_jobs(cat_seen_ids) if cat_seen_ids else 0
+                db.record_fetch(
+                    "nofluffjobs", str(cat), int(page_num), "",
+                    jobs_seen=len(cat_seen_ids),
+                    jobs_new=max(0, len(cat_seen_ids) - existing),
+                )
+            except Exception:
+                log.debug("nofluffjobs: db.record_fetch raised; continuing",
+                          exc_info=True)
 
         if forensic is not None:
             try:
                 forensic.log_step(
                     "sources.nofluffjobs.page",
-                    input={"category": cat, "size": size},
+                    input={"category": cat, "size": size, "page": page_num},
                     output={
                         "status_code": status_code,
                         "postings_seen": len(postings),

@@ -232,7 +232,30 @@ def _resolve_pages(filters: dict) -> list[str]:
     return [urljoin(BASE_URL, p) for p in DEFAULT_PAGES]
 
 
-def fetch(filters: dict) -> list[Job]:
+# P2 page-memory cursor: Built In server-renders ~25 cards per category
+# landing page; ``?page=N`` cycles to the next slice. The module docstring
+# notes the pagination is JS-driven and sometimes unreliable under bot
+# UAs, but it costs nothing to try — when page N>1 returns the same set
+# the cross-source dedupe in P4 collapses the duplicates. We cap the
+# cursor at 5 pages per (category-URL) so a misbehaving response can't
+# walk into infinite-pagination land.
+BUILTIN_MAX_PAGE = 5
+
+
+def _with_page_param(url: str, page: int) -> str:
+    """Return `url` with `?page=N` appended (or replaced)."""
+    if int(page) <= 1:
+        return url
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}page={int(page)}"
+
+
+def fetch(
+    filters: dict,
+    *,
+    db=None,
+    min_revisit_age_s: int = 21600,
+) -> list[Job]:
     """Top-level adapter entry point. Returns up to ``max_per_source`` Jobs.
 
     ``filters`` keys consulted:
@@ -241,6 +264,13 @@ def fetch(filters: dict) -> list[Job]:
       * ``builtin_pages`` (list[str], optional) — override the default
         category pages. Each item may be a path (``/jobs/...``) or a full
         ``https://builtin.com/...`` URL.
+
+    Cursor mode (`db` provided): each category landing page advances ONE
+    pagination page on the `search_fetches` cursor per call. Page 1 is
+    the bare URL; page N>1 appends ``?page=N``. The category URL is the
+    cursor "query" key, so each (category, page) cell is tracked
+    independently. Without `db` the adapter always fetches page 1,
+    preserving pre-P2 behaviour.
 
     Round-robins across pages so a single hot category doesn't crowd out the
     others when ``max_per_source`` is small.
@@ -251,10 +281,36 @@ def fetch(filters: dict) -> list[Job]:
     seen_ids: set[str] = set()
     per_page_cards: list[list[tuple[str, str]]] = []
     page_status: list[tuple[str, int | None, int]] = []  # (url, status, raw_card_count)
+    # Track per-category cursor pages so the forensic + record_fetch step
+    # below sees the same page number we requested.
+    per_cat_page_num: list[int] = []
     body_head = ""
 
     try:
-        for url in pages:
+        for cat_url in pages:
+            # Decide which page to fetch for THIS category URL. The
+            # category URL itself is the "query" key — using the URL
+            # keeps each (category, page) cell distinct.
+            if db is not None:
+                page_num = db.next_page_for(
+                    "builtin", cat_url, "",
+                    max_page=BUILTIN_MAX_PAGE,
+                    min_revisit_age_s=min_revisit_age_s,
+                )
+                if page_num == -1:
+                    log.info(
+                        "builtin[%s]: all pages 1..%d fresh within %ds — skipping",
+                        cat_url, BUILTIN_MAX_PAGE, min_revisit_age_s,
+                    )
+                    page_status.append((cat_url, None, 0))
+                    per_page_cards.append([])
+                    per_cat_page_num.append(0)
+                    continue
+            else:
+                page_num = 1
+            per_cat_page_num.append(int(page_num))
+
+            url = _with_page_param(cat_url, page_num)
             try:
                 r = requests.get(url, headers=UA, timeout=20)
                 status = r.status_code
@@ -273,8 +329,10 @@ def fetch(filters: dict) -> list[Job]:
                 per_page_cards.append([])
                 body_head = body_head or repr(e)[:500]
 
-        # Round-robin selection across pages.
+        # Round-robin selection across pages. Track per-category emitted
+        # job_ids so we can compute jobs_seen / jobs_new for record_fetch.
         jobs: list[Job] = []
+        per_cat_emitted: list[list[str]] = [[] for _ in per_page_cards]
         idx = 0
         # Use independent cursors per page.
         cursors = [0] * len(per_page_cards)
@@ -295,10 +353,32 @@ def fetch(filters: dict) -> list[Job]:
                 if job is None:
                     continue
                 seen_ids.add(job_id)
+                per_cat_emitted[pi].append(f"builtin:{job_id}")
                 jobs.append(job)
             if not advanced:
                 break  # all pages exhausted
             idx += 1
+
+        # Record per-category cursor advancement. Done AFTER the
+        # round-robin so jobs_seen reflects what actually came out of
+        # this category (not the raw 25 cards/page, since downstream
+        # dedupe across categories may have hidden some).
+        if db is not None:
+            for pi, cat_url in enumerate(pages):
+                p_num = per_cat_page_num[pi] if pi < len(per_cat_page_num) else 0
+                if p_num <= 0:
+                    continue
+                seen_ids_p = per_cat_emitted[pi] if pi < len(per_cat_emitted) else []
+                try:
+                    existing = db.count_existing_jobs(seen_ids_p) if seen_ids_p else 0
+                    db.record_fetch(
+                        "builtin", cat_url, int(p_num), "",
+                        jobs_seen=len(seen_ids_p),
+                        jobs_new=max(0, len(seen_ids_p) - existing),
+                    )
+                except Exception:
+                    log.debug("builtin: db.record_fetch raised; continuing",
+                              exc_info=True)
 
     except Exception as e:  # noqa: BLE001
         log.exception("builtin fetch failed: %s", e)
