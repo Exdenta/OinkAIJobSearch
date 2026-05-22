@@ -47,9 +47,17 @@ SEARCH = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search
 
 # Cap the number of per-user queries we'll run in one pass. LinkedIn is
 # rate-sensitive; we enforce a hard cap here so a hand-edited profile
-# can't run away. 5 queries × 3 pages = 15 HTTP requests per user — still
-# well under LinkedIn's anonymous rate limit when paced.
-MAX_USER_QUERIES = 5
+# can't run away.
+#
+# Lifted 5 → 10 (P6-T2 2026-05-23) to match the new
+# `profile_builder._MAX_LINKEDIN_QUERIES = 10` cap. Note the per-run
+# HTTP volume is still bounded by `MAX_LINKEDIN_DISPATCHES` (the
+# cross-product trim cap below) — bumping this constant only matters
+# for the legacy PAIRED v2.0 shape where each entry is one dispatch.
+# For the SEPARATED v2.3 shape, the cross-product is computed first
+# and then trimmed to MAX_LINKEDIN_DISPATCHES, so 10 queries × 4 geos
+# = 40 combos → still 10 dispatches.
+MAX_USER_QUERIES = 10
 
 # v2.3: cross-product cap. When user_seeds use the new separated shape
 # {queries: [...], geos: [...]}, the dispatcher computes the full
