@@ -332,6 +332,19 @@ def post_filter(jobs: list[Job], filters: dict) -> list[Job]:
 # code path.
 _CURSOR_AWARE_SOURCES = frozenset({"justjoinit", "nofluffjobs", "builtin"})
 
+# The FULL set of P2 adapters that write to `search_fetches` (via
+# `record_fetch`). `_CURSOR_AWARE_SOURCES` is a strict subset — it's
+# the global-pass cursor adapters. `linkedin` and `web_search` ALSO
+# instrument `search_fetches`, but through per-user dispatch (their
+# `fetch_per_user` entry points), so they don't appear in the
+# cursor-aware set above. Both lists exist because the bug fix
+# (P6-T1) needs the COMPLETE set of instrumented sources to know
+# which cooldown rows are legitimately FSM-driven versus stuck due to
+# the original "no signal == 0% novelty" coercion bug.
+_P2_INSTRUMENTED_SOURCES = frozenset({
+    "linkedin", "justjoinit", "nofluffjobs", "builtin", "web_search",
+})
+
 
 # Adaptive source cooldown (algorithm v2.8 / P4 pipeline overhaul).
 # Demotion fires only after this many consecutive checks in which the
@@ -750,6 +763,24 @@ def run(
     filters = dict(DEFAULTS)
 
     db = DB(db_path)
+    # P6-T1 migration: reset any source_cooldowns row that the FSM
+    # wrongly demoted while `source_novelty_ratio` coerced "no
+    # instrumentation data" to "0% novelty". After this one-shot
+    # cleanup, uninstrumented sources start each run in 'normal' and
+    # the no-signal branch in `should_run_source` keeps them there.
+    # Idempotent: the SQL filter skips rows already at normal/0.
+    try:
+        reset_count = db.reset_uninstrumented_source_cooldowns(
+            set(_P2_INSTRUMENTED_SOURCES),
+        )
+        if reset_count:
+            log.info(
+                "P6-T1: reset %d wrongly-demoted source_cooldown rows "
+                "(uninstrumented sources stuck at half_freq).",
+                reset_count,
+            )
+    except Exception:
+        log.exception("P6-T1 cooldown reset raised; continuing")
     # TTL-prune the per-run digest enrichment cache that backs the ⬇/⬆
     # filter buttons. 7 days is generous: by then any digest the user
     # might still want to retroactively expand has long scrolled out of
