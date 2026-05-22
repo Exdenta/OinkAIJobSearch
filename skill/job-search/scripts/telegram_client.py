@@ -933,9 +933,17 @@ def _web_search_listing_still_open(
     if not (job.url or "").strip():
         return (None, "unknown:no_url")
     try:
-        from claude_cli import run_p_with_tools, extract_assistant_text, parse_json_block
+        from claude_cli import extract_assistant_text, parse_json_block
     except ImportError:
         return (None, "unknown:claude_cli_import")
+    # Route through the instrumented wrapper so each verifier call is
+    # recorded in `claude_calls` (counters + cost) and gets a forensic
+    # `claude_cli.run_p_with_tools` line. Previously this called the raw
+    # `run_p_with_tools` and never appeared in `/stats` or cost reports.
+    try:
+        from instrumentation.wrappers import wrapped_run_p_with_tools
+    except ImportError:
+        return (None, "unknown:wrappers_import")
 
     prompt = (
         "You verify whether a job posting is still accepting applications.\n"
@@ -1061,7 +1069,9 @@ def _web_search_listing_still_open(
         from claude_cli import SMALLEST_MODEL as _LIVENESS_MODEL
     except ImportError:
         _LIVENESS_MODEL = "haiku"
-    stdout = run_p_with_tools(
+    stdout = wrapped_run_p_with_tools(
+        None,
+        "web_search_liveness",
         prompt,
         allowed_tools="WebFetch WebSearch",
         timeout_s=timeout_s,
