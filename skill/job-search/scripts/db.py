@@ -230,6 +230,39 @@ CREATE TABLE IF NOT EXISTS queued_matches (
 CREATE INDEX IF NOT EXISTS idx_queued_matches_user_age
     ON queued_matches(chat_id, queued_at);
 
+-- Per-source pagination memory (algorithm v2.7, P2 of pipeline overhaul).
+-- Continuous mode fires the search loop every couple of hours; without
+-- memory every iteration re-fetched page 1 of every source and re-scored
+-- the same listings. This table records ONE row per
+-- (source, query, page, location) so adapters can advance to the next
+-- unseen page on each iteration and only fall back to page 1 once the
+-- previous fetch is older than `min_revisit_age_s` seconds.
+--
+-- Columns:
+--   * jobs_seen / jobs_new — telemetry the (P4) source-cooldown logic
+--     consumes via `source_novelty_ratio`. Recorded on every fetch so
+--     the signal is available to operators immediately.
+--   * fetched_at is REPLACED on every record_fetch — INSERT OR REPLACE
+--     against the composite primary key. The previous fetch's stats are
+--     overwritten; the cursor advancement reads only the latest row per
+--     (source, query, page, location).
+--
+-- Adapters that don't paginate (HN, RemoteOK, RemoteOK clones, etc.)
+-- never call record_fetch and their cursors stay empty — they keep
+-- their current "fetch everything in one shot" behaviour.
+CREATE TABLE IF NOT EXISTS search_fetches (
+    source        TEXT    NOT NULL,
+    query         TEXT    NOT NULL,
+    page          INTEGER NOT NULL,
+    location      TEXT    NOT NULL DEFAULT '',
+    fetched_at    REAL    NOT NULL,
+    jobs_seen     INTEGER NOT NULL DEFAULT 0,
+    jobs_new      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (source, query, page, location)
+);
+CREATE INDEX IF NOT EXISTS idx_search_fetches_last_seen
+    ON search_fetches(source, fetched_at);
+
 CREATE INDEX IF NOT EXISTS idx_app_status ON applications(chat_id, status);
 CREATE INDEX IF NOT EXISTS idx_sent_job ON sent_messages(chat_id, job_id);
 CREATE INDEX IF NOT EXISTS idx_profile_builds_chat ON profile_builds(chat_id, built_at DESC);
@@ -1882,6 +1915,249 @@ class DB:
                     (int(chat_id), str(profile_hash)),
                 )
             return int(cur.rowcount or 0)
+
+    # ---------- search_fetches (page memory, P2 pipeline overhaul) ----------
+    #
+    # Each row records ONE adapter call: "source X fetched page P for query Q
+    # at location L at time T, saw N postings, M were new to the jobs table".
+    # The continuous-scheduler will fire iterations every couple of hours
+    # (P3); without page memory each iteration re-fetched page 1 and wasted
+    # scoring on the same listings. The cursor advancement in `next_page_for`
+    # lets each iteration walk forward through the source's pagination until
+    # the previous page-1 fetch is old enough to be worth re-running.
+    #
+    # Telemetry-bearing columns (`jobs_seen` / `jobs_new`) are summed by
+    # `source_novelty_ratio` for the P4 source-cooldown heuristic — exposed
+    # now so the data exists when P4 lands.
+
+    def record_fetch(
+        self,
+        source: str,
+        query: str,
+        page: int,
+        location: str,
+        jobs_seen: int,
+        jobs_new: int,
+    ) -> None:
+        """Record (or overwrite) one fetch's cursor + telemetry.
+
+        INSERT OR REPLACE against the (source, query, page, location)
+        primary key — re-fetching the same page later REPLACES the row
+        with fresh `fetched_at` and updated counts (the previous fetch's
+        stats are lost; we keep only the latest per cell).
+
+        No-op when `source` or `query` is empty (defensive: a malformed
+        adapter call must not pollute the table). `location` may legally
+        be the empty string — that's how worldwide / no-location fetches
+        are keyed.
+        """
+        if not source or query is None:
+            return
+        q_str = str(query)
+        # The primary key allows '' but not None for `location`.
+        loc = "" if location is None else str(location)
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT OR REPLACE INTO search_fetches
+                  (source, query, page, location, fetched_at,
+                   jobs_seen, jobs_new)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(source), q_str, int(page), loc, time.time(),
+                    max(0, int(jobs_seen or 0)),
+                    max(0, int(jobs_new or 0)),
+                ),
+            )
+
+    def get_fetch(
+        self,
+        source: str,
+        query: str,
+        page: int,
+        location: str,
+    ) -> dict | None:
+        """Return the single row for this cursor cell, or None if absent.
+
+        Used by `next_page_for` to inspect a candidate (source, query, page,
+        location)'s last fetch time before deciding whether to re-fetch.
+        """
+        if not source or query is None:
+            return None
+        loc = "" if location is None else str(location)
+        with self._conn() as c:
+            row = c.execute(
+                """
+                SELECT source, query, page, location, fetched_at,
+                       jobs_seen, jobs_new
+                  FROM search_fetches
+                 WHERE source = ? AND query = ? AND page = ? AND location = ?
+                """,
+                (str(source), str(query), int(page), loc),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "source":     row["source"],
+            "query":      row["query"],
+            "page":       int(row["page"] or 0),
+            "location":   row["location"] or "",
+            "fetched_at": float(row["fetched_at"] or 0.0),
+            "jobs_seen":  int(row["jobs_seen"] or 0),
+            "jobs_new":   int(row["jobs_new"] or 0),
+        }
+
+    def stale_fetches(
+        self,
+        source: str,
+        max_age_seconds: float,
+    ) -> list[dict]:
+        """All rows for `source` older than the cutoff, ascending by age.
+
+        Returns dict rows in the same shape as `get_fetch` (with no
+        composite-key fields elided), ordered by `fetched_at ASC` so the
+        oldest entries come first. Empty list when nothing is stale yet.
+        """
+        cutoff = time.time() - float(max_age_seconds)
+        with self._conn() as c:
+            rows = c.execute(
+                """
+                SELECT source, query, page, location, fetched_at,
+                       jobs_seen, jobs_new
+                  FROM search_fetches
+                 WHERE source = ? AND fetched_at <= ?
+                 ORDER BY fetched_at ASC
+                """,
+                (str(source), float(cutoff)),
+            ).fetchall()
+        return [
+            {
+                "source":     r["source"],
+                "query":      r["query"],
+                "page":       int(r["page"] or 0),
+                "location":   r["location"] or "",
+                "fetched_at": float(r["fetched_at"] or 0.0),
+                "jobs_seen":  int(r["jobs_seen"] or 0),
+                "jobs_new":   int(r["jobs_new"] or 0),
+            }
+            for r in rows
+        ]
+
+    def next_page_for(
+        self,
+        source: str,
+        query: str,
+        location: str,
+        max_page: int,
+        min_revisit_age_s: float,
+    ) -> int:
+        """Decide which page to fetch next for (source, query, location).
+
+        Cursor rules:
+          * Page 1 stale (older than `min_revisit_age_s`) → return 1.
+            Re-fetching from the top is justified because the source has
+            likely cycled in fresh top-of-list listings since.
+          * Page 1 fresh, some higher page recorded → return
+            ``min(max_page, highest_recorded_page + 1)``.
+          * Page 1 fresh, every page in 1..max_page recorded AND fresh →
+            return -1 (caller skips this (query, location) for this run).
+          * Page 1 fresh, highest recorded page == max_page → return 1
+            (start the cycle over rather than refuse — keeps each
+            iteration productive when the source ages between runs).
+
+        `max_page` is adapter-specific (linkedin=10, justjoinit=5, etc.);
+        the cursor never goes higher.
+        """
+        if not source or query is None or max_page <= 0:
+            return 1
+        loc = "" if location is None else str(location)
+        cutoff = time.time() - float(min_revisit_age_s)
+        with self._conn() as c:
+            # All recorded pages for this cell, freshest first.
+            rows = c.execute(
+                """
+                SELECT page, fetched_at
+                  FROM search_fetches
+                 WHERE source = ? AND query = ? AND location = ?
+                """,
+                (str(source), str(query), loc),
+            ).fetchall()
+        by_page: dict[int, float] = {
+            int(r["page"] or 0): float(r["fetched_at"] or 0.0)
+            for r in rows
+        }
+        # No history → start at page 1.
+        if not by_page:
+            return 1
+        page1_at = by_page.get(1)
+        if page1_at is None or page1_at < cutoff:
+            return 1
+        # Page 1 is fresh. Walk pages 1..max_page; if any is missing or
+        # stale, that's where we resume.
+        for p in range(1, int(max_page) + 1):
+            seen_at = by_page.get(p)
+            if seen_at is None or seen_at < cutoff:
+                return p
+        # Every page covered and fresh — refuse this run.
+        return -1
+
+    def source_novelty_ratio(
+        self,
+        source: str,
+        since_seconds_ago: float,
+    ) -> float:
+        """Returns ``sum(jobs_new) / sum(jobs_seen)`` over the lookback window.
+
+        Exposed now for P4's adaptive source cooldown — a near-zero ratio
+        signals a source that's not surfacing anything new and can be
+        deprioritised. Returns ``0.0`` when no rows match or when
+        ``jobs_seen`` sums to zero (no division by zero — a quiet source
+        is treated identically to a no-data source for this signal).
+        """
+        if not source or since_seconds_ago <= 0:
+            return 0.0
+        cutoff = time.time() - float(since_seconds_ago)
+        with self._conn() as c:
+            row = c.execute(
+                """
+                SELECT COALESCE(SUM(jobs_seen), 0) AS seen_sum,
+                       COALESCE(SUM(jobs_new),  0) AS new_sum
+                  FROM search_fetches
+                 WHERE source = ? AND fetched_at >= ?
+                """,
+                (str(source), float(cutoff)),
+            ).fetchone()
+        if row is None:
+            return 0.0
+        seen = float(row["seen_sum"] or 0.0)
+        if seen <= 0:
+            return 0.0
+        new_ = float(row["new_sum"] or 0.0)
+        return new_ / seen
+
+    def count_existing_jobs(self, job_ids: Iterable[str]) -> int:
+        """Return how many of `job_ids` are already present in the `jobs` table.
+
+        Used by adapters with the P2 cursor to compute ``jobs_new`` for
+        `record_fetch` cheaply — counting hits instead of materialising
+        full rows the way `get_jobs_by_ids` does.
+        """
+        ids = [str(j) for j in job_ids if j]
+        if not ids:
+            return 0
+        total = 0
+        chunk_size = 500
+        with self._conn() as c:
+            for start in range(0, len(ids), chunk_size):
+                chunk = ids[start:start + chunk_size]
+                placeholders = ",".join("?" for _ in chunk)
+                row = c.execute(
+                    f"SELECT COUNT(*) AS n FROM jobs WHERE job_id IN ({placeholders})",
+                    tuple(chunk),
+                ).fetchone()
+                total += int(row["n"] or 0) if row else 0
+        return total
 
     # ---------- resume_suggestions ----------
 
