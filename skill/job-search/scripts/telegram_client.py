@@ -729,6 +729,185 @@ WEB_SEARCH_VERIFY_OFF: bool = os.environ.get("WEB_SEARCH_VERIFY_OFF", "").strip(
 )
 WEB_SEARCH_VERIFY_TIMEOUT_S: int = _env_int("WEB_SEARCH_VERIFY_TIMEOUT_S", 90)
 
+# Operator escape hatch for the structural soft-404 gate (Section B of
+# P6-T4). Default off (=gate enabled). Flip to any non-empty/non-zero
+# value to bypass the URL-pattern check and rely solely on the LLM
+# verifier — useful for debugging when a legitimate URL shape happens to
+# trip a pattern.
+WEB_SEARCH_SOFT_404_GATE_OFF: bool = os.environ.get(
+    "WEB_SEARCH_SOFT_404_GATE_OFF", "",
+).strip() not in ("", "0", "false", "False")
+
+
+# ---------- Structural soft-404 patterns (closed-set, transport-layer) ----------
+#
+# These regexes match the FINAL URL (post-redirect) for known ATS surrogate
+# pages that return HTTP 200 even though the underlying role is gone. They
+# are *facts about ATS systems*, not heuristics about job fit — analogous
+# to the `_ALLOWED_ATS` allowlist in profile_builder.py. See CLAUDE.md for
+# the design-principle exception that justifies this hardcoded set.
+#
+# Each pattern's rationale is inline. When adding a new pattern: only
+# include shapes that are PROVABLY a "role gone, see other openings"
+# surrogate (e.g. documented in the ATS UI, or observed shipping a fake
+# URL to a user). Generic heuristics — "looks like an index page" —
+# belong in the LLM verifier prompt, not here.
+
+# Workable surrogate pages:
+#  - `apply.workable.com/oops` is the global 404 landing.
+#  - `apply.workable.com/<co>/?not_found=true` or `?expired=true` is the
+#    company-scoped "role removed" landing. Returns 200, lists other
+#    openings, "Apply" buttons belong to OTHER roles.
+#  - `apply.workable.com/<co>/` with no `/j/<slug>` after it = redirect
+#    away from the specific role to the company index.
+_SOFT_404_WORKABLE_OOPS = re.compile(
+    r"^https?://apply\.workable\.com/oops/?(?:\?.*)?$",
+    re.IGNORECASE,
+)
+_SOFT_404_WORKABLE_NOT_FOUND = re.compile(
+    r"^https?://apply\.workable\.com/[^/]+/?\?[^#]*(?:not_found|expired|removed)=true",
+    re.IGNORECASE,
+)
+_SOFT_404_WORKABLE_NO_SLUG = re.compile(
+    # apply.workable.com/<co>/ with optional query, but NO /j/<id> path
+    # segment. The `j/` is Workable's canonical role-slug prefix; its
+    # absence means we landed on the company's careers index.
+    r"^https?://apply\.workable\.com/[^/]+/?(?:\?.*)?$",
+    re.IGNORECASE,
+)
+
+# Lever: `jobs.lever.co/<co>` (no UUID suffix). A real role URL is
+# `jobs.lever.co/<co>/<uuid>` where uuid is hex with hyphens. If we land
+# on the company root, the role is gone or never existed.
+_SOFT_404_LEVER_INDEX = re.compile(
+    r"^https?://jobs\.lever\.co/[^/]+/?(?:\?.*)?$",
+    re.IGNORECASE,
+)
+
+# Greenhouse: `boards.greenhouse.io/<co>/` (no `/jobs/<id>`). Same
+# rationale — role URLs require the `/jobs/<numeric-id>` suffix.
+_SOFT_404_GREENHOUSE_INDEX = re.compile(
+    r"^https?://boards\.greenhouse\.io/[^/]+/?(?:\?.*)?$",
+    re.IGNORECASE,
+)
+
+# Ashby: `jobs.ashbyhq.com/<co>` (no trailing UUID). Real role URL is
+# `jobs.ashbyhq.com/<co>/<uuid>` (Ashby uses UUIDs, like
+# `d2e6c8a4-...-...`).
+_SOFT_404_ASHBY_INDEX = re.compile(
+    r"^https?://jobs\.ashbyhq\.com/[^/]+/?(?:\?.*)?$",
+    re.IGNORECASE,
+)
+
+# SmartRecruiters surrogate: any URL carrying `status=expired` /
+# `status=closed` query. SmartRecruiters appends these on the "this job
+# has expired" landing page.
+_SOFT_404_SMARTRECRUITERS_STATUS = re.compile(
+    r"\?[^#]*status=(?:expired|closed)\b",
+    re.IGNORECASE,
+)
+
+# LinkedIn redirect-away: a specific job-id URL that, after redirect,
+# lands on the generic `/jobs/search/` page. LinkedIn redirects expired
+# postings here when the role-id no longer resolves.
+_SOFT_404_LINKEDIN_SEARCH = re.compile(
+    r"^https?://(?:[a-z]+\.)?linkedin\.com/jobs/search/?(?:\?|$|#)",
+    re.IGNORECASE,
+)
+
+
+def _url_pattern_is_soft_404(final_url: str) -> tuple[bool, str]:
+    """Match a post-redirect URL against known ATS soft-404 surrogate
+    patterns.
+
+    Returns ``(True, "closed:<pattern>")`` on a match, ``(False, "")``
+    otherwise. The pattern label is short and stable so forensic queries
+    can bucket drops by ATS shape.
+
+    Important: this runs against the FINAL URL after redirects. Callers
+    typically issue a HEAD with ``allow_redirects=True`` and pass
+    ``response.url`` here. Passing the original (pre-redirect) URL is
+    safe but limits the gate's value — many soft-404s are only visible
+    after the redirect.
+    """
+    if not final_url or not isinstance(final_url, str):
+        return (False, "")
+    url = final_url.strip()
+    if not url:
+        return (False, "")
+
+    # Workable: check the most specific patterns first so the reason
+    # label is informative (oops vs not_found vs no-slug index).
+    if _SOFT_404_WORKABLE_OOPS.search(url):
+        return (True, "closed:workable_oops")
+    if _SOFT_404_WORKABLE_NOT_FOUND.search(url):
+        return (True, "closed:workable_not_found")
+    # The "no /j/<slug>" check must NOT fire for full role URLs. We test
+    # for the explicit `/j/` segment first to short-circuit, then fall
+    # through to the index-only match.
+    parsed_host = ""
+    try:
+        parsed_host = urlparse(url).netloc.lower()
+    except Exception:
+        parsed_host = ""
+    if parsed_host.endswith("apply.workable.com") and "/j/" not in urlparse(url).path:
+        if _SOFT_404_WORKABLE_NO_SLUG.match(url):
+            return (True, "closed:workable_index")
+
+    # Lever: only fire when there's NO uuid path segment after the co.
+    if parsed_host == "jobs.lever.co":
+        path = urlparse(url).path.strip("/")
+        # path is "<co>" alone if there's no role slug. A real role URL
+        # has at least one `/` after the company segment.
+        if "/" not in path:
+            return (True, "closed:lever_index")
+
+    # Greenhouse: index page detection — `<co>/` with no `/jobs/<id>`.
+    if parsed_host == "boards.greenhouse.io":
+        path = urlparse(url).path.strip("/")
+        if "/" not in path:
+            return (True, "closed:greenhouse_index")
+
+    # Ashby: `<co>` with no uuid segment.
+    if parsed_host == "jobs.ashbyhq.com":
+        path = urlparse(url).path.strip("/")
+        if "/" not in path:
+            return (True, "closed:ashby_index")
+
+    # SmartRecruiters: query-string status flag.
+    if _SOFT_404_SMARTRECRUITERS_STATUS.search(url):
+        return (True, "closed:smartrecruiters_status")
+
+    # LinkedIn redirect to /jobs/search/.
+    if _SOFT_404_LINKEDIN_SEARCH.search(url):
+        return (True, "closed:linkedin_search_redirect")
+
+    return (False, "")
+
+
+def _resolve_final_url(url: str, timeout_s: float) -> str | None:
+    """Issue a HEAD against ``url`` and return the final URL after
+    redirects. Returns None on any transport failure (the caller falls
+    back to using the input URL for soft-404 matching). Never raises.
+
+    Kept separate from `_url_is_alive` because that helper deliberately
+    doesn't expose the final URL — its contract is the alive boolean
+    plus a stable reason string. Threading the URL through there would
+    change the contract for every other caller.
+    """
+    if not url or not isinstance(url, str):
+        return None
+    try:
+        resp, err = _head_with_429_retry(url, timeout_s)
+        if err is not None or resp is None:
+            return None
+        final = getattr(resp, "url", None)
+        if isinstance(final, str) and final.strip():
+            return final
+        return None
+    except Exception:
+        return None
+
 
 def _web_search_listing_still_open(
     job: Job, timeout_s: int = WEB_SEARCH_VERIFY_TIMEOUT_S,
