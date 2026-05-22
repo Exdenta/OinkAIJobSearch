@@ -223,10 +223,17 @@ def test_source_novelty_ratio(tmp_db):
 
 
 def test_source_novelty_ratio_zero_seen_returns_zero(tmp_db):
-    """No rows OR jobs_seen sums to 0 → 0.0, never a ZeroDivisionError."""
-    assert tmp_db.source_novelty_ratio("linkedin", 86400) == 0.0
+    """Distinguish "no data" (None) from "real 0%" (0.0) — see P6-T1.
 
-    # Add a row whose jobs_seen is 0 — still no division.
+    Contract:
+      * No rows match → None (uninstrumented source, no signal).
+      * Rows match but ``SUM(jobs_seen) == 0`` → 0.0 (a real "we
+        fetched but got nothing" signal; never a ZeroDivisionError).
+    """
+    # No rows for this source — None, not 0.0.
+    assert tmp_db.source_novelty_ratio("linkedin", 86400) is None
+
+    # Add a row whose jobs_seen is 0 — still no division, returns 0.0.
     tmp_db.record_fetch("linkedin", "empty", 1, "", jobs_seen=0, jobs_new=0)
     assert tmp_db.source_novelty_ratio("linkedin", 86400) == 0.0
 
