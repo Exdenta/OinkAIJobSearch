@@ -1808,9 +1808,9 @@ def prefilter_for_send(
     """Run the age / dead-URL / forum / LLM-liveness gates on `jobs`.
 
     Extracted from `send_per_job_digest` so `search_jobs.run` can call
-    it BEFORE deciding whether to fall back to the closest miss when
-    the floor-survivors all die at the send-time gates (algorithm v2.4
-    fallback path).
+    it BEFORE deciding whether to enqueue survivors into the per-user
+    quality buffer (algorithm v2.6, P1). Anything the gates kill here
+    never reaches the buffer.
 
     Returns `(alive, drop_counts)` where `drop_counts` carries:
         too_old_count, dead_url_count, forum_url_count,
@@ -1942,8 +1942,6 @@ def send_per_job_digest(
     dropped_below_score: int = 0,
     lower_count_at_step: int = 0,
     skip_header: bool = False,
-    fallback_mode: bool = False,
-    fallback_top_score: int = 0,
     pre_filtered: bool = False,
 ) -> int:
     """Send one message per job, each with its own inline keyboard.
@@ -2075,25 +2073,12 @@ def send_per_job_digest(
                 current_floor=int(min_score or 0),
                 lower_count=int(lower_count_at_step or 0),
             )
-            if fallback_mode:
-                # v2.4 "no matches at floor" fallback. alive_jobs has
-                # exactly 1 entry — the closest miss the picker chose.
-                header_text = (
-                    "🐷 *No matches today*\n\n"
-                    + mdv2_escape(
-                        f"Nothing cleared your filter "
-                        f"({int(min_score)} of 5). Showing the closest "
-                        f"miss instead — best available score "
-                        f"{int(fallback_top_score)} of 5."
-                    )
-                )
-            else:
-                header_text = digest_header_mdv2() + "\n\n" + _count_line(
-                    alive_jobs,
-                    min_score=min_score,
-                    enriched_count=enriched_count,
-                    dropped_below_score=dropped_below_score,
-                )
+            header_text = digest_header_mdv2() + "\n\n" + _count_line(
+                alive_jobs,
+                min_score=min_score,
+                enriched_count=enriched_count,
+                dropped_below_score=dropped_below_score,
+            )
             tg.send_message(chat_id, header_text, reply_markup=kb)
         except Exception as e:
             header_status = "error"
