@@ -279,11 +279,58 @@ DERIVATION RULES
 20. `min_match_score` — default 0. If user_description says something like
     "only strong matches", set 3; "only great matches", set 4.
 
-21. `search_seeds.linkedin.queries` — up to 5 entries. Each `q` is a
-    short, LinkedIn-UI-shaped phrase (NOT a boolean query). Each `geo` is
-    a LinkedIn-recognizable region name (e.g. "Spain", "European Union",
-    "United Kingdom", "Germany", "Belgium", "Netherlands", "Ireland",
-    "Poland", "United States"). `f_TPR` is always "r86400" (past 24h).
+21. `search_seeds.linkedin.queries` — 8-12 entries (range, not exact).
+    Each `q` is a short, LinkedIn-UI-shaped phrase (NOT a boolean
+    query). Each `geo` is a LinkedIn-recognizable region name (e.g.
+    "Spain", "European Union", "United Kingdom", "Germany", "Belgium",
+    "Netherlands", "Ireland", "Poland", "United States"). `f_TPR` is
+    always "r86400" (past 24h).
+
+    QUALITY OVER QUANTITY: 8-12 is the target band. If the candidate's
+    resume genuinely supports fewer (very narrow specialty, single
+    stack, niche role family), emit fewer rather than padding with
+    weak queries — a 6-query profile of tight queries beats a 12-query
+    profile half of which are stretch matches.
+
+    DIVERSIFICATION RECIPE — fill the 8-12 slots with this mix:
+
+      1. PRIMARY-STACK VARIANTS (2-3 queries). The candidate's main
+         stack with different role-noun forms. Cycle the noun across
+         "developer", "engineer", "developer" — LinkedIn cards index
+         slightly differently across noun synonyms, so the variants
+         each unlock distinct postings.
+         Example for a React frontend dev:
+           "frontend developer react", "react engineer", "react developer"
+
+      2. SECONDARY-STACK VARIANTS (1-2 queries). If the resume shows a
+         secondary stack (Vue alongside React, FastAPI alongside
+         Django, Next.js alongside vanilla React, etc.) emit 1-2
+         queries anchored on it. Example: "vue developer", "next.js
+         engineer", "typescript frontend". Skip entirely if the resume
+         has no clear secondary stack.
+
+      3. ADJACENT-ROLE TITLES (2-3 queries). Roles the candidate could
+         plausibly fit, derived from resume signals — not just role-
+         family neighbors at random. Concrete derivations:
+           * Frontend dev with backend touch in resume → "fullstack
+             react node", "javascript developer", "web developer mid"
+           * Backend dev with K8s experience → "platform engineer
+             python", "devops backend"
+           * React Native experience on a frontend resume → "mobile
+             react native engineer"
+           * Data engineer with ML on resume → "ml engineer python",
+             "machine learning engineer"
+         Pick adjacencies the resume actually supports. Don't invent.
+
+      4. GEO DIVERSIFICATION (existing rule). Spread `geo` values
+         across candidate-OK'd regions. Don't repeat the same geo for
+         back-to-back queries — the runner reorders to interleave but
+         a mostly-single-geo set still dedupes heavily.
+
+      5. ONE REMOTE VARIANT (1 query, geo-agnostic-but-stack-specific).
+         E.g. "react typescript remote", "frontend remote europe",
+         "python backend remote". This catches global-remote roles
+         whose country page doesn't surface in single-geo searches.
 
     GEO RESTRICTION — pick `geo` values ONLY from regions the candidate
     has actually OK'd. Specifically:
@@ -298,23 +345,28 @@ DERIVATION RULES
     prefer `geo="European Union"` over individual member states — fewer
     queries, less off-locale noise.
 
-    Diversify GEOS across the 5 queries so they don't dedupe each other
-    (LinkedIn over-deduplicates same-region searches). Pick DIFFERENT
-    regions when possible WITHIN the allowed set above — never add
-    out-of-locale geos just to diversify.
+    Diversify GEOS across the 8-12 queries so they don't dedupe each
+    other (LinkedIn over-deduplicates same-region searches). Pick
+    DIFFERENT regions when possible WITHIN the allowed set above —
+    never add out-of-locale geos just to diversify.
 
     Construct each `q` using vocabulary recruiters write, NOT resume
     jargon. By role family:
 
-      - Tech/engineering — primary_role variant + a top stack token:
-        a. primary_role + top stack_primary in candidate's main geo
-        b. primary_role + remote/region hint in a wider region
-        c. (optional) stack_secondary angle in another candidate-allowed geo
+      - Tech/engineering — primary_role variant + a top stack token.
+        Target 8-10 queries: 2-3 primary-stack variants, 1-2 secondary-
+        stack, 2-3 adjacent-role, 1 remote-only.
         Example (Vue frontend mid, Bilbao, remote-EU OK):
           [
             {{"q":"frontend vue developer","geo":"Spain","f_TPR":"r86400"}},
-            {{"q":"react typescript remote","geo":"European Union","f_TPR":"r86400"}},
-            {{"q":"nuxt frontend","geo":"Spain","f_TPR":"r86400"}}
+            {{"q":"vue engineer","geo":"European Union","f_TPR":"r86400"}},
+            {{"q":"vue developer","geo":"Spain","f_TPR":"r86400"}},
+            {{"q":"react typescript developer","geo":"European Union","f_TPR":"r86400"}},
+            {{"q":"nuxt frontend","geo":"Spain","f_TPR":"r86400"}},
+            {{"q":"fullstack javascript node","geo":"European Union","f_TPR":"r86400"}},
+            {{"q":"javascript developer mid","geo":"Spain","f_TPR":"r86400"}},
+            {{"q":"web developer","geo":"European Union","f_TPR":"r86400"}},
+            {{"q":"vue typescript remote","geo":"European Union","f_TPR":"r86400"}}
           ]
         Note: every `geo` is a region the candidate OK'd. No Germany,
         Poland, Netherlands etc. unless the user explicitly listed them.
@@ -322,20 +374,39 @@ DERIVATION RULES
       - Research/academic — operational role + thematic specialty + geo:
         Use nouns recruiters use (researcher, fellow, postdoc, lecturer,
         analyst, assistant) NOT discipline names (ethnography,
-        ethnomethodology, discourse analysis). Example for a migration/
-        peace-studies anthropologist:
+        ethnomethodology, discourse analysis). Target 8-10 queries —
+        cycle the operational nouns (researcher / officer / analyst /
+        fellow / consultant) across the candidate's thematic specialties.
+        Example for a migration/peace-studies anthropologist:
           [
             {{"q":"research officer migration","geo":"European Union","f_TPR":"r86400"}},
+            {{"q":"researcher migration","geo":"Belgium","f_TPR":"r86400"}},
             {{"q":"postdoctoral researcher anthropology","geo":"United Kingdom","f_TPR":"r86400"}},
-            {{"q":"policy analyst peace conflict","geo":"Belgium","f_TPR":"r86400"}}
+            {{"q":"postdoc peace conflict","geo":"European Union","f_TPR":"r86400"}},
+            {{"q":"policy analyst peace conflict","geo":"Belgium","f_TPR":"r86400"}},
+            {{"q":"research associate migration","geo":"European Union","f_TPR":"r86400"}},
+            {{"q":"programme officer migration","geo":"Belgium","f_TPR":"r86400"}},
+            {{"q":"M&E specialist humanitarian","geo":"European Union","f_TPR":"r86400"}},
+            {{"q":"researcher peace conflict remote","geo":"European Union","f_TPR":"r86400"}}
           ]
 
       - NGO/policy/development — operational role + thematic + geo:
           [
             {{"q":"programme officer migration","geo":"Belgium","f_TPR":"r86400"}},
+            {{"q":"project officer migration","geo":"European Union","f_TPR":"r86400"}},
             {{"q":"policy analyst climate","geo":"Netherlands","f_TPR":"r86400"}},
-            {{"q":"M&E specialist humanitarian","geo":"European Union","f_TPR":"r86400"}}
+            {{"q":"M&E specialist humanitarian","geo":"European Union","f_TPR":"r86400"}},
+            {{"q":"field officer NGO","geo":"Belgium","f_TPR":"r86400"}},
+            {{"q":"programme analyst","geo":"European Union","f_TPR":"r86400"}},
+            {{"q":"humanitarian consultant","geo":"Belgium","f_TPR":"r86400"}},
+            {{"q":"NGO programme manager remote","geo":"European Union","f_TPR":"r86400"}}
           ]
+
+    BACK-COMPAT NOTE for the operator — existing user profiles built
+    before 2026-05-23 carry 5-query seeds. They keep working unchanged
+    (the validator accepts up to 10 queries; 5 < 10 is fine). Users
+    only get the new 8-12 set the next time `/rebuildprofile` (or
+    resume-upload / prefs-change) triggers a rebuild.
 
 22. `search_seeds.web_search.seed_phrases` — 5-8 items. Each is a short
     search-engine query (lowercase, no boolean operators needed; the
@@ -402,7 +473,9 @@ HARD CONSTRAINTS (the parser checks these)
  - All strings in list fields other than `exclude_companies` MUST be
    lowercase.
  - `title_must_match` and `title_exclude` strings must be ≤ 40 chars each.
- - `search_seeds.linkedin.queries` length ≤ 5.
+ - `search_seeds.linkedin.queries` length ≤ 10 (target band 8-12, but
+   parser hard cap is 10; emit fewer when the resume genuinely supports
+   fewer).
  - Each `search_seeds.linkedin.queries[i].q` ≤ 80 chars.
  - `search_seeds.web_search.seed_phrases` length ≤ 12, each ≤ 120 chars.
  - `search_seeds.web_search.ats_domains` MUST be a subset of the allowlist
@@ -451,8 +524,14 @@ Output:
     "linkedin": {{
       "queries": [
         {{"q": "frontend vue developer", "geo": "Spain", "f_TPR": "r86400"}},
-        {{"q": "react typescript remote", "geo": "European Union", "f_TPR": "r86400"}},
-        {{"q": "vue frontend engineer", "geo": "Spain", "f_TPR": "r86400"}}
+        {{"q": "vue engineer", "geo": "European Union", "f_TPR": "r86400"}},
+        {{"q": "vue developer", "geo": "Spain", "f_TPR": "r86400"}},
+        {{"q": "react typescript developer", "geo": "European Union", "f_TPR": "r86400"}},
+        {{"q": "nuxt frontend", "geo": "Spain", "f_TPR": "r86400"}},
+        {{"q": "fullstack javascript node", "geo": "European Union", "f_TPR": "r86400"}},
+        {{"q": "javascript developer mid", "geo": "Spain", "f_TPR": "r86400"}},
+        {{"q": "web developer", "geo": "European Union", "f_TPR": "r86400"}},
+        {{"q": "vue typescript remote", "geo": "European Union", "f_TPR": "r86400"}}
       ]
     }},
     "web_search": {{
@@ -507,8 +586,14 @@ Output:
     "linkedin": {{
       "queries": [
         {{"q": "senior backend python", "geo": "United States", "f_TPR": "r86400"}},
+        {{"q": "python engineer", "geo": "United States", "f_TPR": "r86400"}},
+        {{"q": "backend python developer", "geo": "United States", "f_TPR": "r86400"}},
         {{"q": "python django remote", "geo": "United States", "f_TPR": "r86400"}},
-        {{"q": "fastapi backend remote", "geo": "United States", "f_TPR": "r86400"}}
+        {{"q": "fastapi backend remote", "geo": "United States", "f_TPR": "r86400"}},
+        {{"q": "go backend engineer", "geo": "United States", "f_TPR": "r86400"}},
+        {{"q": "platform engineer python", "geo": "United States", "f_TPR": "r86400"}},
+        {{"q": "senior python engineer remote", "geo": "United States", "f_TPR": "r86400"}},
+        {{"q": "backend python aws remote", "geo": "United States", "f_TPR": "r86400"}}
       ]
     }},
     "web_search": {{
@@ -568,8 +653,14 @@ Output:
     "linkedin": {{
       "queries": [
         {{"q": "research officer migration", "geo": "European Union", "f_TPR": "r86400"}},
+        {{"q": "researcher migration", "geo": "Belgium", "f_TPR": "r86400"}},
         {{"q": "postdoctoral researcher anthropology", "geo": "United Kingdom", "f_TPR": "r86400"}},
-        {{"q": "policy analyst peace conflict", "geo": "Belgium", "f_TPR": "r86400"}}
+        {{"q": "postdoc peace conflict", "geo": "European Union", "f_TPR": "r86400"}},
+        {{"q": "policy analyst peace conflict", "geo": "Belgium", "f_TPR": "r86400"}},
+        {{"q": "research associate migration", "geo": "European Union", "f_TPR": "r86400"}},
+        {{"q": "programme officer migration", "geo": "Belgium", "f_TPR": "r86400"}},
+        {{"q": "M&E specialist humanitarian", "geo": "European Union", "f_TPR": "r86400"}},
+        {{"q": "researcher peace conflict remote", "geo": "European Union", "f_TPR": "r86400"}}
       ]
     }},
     "web_search": {{
