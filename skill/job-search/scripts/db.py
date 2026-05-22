@@ -211,6 +211,25 @@ CREATE TABLE IF NOT EXISTS posting_clicks (
     referer     TEXT
 );
 
+-- Quality-buffer queue (algorithm v2.6, P1 of pipeline overhaul). Continuous
+-- searches enqueue jobs that pass scoring (>=4) + send-time prefilter here
+-- instead of firing a digest every run; the queue is flushed in one batch
+-- once depth >= quality_send_threshold OR the oldest entry exceeds
+-- max_queue_latency_hours. `profile_hash` snapshots the user's scoring
+-- inputs at enqueue time; resume/prefs edits flip the hash and the stale
+-- rows are silently purged on the next send-decision (they may no longer
+-- fit). match_score is the score that gated entry, always >=4.
+CREATE TABLE IF NOT EXISTS queued_matches (
+    chat_id        INTEGER NOT NULL,
+    job_id         TEXT    NOT NULL,
+    profile_hash   TEXT    NOT NULL,
+    match_score    INTEGER NOT NULL,
+    queued_at      REAL    NOT NULL,
+    PRIMARY KEY (chat_id, job_id)
+);
+CREATE INDEX IF NOT EXISTS idx_queued_matches_user_age
+    ON queued_matches(chat_id, queued_at);
+
 CREATE INDEX IF NOT EXISTS idx_app_status ON applications(chat_id, status);
 CREATE INDEX IF NOT EXISTS idx_sent_job ON sent_messages(chat_id, job_id);
 CREATE INDEX IF NOT EXISTS idx_profile_builds_chat ON profile_builds(chat_id, built_at DESC);
@@ -1177,6 +1196,30 @@ class DB:
         with self._conn() as c:
             return c.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
 
+    def get_jobs_by_ids(self, job_ids: Iterable[str]) -> dict[str, sqlite3.Row]:
+        """Bulk-fetch `jobs` rows for the given job_ids. Returns ``{job_id: row}``.
+
+        Missing ids are simply absent from the returned dict; callers can
+        partition by membership. Used by the quality-buffer flush path to
+        rehydrate `Job` dataclasses from queued ids.
+        """
+        ids = [str(j) for j in job_ids if j]
+        if not ids:
+            return {}
+        out: dict[str, sqlite3.Row] = {}
+        chunk_size = 500
+        with self._conn() as c:
+            for start in range(0, len(ids), chunk_size):
+                chunk = ids[start:start + chunk_size]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = c.execute(
+                    f"SELECT * FROM jobs WHERE job_id IN ({placeholders})",
+                    tuple(chunk),
+                ).fetchall()
+                for r in rows:
+                    out[r["job_id"]] = r
+        return out
+
     def is_known_job(self, job_id: str) -> bool:
         return self.get_job(job_id) is not None
 
@@ -1641,6 +1684,168 @@ class DB:
                 "DELETE FROM job_scores WHERE scored_at < ?",
                 (cutoff,),
             )
+            return int(cur.rowcount or 0)
+
+    # ---------- queued_matches (quality buffer, P1 pipeline overhaul) ----------
+    #
+    # Continuous searcher buffers scored-and-live matches here instead of
+    # firing a digest every run. The send-decision path flushes the queue in
+    # one batch once depth >= quality_send_threshold OR the oldest entry's
+    # age exceeds max_queue_latency_hours. `profile_hash` snapshots the
+    # user's scoring inputs at enqueue time; a resume/prefs edit flips the
+    # hash and stale rows are silently purged before depth is computed.
+
+    def enqueue_match(
+        self,
+        chat_id: int,
+        job_id: str,
+        profile_hash: str,
+        match_score: int,
+    ) -> None:
+        """Buffer a scored-and-live job for batched delivery.
+
+        INSERT OR IGNORE — if the same (chat_id, job_id) is already
+        queued, this is a silent no-op. Re-queuing must not bump
+        `queued_at`: the age-flush latency budget is measured from the
+        first time the user saw this posting clear scoring + liveness,
+        so a re-run on the same job should not reset its clock.
+        """
+        if not job_id or not profile_hash:
+            return
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT OR IGNORE INTO queued_matches
+                  (chat_id, job_id, profile_hash, match_score, queued_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (int(chat_id), str(job_id), str(profile_hash),
+                 int(match_score), time.time()),
+            )
+
+    def queue_depth(self, chat_id: int, profile_hash: str) -> int:
+        """Count queued entries matching the user's CURRENT profile_hash.
+
+        Stale-profile rows are not counted — they're silently purged by
+        `purge_stale_queue` on the send-decision path before depth is
+        computed, so they never contribute to flush.
+        """
+        if not profile_hash:
+            return 0
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT COUNT(*) AS n FROM queued_matches "
+                "WHERE chat_id = ? AND profile_hash = ?",
+                (int(chat_id), str(profile_hash)),
+            ).fetchone()
+            return int(row["n"] or 0) if row else 0
+
+    def queue_oldest_age_seconds(
+        self,
+        chat_id: int,
+        profile_hash: str,
+    ) -> float | None:
+        """Age (seconds) of the oldest queued entry under the current profile_hash.
+
+        Returns ``time.time() - min(queued_at)``, or None if the queue is
+        empty for this user/profile pair. Stale-profile rows are excluded —
+        same rationale as `queue_depth`.
+        """
+        if not profile_hash:
+            return None
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT MIN(queued_at) AS oldest FROM queued_matches "
+                "WHERE chat_id = ? AND profile_hash = ?",
+                (int(chat_id), str(profile_hash)),
+            ).fetchone()
+            if row is None or row["oldest"] is None:
+                return None
+            return max(0.0, time.time() - float(row["oldest"]))
+
+    def fetch_queue(
+        self,
+        chat_id: int,
+        profile_hash: str,
+    ) -> list[dict]:
+        """Return all queued entries for the user's current profile_hash.
+
+        Ordered by ``match_score DESC, queued_at ASC`` — strongest match
+        goes out first (top of the digest), ties break by who's been
+        waiting longest. Shape per row::
+
+            {"job_id": str, "match_score": int, "queued_at": float}
+        """
+        if not profile_hash:
+            return []
+        with self._conn() as c:
+            rows = c.execute(
+                """
+                SELECT job_id, match_score, queued_at
+                  FROM queued_matches
+                 WHERE chat_id = ? AND profile_hash = ?
+                 ORDER BY match_score DESC, queued_at ASC
+                """,
+                (int(chat_id), str(profile_hash)),
+            ).fetchall()
+        return [
+            {
+                "job_id":      r["job_id"],
+                "match_score": int(r["match_score"] or 0),
+                "queued_at":   float(r["queued_at"] or 0.0),
+            }
+            for r in rows
+        ]
+
+    def clear_queue(self, chat_id: int, job_ids: Iterable[str]) -> int:
+        """Bulk-delete the named (chat_id, job_id) rows. Returns rows removed.
+
+        Called after a successful flush with the job_ids that actually
+        shipped. Jobs that failed mid-flush stay queued for the next
+        flush attempt — the row is removed only when delivery is
+        confirmed.
+        """
+        ids = [str(j) for j in job_ids if j]
+        if not ids:
+            return 0
+        removed = 0
+        chunk_size = 500
+        with self._conn() as c:
+            for start in range(0, len(ids), chunk_size):
+                chunk = ids[start:start + chunk_size]
+                placeholders = ",".join("?" for _ in chunk)
+                cur = c.execute(
+                    f"""
+                    DELETE FROM queued_matches
+                     WHERE chat_id = ?
+                       AND job_id IN ({placeholders})
+                    """,
+                    (int(chat_id), *chunk),
+                )
+                removed += int(cur.rowcount or 0)
+        return removed
+
+    def purge_stale_queue(self, chat_id: int, profile_hash: str) -> int:
+        """Drop queued rows whose `profile_hash` != the user's current hash.
+
+        Runs on the send-decision path BEFORE the depth check, so an
+        edit to resume or prefs silently invalidates the queue — those
+        matches were scored against an old profile and may no longer
+        fit. Returns rows removed. Pass an empty `profile_hash` to drop
+        EVERY row for the user (e.g. after a full profile reset).
+        """
+        with self._conn() as c:
+            if not profile_hash:
+                cur = c.execute(
+                    "DELETE FROM queued_matches WHERE chat_id = ?",
+                    (int(chat_id),),
+                )
+            else:
+                cur = c.execute(
+                    "DELETE FROM queued_matches "
+                    "WHERE chat_id = ? AND profile_hash <> ?",
+                    (int(chat_id), str(profile_hash)),
+                )
             return int(cur.rowcount or 0)
 
     # ---------- resume_suggestions ----------
