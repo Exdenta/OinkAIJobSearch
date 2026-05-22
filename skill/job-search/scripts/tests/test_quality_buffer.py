@@ -244,3 +244,119 @@ def test_score_below_4_is_not_enqueued(tmp_db):
     with tmp_db._conn() as c:
         row = c.execute("SELECT COUNT(*) AS n FROM queued_matches").fetchone()
         assert row["n"] == 0
+
+
+def test_flush_purges_leaked_queue_rows(tmp_db):
+    """Round 2 regression: rows that fail rehydration (already handled,
+    missing `jobs` entry, already in `sent_messages`) must be deleted
+    from `queued_matches`, not just excluded from `jobs_to_send`.
+
+    Otherwise they linger under the user's profile_hash, inflate
+    `queue_depth` (premature flushes), and `queue_oldest_age_seconds`
+    reports them as ancient forever → empty-flush loop.
+
+    Seed: 1 already-sent, 1 row-missing-from-jobs, 1 already-handled,
+    2 ok. Force a flush. After the call:
+      * jobs_to_send == [J_ok1, J_ok2]
+      * queued_matches contains only the 2 ok ids.
+    """
+    chat_id = 99
+    phash = db_module.profile_hash("resume", "prefs")
+    filters = _filters(threshold=2, max_hours=48.0)
+
+    # ok jobs — both their `jobs` row AND queue entry exist.
+    j_ok1 = _make_job("linkedin", "j_ok1")
+    j_ok2 = _make_job("linkedin", "j_ok2")
+    _save_job(tmp_db, j_ok1)
+    _save_job(tmp_db, j_ok2)
+
+    # already sent: jobs row exists, queue entry exists, sent_messages
+    # already logged a delivery in a (simulated) parallel run.
+    j_sent = _make_job("linkedin", "j_sent")
+    _save_job(tmp_db, j_sent)
+    tmp_db.log_sent(chat_id, 12345, j_sent.job_id)
+
+    # missing-from-jobs: queue entry exists but the backing `jobs` row
+    # was pruned (TTL eviction). Insert the queue row by id only.
+    j_missing_id = "phantom_job_id_not_in_jobs"
+
+    # already handled: user marked the job applied via /apply earlier;
+    # row in `applications` blocks the re-send.
+    j_handled = _make_job("linkedin", "j_handled")
+    _save_job(tmp_db, j_handled)
+    tmp_db.set_application_status(chat_id, j_handled.job_id, "applied")
+
+    # Queue all five. Force-flush by enqueueing one ok via alive_floor
+    # (so the function runs through its normal enqueue branch) plus
+    # pre-seeding the other four directly. Force a flush by also
+    # pushing queued_at back so the latency cap trips even if the
+    # threshold doesn't.
+    for jid, score in [
+        (j_ok1.job_id, 5),
+        (j_ok2.job_id, 4),
+        (j_sent.job_id, 4),
+        (j_missing_id, 4),
+        (j_handled.job_id, 4),
+    ]:
+        tmp_db.enqueue_match(chat_id, jid, phash, score)
+
+    # Push queued_at far enough in the past to guarantee the age-flush
+    # fires (max_queue_latency_hours=48 → set queued_at = now - 49h).
+    with tmp_db._conn() as c:
+        c.execute(
+            "UPDATE queued_matches SET queued_at = ? WHERE chat_id = ?",
+            (time.time() - 49 * 3600, chat_id),
+        )
+
+    out_jobs, flush, depth, age = search_jobs._decide_buffer_flush(
+        tmp_db, chat_id, [], {}, phash, filters,
+    )
+
+    assert flush is True
+    assert depth == 5  # pre-leak-purge value (decision was made on this)
+    assert age >= 48 * 3600
+
+    # jobs_to_send is exactly the two ok ids, queue-order preserved
+    # (match_score DESC → j_ok1=5 first, j_ok2=4 second).
+    assert [j.job_id for j in out_jobs] == [j_ok1.job_id, j_ok2.job_id]
+
+    # Critical assertion: leak rows are gone from queued_matches.
+    surviving = {r["job_id"] for r in tmp_db.fetch_queue(chat_id, phash)}
+    assert surviving == {j_ok1.job_id, j_ok2.job_id}
+    assert j_sent.job_id not in surviving
+    assert j_missing_id not in surviving
+    assert j_handled.job_id not in surviving
+
+
+def test_leak_purge_runs_on_hold_path(tmp_db):
+    """Even when the flush threshold isn't met, leak rows (handled /
+    missing / already-sent) must be purged so they don't permanently
+    inflate `queue_depth` for the next iteration's flush decision.
+    """
+    chat_id = 7
+    phash = db_module.profile_hash("resume", "prefs")
+    # Threshold = 10 so 1 ok row + 1 leak row never flushes; latency
+    # well above oldest age.
+    filters = _filters(threshold=10, max_hours=48.0)
+
+    j_ok = _make_job("linkedin", "j_ok_hold")
+    _save_job(tmp_db, j_ok)
+
+    j_handled = _make_job("linkedin", "j_handled_hold")
+    _save_job(tmp_db, j_handled)
+    tmp_db.set_application_status(chat_id, j_handled.job_id, "skipped")
+
+    tmp_db.enqueue_match(chat_id, j_ok.job_id, phash, 5)
+    tmp_db.enqueue_match(chat_id, j_handled.job_id, phash, 4)
+
+    out_jobs, flush, depth, _age = search_jobs._decide_buffer_flush(
+        tmp_db, chat_id, [], {}, phash, filters,
+    )
+    assert flush is False  # depth 2 < threshold 10 AND age < 48h
+    assert out_jobs == []
+    # depth reported is pre-purge (decision branch value).
+    assert depth == 2
+
+    # The handled row got swept even on the hold path.
+    surviving = {r["job_id"] for r in tmp_db.fetch_queue(chat_id, phash)}
+    assert surviving == {j_ok.job_id}

@@ -154,12 +154,23 @@ def _decide_buffer_flush(
     3. Compute depth + oldest_age under the current profile_hash.
     4. Flush when EITHER depth >= ``quality_send_threshold`` OR
        oldest_age >= ``max_queue_latency_hours`` (the latency cap).
-    5. On flush: fetch ordered queue, rehydrate `Job` dataclasses from
-       the jobs table, drop any already-actioned by the user (defensive
-       dedupe against `applications`). On hold: return [], flush=False.
+    5. Whether or not a flush fires, scan the current queue for rows
+       that the rehydration step would silently drop — already-handled
+       jobs (in `applications`), already-sent jobs (in `sent_messages`,
+       e.g. delivered by a parallel run), or rows whose backing `jobs`
+       entry has been pruned. Purge those leak ids from `queued_matches`
+       immediately so they don't inflate depth or get reported as
+       "ancient" by `queue_oldest_age_seconds` forever (empty-flush
+       loop). This MUST run on the hold path too — a stale queue gets
+       cleaned the moment it's noticed.
+    6. On flush: rehydrate `Job` dataclasses from the surviving rows,
+       carrying the queue ordering (match_score DESC, queued_at ASC).
+       On hold: return [], flush=False.
 
     Returns ``(jobs_to_send, flush, depth, oldest_age)``. When
-    ``flush=False``, ``jobs_to_send`` is always ``[]``.
+    ``flush=False``, ``jobs_to_send`` is always ``[]``. ``depth`` is
+    reported PRE-leak-purge (the value the flush decision was made on)
+    so observability stays consistent with the decision branch taken.
     """
     db.purge_stale_queue(chat_id, profile_hash)
     for j in alive_floor:
@@ -181,9 +192,11 @@ def _decide_buffer_flush(
         max_latency_s = 48 * 3600.0
 
     flush = depth >= threshold or (depth > 0 and oldest_age >= max_latency_s)
-    if not flush:
-        return [], False, depth, oldest_age
 
+    # Snapshot the queue so we can both (a) decide what to ship on flush
+    # and (b) detect leak rows that no longer correspond to a deliverable
+    # `Job`. We always run the leak sweep — even on hold — so the queue
+    # self-heals between iterations.
     queued_rows = db.fetch_queue(chat_id, profile_hash)
     if not queued_rows:
         return [], False, depth, oldest_age
@@ -191,23 +204,49 @@ def _decide_buffer_flush(
     ids = [r["job_id"] for r in queued_rows]
     row_by_id = db.get_jobs_by_ids(ids)
     handled = db.handled_job_ids(chat_id)
+    # Bulk lookup — single SELECT instead of N row probes. Includes any
+    # row delivered by a parallel run since this iteration started, so
+    # we never re-issue a card that's already in the user's chat.
+    already_sent = db.user_seen_jobs(chat_id, ids)
+
+    leak_ids: list[str] = []
+    deliverable_rows: list[dict] = []
+    for entry in queued_rows:
+        jid = entry["job_id"]
+        if jid in handled:
+            # User already actioned this — applied / skipped / interested.
+            leak_ids.append(jid)
+            continue
+        if jid in already_sent:
+            # Delivered already (parallel run or previous flush that
+            # confirmed `on_sent` but failed mid-`clear_queue`). Drop so
+            # the user never sees the same card twice.
+            leak_ids.append(jid)
+            continue
+        row = row_by_id.get(jid)
+        if row is None:
+            # `jobs` row pruned underneath us (TTL eviction, manual
+            # delete). Nothing to ship; clear the dangling pointer.
+            leak_ids.append(jid)
+            continue
+        deliverable_rows.append({"entry": entry, "row": row})
+
+    if leak_ids:
+        try:
+            db.clear_queue(chat_id, leak_ids)
+        except Exception:
+            log.debug("clear_queue leak-purge failed; continuing",
+                      exc_info=True)
+
+    if not flush:
+        return [], False, depth, oldest_age
 
     # Carry the queue's ordering (match_score DESC, queued_at ASC) into
     # the Job list so the digest reaches the user in the same priority
     # order the buffer accumulated.
     jobs_to_send: list[Job] = []
-    for entry in queued_rows:
-        jid = entry["job_id"]
-        if jid in handled:
-            # User already actioned this — applied / skipped / interested.
-            # Drop silently so the queue clears on flush.
-            continue
-        row = row_by_id.get(jid)
-        if row is None:
-            # Should not happen: queue rows are only inserted from
-            # alive_floor, which itself came from the jobs table. Treat
-            # as a dead row and let the caller clear it.
-            continue
+    for d in deliverable_rows:
+        row = d["row"]
         jobs_to_send.append(
             Job(
                 source=row["source"],
