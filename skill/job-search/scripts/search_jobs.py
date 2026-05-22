@@ -463,11 +463,12 @@ def should_run_source(
          threading the counter through one more function call is a
          smaller surface area than baking time-math into both ends.
 
-    The continuous-searcher hook simply increments its own counter on
-    every iteration; for the daily-cron path (one shot per process), 0
-    is fine (treated as 'odd' for half_freq, which simply means a
-    single-shot cron always runs the source — the desired behaviour
-    since the operator started it manually).
+    The continuous-searcher hook increments its own counter (starting
+    at 1) on every iteration; half_freq sources fire on odd cycles
+    (1, 3, 5, ...). Callers passing the default cycle_index=0 (e.g. a
+    one-shot manual run) hit the even branch and SKIP half_freq
+    sources — if you want a one-shot run to bypass cooldown, pass an
+    odd value explicitly (e.g. cycle_index=1).
     """
     if db is None or not source:
         return True
@@ -618,7 +619,7 @@ def fetch_all(
 
     enabled = filters.get("sources") or {}
     try:
-        low_thresh = float(filters.get("source_low_novelty_threshold") or 0.05)
+        low_thresh = float(filters.get("source_low_novelty_threshold", 0.05))
     except (TypeError, ValueError):
         low_thresh = 0.05
     tasks: list[tuple[str, object]] = []
