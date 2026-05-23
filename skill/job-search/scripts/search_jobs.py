@@ -28,10 +28,12 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import datetime
 import logging
 import os
 import sys
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -135,6 +137,59 @@ def load_env() -> None:
 
 # ---------- helpers ----------
 
+def _is_in_night_mute_window(
+    now: datetime.datetime | None = None,
+    *,
+    tz_name: str = "Europe/Madrid",
+    start_hour: int = 23,
+    end_hour: int = 9,
+) -> bool:
+    """Return True iff current local time in ``tz_name`` is inside the
+    [``start_hour``, ``end_hour``) night-mute window.
+
+    The window wraps midnight when ``start_hour > end_hour`` (the common
+    Madrid 23 → 09 case = mute from 23:00 through 08:59:59, resume at
+    09:00). When ``start_hour < end_hour`` it is a same-day window. When
+    ``start_hour == end_hour`` the window is empty and this returns False
+    for any ``now`` (feature disabled).
+
+    ``end_hour`` is exclusive, ``start_hour`` is inclusive — i.e. exactly
+    09:00 in the default config is NOT muted; exactly 23:00 IS muted.
+
+    ``now`` defaults to ``datetime.datetime.now(tz=UTC)``; tests inject a
+    frozen value. The function converts to the target tz before comparing
+    hours, so tz-naive callers and tz-aware callers behave identically.
+
+    Fails open on bad tz: if ``zoneinfo`` can't load ``tz_name`` we log a
+    WARNING and return False (never mute) — a typo in defaults.py must
+    not muzzle the user forever.
+    """
+    if start_hour == end_hour:
+        return False
+    try:
+        tz = ZoneInfo(tz_name)
+    except ZoneInfoNotFoundError:
+        log.warning(
+            "_is_in_night_mute_window: unknown timezone %r; "
+            "failing open (no mute)", tz_name,
+        )
+        return False
+
+    if now is None:
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
+    elif now.tzinfo is None:
+        # Treat a naive datetime as UTC (matches the default branch above)
+        # rather than silently interpreting it as wall-clock in tz_name.
+        now = now.replace(tzinfo=datetime.timezone.utc)
+    local_hour = now.astimezone(tz).hour
+
+    if start_hour < end_hour:
+        # Same-day window: [start_hour, end_hour).
+        return start_hour <= local_hour < end_hour
+    # Wraps midnight: hour is in the window if it's >= start OR < end.
+    return local_hour >= start_hour or local_hour < end_hour
+
+
 def _decide_buffer_flush(
     db,
     chat_id: int,
@@ -154,6 +209,9 @@ def _decide_buffer_flush(
     3. Compute depth + oldest_age under the current profile_hash.
     4. Flush when EITHER depth >= ``quality_send_threshold`` OR
        oldest_age >= ``max_queue_latency_hours`` (the latency cap).
+       The night-mute window (``night_mute_*`` knobs, P7) overrides
+       this back to hold during the operator's quiet hours — applies
+       to BOTH the threshold-flush AND the age-flush.
     5. Whether or not a flush fires, scan the current queue for rows
        that the rehydration step would silently drop — already-handled
        jobs (in `applications`), already-sent jobs (in `sent_messages`,
@@ -192,6 +250,34 @@ def _decide_buffer_flush(
         max_latency_s = 48 * 3600.0
 
     flush = depth >= threshold or (depth > 0 and oldest_age >= max_latency_s)
+
+    # Night-mute override (P7). If the operator's quiet-hours window is
+    # active in the configured tz, hold this iteration regardless of
+    # depth/age — the next iteration after the window ends will flush.
+    # This covers BOTH branches of the flush decision above: a single
+    # `flush = False` here cancels the threshold-met flush AND the age
+    # latency-cap flush. The leak-purge sweep below still runs (we hand
+    # back to it via the normal `flush` variable), and `purge_stale_queue`
+    # / `enqueue_match` above already ran — night-mute only flips the
+    # "do we send now?" verdict.
+    if flush:
+        tz_name = filters.get("night_mute_tz", "Europe/Madrid")
+        try:
+            start_h = int(filters.get("night_mute_start_hour", 23))
+            end_h = int(filters.get("night_mute_end_hour", 9))
+        except (TypeError, ValueError):
+            start_h, end_h = 23, 9
+        if start_h != end_h and _is_in_night_mute_window(
+            tz_name=tz_name, start_hour=start_h, end_hour=end_h,
+        ):
+            log.info(
+                "User %s: quality-buffer flush would fire (depth=%d, "
+                "oldest_age=%.1fh) but night-mute window active "
+                "(%02d:00-%02d:00 %s) — holding until morning",
+                chat_id, depth, (oldest_age or 0) / 3600.0,
+                start_h, end_h, tz_name,
+            )
+            flush = False
 
     # Snapshot the queue so we can both (a) decide what to ship on flush
     # and (b) detect leak rows that no longer correspond to a deliverable
