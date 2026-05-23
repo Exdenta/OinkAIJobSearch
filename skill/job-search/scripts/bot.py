@@ -2958,11 +2958,20 @@ def _maybe_start_continuous_searcher(db: DB) -> threading.Thread | None:
         return None
 
     chat_raw = (os.environ.get("HRYU_CONTINUOUS_CHAT_ID", "") or "").strip()
-    try:
-        chat_id = int(chat_raw)
-    except ValueError:
-        chat_id = 0
-    if chat_id <= 0:
+    # Comma-separated list of chat_ids — one searcher daemon thread per id.
+    # Single-id env values stay back-compat ("433775883" still parses to [433775883]).
+    chat_ids: list[int] = []
+    for tok in chat_raw.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            cid = int(tok)
+        except ValueError:
+            cid = 0
+        if cid > 0:
+            chat_ids.append(cid)
+    if not chat_ids:
         log.warning(
             "continuous_mode enabled but HRYU_CONTINUOUS_CHAT_ID missing or "
             "invalid (got %r) — skipping searcher",
@@ -2982,36 +2991,59 @@ def _maybe_start_continuous_searcher(db: DB) -> threading.Thread | None:
         interval, min_sleep = 7200, 60
 
     from continuous_searcher import ContinuousSearcher
+    import time as _time
 
-    def _runner():
-        loop = asyncio.new_event_loop()
-        try:
-            asyncio.set_event_loop(loop)
-            searcher = ContinuousSearcher(
-                db=db,
-                chat_id=chat_id,
-                interval_seconds=interval,
-                min_sleep_seconds=min_sleep,
-            )
-            try:
-                loop.run_until_complete(searcher.run_forever())
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                log.exception("continuous_searcher thread crashed")
-        finally:
-            try:
-                loop.close()
-            except Exception:
-                pass
+    # Stagger across the chat_id list so N users don't all fire scoring
+    # concurrently (cuts peak Claude-API load by N×). Stagger = interval/N:
+    # at N=2 with interval=3600, chat[0] fires at T, chat[1] at T+1800.
+    n = len(chat_ids)
+    stagger_step = interval // n if n > 0 else 0
 
-    t = threading.Thread(target=_runner, daemon=True, name="continuous_searcher")
-    t.start()
-    log.info(
-        "continuous_searcher started: chat_id=%d interval=%ds (daemon thread)",
-        chat_id, interval,
-    )
-    return t
+    def _make_runner(cid: int, startup_delay: int):
+        def _runner():
+            if startup_delay > 0:
+                log.info(
+                    "continuous_searcher chat_id=%d: staggered startup sleep %ds",
+                    cid, startup_delay,
+                )
+                _time.sleep(startup_delay)
+            loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(loop)
+                searcher = ContinuousSearcher(
+                    db=db,
+                    chat_id=cid,
+                    interval_seconds=interval,
+                    min_sleep_seconds=min_sleep,
+                )
+                try:
+                    loop.run_until_complete(searcher.run_forever())
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    log.exception("continuous_searcher thread crashed (chat_id=%d)", cid)
+            finally:
+                try:
+                    loop.close()
+                except Exception:
+                    pass
+        return _runner
+
+    threads: list = []
+    for idx, cid in enumerate(chat_ids):
+        delay = idx * stagger_step
+        t = threading.Thread(
+            target=_make_runner(cid, delay),
+            daemon=True,
+            name=f"continuous_searcher_{cid}",
+        )
+        t.start()
+        threads.append(t)
+        log.info(
+            "continuous_searcher started: chat_id=%d interval=%ds stagger_delay=%ds (daemon thread)",
+            cid, interval, delay,
+        )
+    return threads
 
 
 # ---------- main loop ----------
