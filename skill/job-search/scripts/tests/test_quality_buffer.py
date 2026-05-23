@@ -135,9 +135,14 @@ def _save_job(tmp_db, job: Job) -> None:
 
 
 def _filters(threshold: int = 5, max_hours: float = 48.0) -> dict:
+    # Disable night-mute (P7) by default so these tests are
+    # deterministic regardless of wall-clock when they run. Tests that
+    # need to exercise night-mute behaviour live in test_night_mute.py.
     return {
         "quality_send_threshold": threshold,
         "max_queue_latency_hours": max_hours,
+        "night_mute_start_hour": 0,
+        "night_mute_end_hour": 0,
     }
 
 

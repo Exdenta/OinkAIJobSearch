@@ -169,9 +169,13 @@ def test_send_per_job_digest_force_empty_card_still_works():
 
 def _filters(threshold: int = 5, max_hours: float = 48.0) -> dict:
     """Match the shape ``_decide_buffer_flush`` reads from ``filters``."""
+    # Disable night-mute (P7) so wall-clock at test-time doesn't perturb
+    # the deterministic hold-vs-flush expectations below.
     return {
         "quality_send_threshold": threshold,
         "max_queue_latency_hours": max_hours,
+        "night_mute_start_hour": 0,
+        "night_mute_end_hour": 0,
     }
 
 
