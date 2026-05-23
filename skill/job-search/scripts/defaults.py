@@ -178,6 +178,26 @@ DEFAULTS: dict = {
     "quality_send_threshold":     5,
     "max_queue_latency_hours":   48,
 
+    # Night mute: do not flush the quality buffer between these hours in the
+    # configured timezone. Applies to BOTH the threshold-met flush AND the
+    # 48h age-based force-flush — the operator does not want Telegram pings
+    # at night. Set start_hour == end_hour to disable.
+    #
+    # Wrap-around semantics: `start_hour > end_hour` means the window
+    # crosses midnight (the default 23 → 09 case = mute from 23:00 through
+    # 08:59:59, resume at 09:00). `start_hour < end_hour` is a same-day
+    # window (e.g. 13 → 14 mutes only the 13:00-13:59 hour). When
+    # `start_hour == end_hour` the window is empty and night-mute is
+    # disabled (no muting ever).
+    #
+    # `end_hour` is exclusive: 09:00 sharp is "back online". The
+    # `night_mute_tz` value must be an IANA zone name (e.g. "Europe/Madrid",
+    # "UTC"); unknown zones fail-open (no muting + WARNING log) so a typo
+    # can't muzzle the user permanently.
+    "night_mute_tz":             "Europe/Madrid",
+    "night_mute_start_hour":     23,    # inclusive
+    "night_mute_end_hour":       9,     # exclusive (09:00 = "back online")
+
     # Per-scrape timeout for Claude-CLI-backed adapters (curated_boards).
     "ai_scrape_timeout_s":     180,
     # Web-search agent runs multiple WebSearch+WebFetch calls — needs more.
