@@ -2164,6 +2164,40 @@ class DB:
         # Every page covered and fresh — refuse this run.
         return -1
 
+    def reset_search_cursors(
+        self,
+        sources: list[str] | set[str] | frozenset[str] | None = None,
+    ) -> int:
+        """Delete all ``search_fetches`` rows for the given sources (or
+        every source when ``sources`` is None).
+
+        Why
+        ---
+        The natural cursor-staleness window (``min_revisit_age_s``,
+        default 6h) is longer than the iteration interval (30 min per
+        chat), so the cursor walks 10+ pages deep before page 1 becomes
+        re-fetchable. Strong matches concentrate on pages 1-4; deep
+        pages produce mostly low-relevance jobs. A periodic reset every
+        N iterations forces the cursor back to page 1, restoring the
+        hit rate. Caller decides N (see ``cursor_reset_every_n_cycles``
+        in defaults).
+
+        Returns the number of rows deleted (for telemetry / log line).
+        """
+        with self._conn() as c:
+            if sources is None:
+                cur = c.execute("DELETE FROM search_fetches")
+            else:
+                whitelist = [str(s) for s in sources if s]
+                if not whitelist:
+                    return 0
+                placeholders = ",".join("?" for _ in whitelist)
+                cur = c.execute(
+                    f"DELETE FROM search_fetches WHERE source IN ({placeholders})",
+                    whitelist,
+                )
+            return int(cur.rowcount or 0)
+
     def source_novelty_ratio(
         self,
         source: str,

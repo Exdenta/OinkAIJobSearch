@@ -747,6 +747,34 @@ def fetch_all(
         low_thresh = float(filters.get("source_low_novelty_threshold", 0.05))
     except (TypeError, ValueError):
         low_thresh = 0.05
+
+    # Periodic P2 cursor reset (see `cursor_reset_every_n_cycles` in
+    # defaults). Fires on cycle 4, 8, 12, … of each chat_id's continuous
+    # loop. Strong matches concentrate on pages 1-4; without this the
+    # cursor walks 10+ pages deep before the natural staleness window
+    # lets it return to page 1.
+    try:
+        reset_every = int(filters.get("cursor_reset_every_n_cycles", 4))
+    except (TypeError, ValueError):
+        reset_every = 4
+    if (
+        db is not None
+        and reset_every > 0
+        and cycle_index > 0
+        and cycle_index % reset_every == 0
+    ):
+        try:
+            deleted = db.reset_search_cursors(_P2_INSTRUMENTED_SOURCES)
+            log.info(
+                "fetch_all: cycle=%d hit cursor-reset boundary (every %d) — "
+                "cleared %d search_fetches rows for %d sources",
+                cycle_index, reset_every, deleted, len(_P2_INSTRUMENTED_SOURCES),
+            )
+        except Exception as e:  # noqa: BLE001 — defensive
+            log.exception(
+                "fetch_all: cursor reset failed at cycle=%d: %s",
+                cycle_index, type(e).__name__,
+            )
     tasks: list[tuple[str, object]] = []
     cooldown_skipped: list[str] = []
     for key, mod in SOURCES.items():

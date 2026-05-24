@@ -29,7 +29,7 @@ DEFAULTS: dict = {
         "remocate":         True,    # curated boards — Claude CLI required
         "wantapply":        True,
         "remoterocketship": True,
-        "web_search":       False,   # PAUSED 2026-05-22 — verifier was letting Workable soft-404s (apply.workable.com/oops, ?not_found=true) ship as live jobs. Re-enable once the listing-verifier gate is hardened.
+        "web_search":       True,    # Re-enabled 2026-05-24 after T4 verifier hardening (soft-404 pre-LLM check + fail-safe gate) ran clean for 36h. Was #1 strong-hit source (17-32% hit rate).
         # Humanitarian + research/academic sources (added 2026-04-30).
         "reliefweb":        True,    # public API — humanitarian sector
         "euraxess":         True,    # EU researcher mobility portal — public API
@@ -117,6 +117,14 @@ DEFAULTS: dict = {
     # in each adapter (linkedin=10, justjoinit/nofluffjobs/builtin=5,
     # web_search=3).
     "source_min_revisit_age_s": 21600,
+
+    # P2-cursor periodic reset (added 2026-05-24 after diagnosing yield
+    # collapse). Every Nth cycle the continuous searcher nukes
+    # `search_fetches` for the P2-instrumented sources, forcing the
+    # cursor back to page 1. Strong matches concentrate on pages 1-4;
+    # without this the cursor walks 10+ pages deep and hits the long
+    # tail. Set to 0 to disable.
+    "cursor_reset_every_n_cycles": 4,
 
     # v2.5 scoring-audit stage. AFTER the digest cards ship, re-grade
     # the score-≥1 verdicts with a second-opinion model (Opus). Catches

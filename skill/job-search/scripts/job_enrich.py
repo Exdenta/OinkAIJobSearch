@@ -184,6 +184,52 @@ score=0 when the body shows ANY of:
 why_mismatch must cite: "AI-rating / data-labeling gig — not real
 engineering" (with the matched phrase).
 
+DOCTRINE D — ASPIRATIONAL stack preference is NOT a hard veto.
+  When PREFS frame a stack focus as ASPIRATIONAL (e.g. "primarily
+  frontend", "mostly React work", "focus on user interfaces", "rather
+  than backend", "looking for a frontend role"), the PER-SKILL YEARS
+  PENALTY for an ADJACENT-but-not-listed skill on a posting that
+  shares the user's PRIMARY stack is CAPPED AT -1, not -3.
+  Applies to: a candidate whose resume/PREFS centre one half of a
+  stack-pair (frontend ↔ backend, mobile ↔ web, data ↔ ML) when
+  scoring a posting that names the user's primary stack PLUS the
+  adjacent half.
+  Examples:
+    × Frontend candidate, PREFS "primarily React/TS", posting
+      "Full-Stack React + Node.js + PostgreSQL" → React match is
+      strong; Node/Postgres are the adjacent gap → cap penalty at
+      -1 total for the backend ask, NOT -3.
+    × Mobile candidate, PREFS "looking for React Native roles",
+      posting "Mobile engineer, React Native + some web React" → web
+      React is adjacent, cap at -1.
+    × Backend candidate, PREFS "Python services", posting
+      "Backend Python + light React frontend" → React is adjacent,
+      cap at -1.
+  Rationale: modern listings frequently bundle adjacent skills the
+  user is happy to learn on the job — penalising -3 per skill makes
+  a 4-5 fit impossible for the bulk of EU mid-level postings. The
+  user opted into "primarily" not "exclusively", and the bot's job
+  is to surface plausible roles, not gate based on candidate-side
+  preference for one half of a paired stack.
+  DOES NOT APPLY when:
+    × PREFS explicitly veto the adjacent half ("NO backend",
+      "do not want full-stack roles", "frontend only — hard no on
+      backend", "not a fit: requires backend") — then the gap is
+      a HARD VETO (V2 body-exclude) and scores 0.
+    × The posting's PRIMARY stack is the adjacent half (e.g. posting
+      titled "Backend Engineer" with light frontend) — then it's a
+      backend role being offered to a frontend candidate; treat as
+      a different role entirely (full PER-SKILL penalty applies).
+    × Skill-gap is for a foundational requirement the candidate has
+      ZERO of AND is named as a HARD requirement in the posting
+      ("must have 5+ years AWS", "deep Kubernetes expertise
+      required") — those are not "adjacent learn-on-the-job"
+      asks. Full penalty.
+  why_mismatch when this doctrine fires: cite it explicitly, e.g.
+  "Full-Stack ask but PREFS frame stack focus as aspirational —
+  capped backend-gap at -1 (was -3)." Operators auditing borderline
+  4-vs-2 calls need to see this rule fired.
+
 ═════════════════════════════════════════════════════════════════════
 
 For each posting, you must:
