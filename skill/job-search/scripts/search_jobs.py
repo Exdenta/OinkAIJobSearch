@@ -1698,7 +1698,7 @@ def run(
 
     if run_id_for_summary is not None and not no_send:
         try:
-            deliver_daily_summary(tg, store, run_id_for_summary)
+            deliver_daily_summary(tg, store, run_id_for_summary, db=db)
         except Exception:
             log.exception("daily summary delivery raised")
 
