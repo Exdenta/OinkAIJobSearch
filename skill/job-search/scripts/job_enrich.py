@@ -326,6 +326,38 @@ For each posting, you must:
                   cadence and no named hub.
                 * "We are a fully distributed team" with no in-
                   person requirement.
+
+              COUNTRY-LOCKED REMOTE — same reclassification trigger,
+              even WITHOUT explicit "remote within X" phrasing:
+              when the posting's `location` field is a LIST OF CITIES
+              that all sit inside ONE country, the role is remote
+              within THAT country only — non-residents can't apply.
+              Treat as `remote_policy = hybrid` at the named country
+              and apply the V4 onsite branch.
+              Pattern: "City1 + City2, City3, City4 (remote)" — the
+              "(remote)" applies to the listed cities, NOT to the
+              whole world.
+              Examples that TRIGGER country-locked reclassification:
+                * "Kraków + Warszawa, Wrocław, Rzeszów (remote)"
+                  → Poland-locked. Bilbao candidate scores 0
+                  unless Poland is in `onsite_locations`.
+                * "Berlin, Munich, Hamburg (remote)" → Germany-locked.
+                * "Madrid, Barcelona, Valencia · Remote" → Spain-locked
+                  (passes V4 for a Bilbao-listed Spain user only
+                  because Spain ∈ remote_regions; still gets a TZ pass).
+                * "San Francisco, NYC, Austin remote" → US-locked.
+              Examples that do NOT trigger (genuinely cross-border):
+                * "Spain, Germany, Portugal · Remote" — multiple
+                  countries → real EU remote.
+                * "Remote · EU" / "Remote · EMEA" / "Remote Europe"
+                  → macro-region remote, passes V4 normally.
+                * "Remote — Worldwide" / "Remote · Anywhere" → no
+                  country lock.
+              When in doubt about whether the listed cities are all
+              in one country, look at the URL slug, company HQ
+              location, or any country-name suffix in the listing
+              ("(Polska)", "(Deutschland)") — if the answer is one
+              country, apply this rule.
        - `remote_policy` unknown / not stated:
             * If posting names a city/country, treat as onsite for V4.
             * If posting offers no geo signal at all → pass V4.
