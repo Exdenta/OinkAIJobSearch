@@ -373,36 +373,30 @@ check(ok, "broken envelope → deliver_alert swallows")
 
 
 # ---------------------------------------------------------------------------
-# 5. build_daily_summary — happy path
+# 5. build_daily_summary — three sections present
 # ---------------------------------------------------------------------------
-print("\n5. build_daily_summary — happy path")
+# The admin message format was simplified 2026-05-24 to: queue depths,
+# per-source funnel for THIS run, queue contents. No header / footer /
+# anomalies / cost block — the operator asked for the bare facts only.
+print("\n5. build_daily_summary — three sections present")
 
 store = FakeStore()
 _seed_default(store)
-summary = build_daily_summary(store, 2031)
-# Daily summary body is plain MDv2 (no code block), so source keys with
-# underscores get backslash-escaped: 'remote_boards' → 'remote\_boards'.
+summary = build_daily_summary(store, 2031, db=None)
 check(contains_all(summary, [
-    "Daily digest",
-    "Sources",
-    "delivered to",
-    "hackernews 12",
-    "remote\\_boards 27",
-    "curated\\_boards 8",
-    "Run",
-    "2031",
-]), "daily summary contains key facts")
-# Seed has 2 failed per-user sources (linkedin/web_search for chat 200) — the
-# new layout surfaces partial failures inline so the operator notices them
-# before they snowball. Spot-check that flag is rendered.
-check("Anomalies:" in summary, "partial failures surface as anomaly")
-check("source error" in summary, "anomaly mentions source errors")
+    "Queue",
+    "Sources this run",
+    "Queue contents",
+    "hackernews",
+]), "admin message contains queue, funnel, contents")
+check("fetched" in summary and "scored" in summary,
+      "funnel header names the per-step columns")
 
 
 # ---------------------------------------------------------------------------
-# 6. build_daily_summary — zero raw → still 4 lines
+# 6. build_daily_summary — empty inputs still render the three sections
 # ---------------------------------------------------------------------------
-print("\n6. build_daily_summary — zero raw edge case")
+print("\n6. build_daily_summary — empty-input edge case")
 
 now = time.time()
 store2 = FakeStore()
@@ -412,17 +406,20 @@ zero_run = {
     "started_at": now - 5, "finished_at": now, "extra_json": None,
 }
 store2.run_with_sources[99] = (zero_run, [])
-out = build_daily_summary(store2, 99)
-non_empty_lines = [l for l in out.splitlines() if l.strip()]
-check(len(non_empty_lines) >= 4, f"≥4 non-empty lines (got {len(non_empty_lines)})")
-check("No jobs delivered" in out, "zero-delivered phrasing visible")
-check("no source data" in out, "no-source-data placeholder visible")
+out = build_daily_summary(store2, 99, db=None)
+check("Queue" in out, "queue section present")
+check("Sources this run" in out, "funnel section present")
+check("Queue contents" in out, "contents section present")
+check("(empty)" in out or "(no source data)" in out,
+      "empty-state placeholder visible")
 
 
 # ---------------------------------------------------------------------------
-# 7. build_daily_summary — all sources failed → anomalies line present
+# 7. build_daily_summary — failed sources don't appear in the funnel
 # ---------------------------------------------------------------------------
-print("\n7. build_daily_summary — all sources failed")
+# Failed source rows have raw_count=0, so the funnel-row filter drops them
+# (a row that contributed nothing at every step is not worth a line).
+print("\n7. build_daily_summary — failed-only sources are dropped")
 
 store3 = FakeStore()
 fail_run = {
@@ -434,15 +431,14 @@ store3.run_with_sources[100] = (fail_run, [
     {"source_key": "hackernews",    "status": "failed", "raw_count": 0, "user_chat_id": None},
     {"source_key": "remote_boards", "status": "failed", "raw_count": 0, "user_chat_id": None},
 ])
-out = build_daily_summary(store3, 100)
-check("Anomalies:" in out, "Anomalies line present when all sources failed")
-check("all sources failed" in out, "synthesized anomaly text present")
+out = build_daily_summary(store3, 100, db=None)
+check("(no source data)" in out, "all-zero funnel renders the placeholder")
 
 
 # ---------------------------------------------------------------------------
-# 8. build_daily_summary — extra_json anomalies pass through
+# 8. build_daily_summary — per-user source attribution
 # ---------------------------------------------------------------------------
-print("\n8. build_daily_summary — extra_json anomalies pass through")
+print("\n8. build_daily_summary — per-user source attribution")
 
 store4 = FakeStore()
 anom_run = {
@@ -453,10 +449,12 @@ anom_run = {
 }
 store4.run_with_sources[101] = (anom_run, [
     {"source_key": "hackernews", "status": "ok", "raw_count": 12, "user_chat_id": None},
+    {"source_key": "linkedin",   "status": "ok", "raw_count":  5, "user_chat_id": 555},
 ])
-out = build_daily_summary(store4, 101)
-check("Anomalies:" in out, "Anomalies line present from extra_json")
-check("linkedin 0 results" in out, "anomaly text passed through")
+out = build_daily_summary(store4, 101, db=None)
+check("chat 555" in out, "funnel header names the per-user chat_id")
+check("linkedin" in out and "hackernews" in out,
+      "both per-user and global sources appear in the funnel")
 
 
 # ---------------------------------------------------------------------------
