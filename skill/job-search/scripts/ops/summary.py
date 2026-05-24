@@ -366,7 +366,9 @@ def deliver_daily_summary(
 
         body = build_daily_summary(store, run_id, db=db)
         for chunk in _chunk_by_size(body):
-            tg.send_message(op, chunk)
+            # send_plain bypasses the MarkdownV2 parser; our body contains
+            # raw '(', '_', '-' etc. and we don't want to escape every URL.
+            tg.send_plain(op, chunk)
     except Exception:
         log.exception(
             "deliver_daily_summary: unhandled error swallowed (run_id=%s)",
