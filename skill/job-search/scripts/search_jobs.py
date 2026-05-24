@@ -1405,6 +1405,45 @@ def run(
                         # contents so the digest reflects what actually
                         # ships.
                         user_jobs = buffer_jobs
+                        # Re-verify web_search URLs at flush time. The
+                        # original verifier call ran at ENQUEUE; a job
+                        # that sits in the buffer for hours/days can
+                        # have its URL go dead between then and now
+                        # (Workable/SmartRecruiters silently redirect to
+                        # the company openings index — server still
+                        # returns 200, so a stale verdict from enqueue
+                        # would let a dead URL ship).
+                        try:
+                            web_jobs = [j for j in user_jobs if (j.source or "") == "web_search"]
+                            if web_jobs:
+                                fresh_alive, _drop = prefilter_for_send(
+                                    web_jobs, chat_id, forensic=forensic,
+                                )
+                                dropped_ids = {j.job_id for j in web_jobs} - {j.job_id for j in fresh_alive}
+                                if dropped_ids:
+                                    log.info(
+                                        "User %s: flush-time re-verify dropped "
+                                        "%d web_search URLs as dead",
+                                        chat_id, len(dropped_ids),
+                                    )
+                                    # Purge dead URLs from the queue so they
+                                    # don't keep coming back next flush.
+                                    try:
+                                        db.clear_queue(chat_id, dropped_ids)
+                                    except Exception:
+                                        log.debug(
+                                            "clear_queue (re-verify drops) failed",
+                                            exc_info=True,
+                                        )
+                                    user_jobs = [
+                                        j for j in user_jobs
+                                        if j.job_id not in dropped_ids
+                                    ]
+                        except Exception:
+                            log.exception(
+                                "User %s: flush-time re-verify raised; "
+                                "shipping buffer as-is", chat_id,
+                            )
                         # Hydrate enrichments for any buffered job that
                         # was enqueued in a PRIOR run — that run's
                         # `enrichments_by_job_id` is gone (this iter's

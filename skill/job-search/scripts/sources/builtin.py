@@ -385,6 +385,35 @@ def fetch(
         body_head = body_head or repr(e)[:500]
         jobs = []
 
+    # Detail-page body fetch (2026-05-24): card snippets cap at ~200
+    # chars and OMIT the real location (builtin shows "Remote · 7
+    # Locations" on the card but the actual eligibility — "Remote in
+    # CA", "US-only" — lives in the detail-page body). Without this
+    # the scorer was passing US-only roles to EU candidates because
+    # V4 LOCATION had no signal to fire on. Mirror impactpool's
+    # pattern: concurrent GETs, failures keep the card-only snippet.
+    if jobs:
+        try:
+            from sources._detail_fetch import fetch_many_bodies
+            body_map = fetch_many_bodies(
+                [j.url for j in jobs], max_chars=4000, workers=8,
+            )
+            enriched = 0
+            for i, j in enumerate(jobs):
+                body = body_map.get(j.url, "")
+                if body and len(body) > len(j.snippet or ""):
+                    jobs[i] = Job(
+                        j.source, j.external_id, j.title, j.company, j.location,
+                        j.url, j.posted_at, body, j.salary,
+                    )
+                    enriched += 1
+            log.info(
+                "builtin: detail-page bodies fetched for %d/%d postings",
+                enriched, len(jobs),
+            )
+        except Exception:
+            log.exception("builtin: detail-page enrichment failed; using card-only snippets")
+
     sample_titles = [j.title for j in jobs[:5]]
 
     _log_forensic({
