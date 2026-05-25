@@ -183,7 +183,7 @@ DEFAULTS: dict = {
     # This replaces the v2.4 closest-miss fallback: if nothing scores
     # ≥ floor in a given run, the queue simply doesn't grow — no
     # substitute card is surfaced.
-    "quality_send_threshold":     3,
+    "quality_send_threshold":     1,
     "max_queue_latency_hours":   24,
 
     # Night mute: do not flush the quality buffer between these hours in the
