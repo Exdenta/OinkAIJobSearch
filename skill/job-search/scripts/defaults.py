@@ -183,7 +183,7 @@ DEFAULTS: dict = {
     # This replaces the v2.4 closest-miss fallback: if nothing scores
     # ≥ floor in a given run, the queue simply doesn't grow — no
     # substitute card is surfaced.
-    "quality_send_threshold":     5,
+    "quality_send_threshold":     3,
     "max_queue_latency_hours":   48,
 
     # Night mute: do not flush the quality buffer between these hours in the
@@ -232,14 +232,14 @@ DEFAULTS: dict = {
     # gated by the P2 cursor memory; this knob just controls how often the
     # searcher wakes up.
     #
-    #   continuous_interval_seconds — target gap between iterations. 14400
-    #     (4h) is the operator default; tighter intervals burn API + scrape
+    #   continuous_interval_seconds — target gap between iterations. 28800
+    #     (8h) is the operator default; tighter intervals burn API + scrape
     #     quota without finding much.
     #   continuous_min_sleep_seconds — back-pressure floor. If an iteration
     #     takes longer than `continuous_interval_seconds`, the loop still
     #     pauses this long before the next run, so a degraded source can't
     #     pin the searcher in a hot loop.
-    "continuous_interval_seconds": 14400,
+    "continuous_interval_seconds": 28800,
     "continuous_min_sleep_seconds":  60,
 
     # Adaptive source cooldown (algorithm v2.8, P4 pipeline overhaul).
