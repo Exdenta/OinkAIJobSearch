@@ -158,6 +158,11 @@ def _run_claude(prompt: str, *, timeout_s: int) -> str | None:
     context. See ``sources/web_search.py`` and the 2026-04 zero-runs incident
     on chat 169016071 for the same class of bug.
     """
+    # Pin to haiku (2026-05-25): without an explicit --model the CLI falls
+    # back to the default (Opus on this account) and a single devex run
+    # routinely exceeds 240s + ARG/IO ceiling, blowing through the 180s
+    # bot timeout. Haiku handles the WebSearch+JSON extraction in ~90s.
+    from claude_cli import SMALLEST_MODEL as _MODEL
     if _HAS_WRAPPED and _wrapped_run_p_with_tools is not None:
         try:
             return _wrapped_run_p_with_tools(  # type: ignore[misc]
@@ -165,6 +170,7 @@ def _run_claude(prompt: str, *, timeout_s: int) -> str | None:
                 allowed_tools=_ALLOWED_TOOLS,
                 disallowed_tools=_DISALLOWED_TOOLS,
                 timeout_s=timeout_s,
+                model=_MODEL,
             )
         except Exception:
             log.exception("devex: wrapped_run_p_with_tools failed; falling back to run_p_with_tools")
@@ -173,6 +179,7 @@ def _run_claude(prompt: str, *, timeout_s: int) -> str | None:
         allowed_tools=_ALLOWED_TOOLS,
         disallowed_tools=_DISALLOWED_TOOLS,
         timeout_s=timeout_s,
+        model=_MODEL,
     )
 
 

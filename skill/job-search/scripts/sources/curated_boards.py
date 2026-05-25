@@ -93,7 +93,9 @@ def _scrape_one(board_key: str, url: str, filters: dict) -> list[Job]:
         prompt = _PROMPT.format(url=url)
         # Tag the underlying CLI call with the specific board so claude_calls
         # rolls up per-board cost/elapsed.
-        stdout = wrapped_run_p(None, f"curated_boards:{board_key}", prompt, timeout_s=timeout_s)
+        # Pin to haiku (2026-05-25) — see same fix in devex/web_search.
+        from claude_cli import SMALLEST_MODEL as _MODEL
+        stdout = wrapped_run_p(None, f"curated_boards:{board_key}", prompt, timeout_s=timeout_s, model=_MODEL)
         if not stdout:
             fctx.set_output({"raw_count": 0, "reason": "cli_missing_or_empty"})
             return []

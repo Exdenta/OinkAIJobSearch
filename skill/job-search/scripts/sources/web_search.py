@@ -521,6 +521,9 @@ def fetch(
     # Use the tool-aware wrapper: WebSearch + WebFetch must be explicitly
     # allowed or the CLI rejects every tool_use and the agent gives up with
     # an empty jobs list.
+    # Pin to haiku (2026-05-25) — without --model the CLI defaults to
+    # Opus and the prompt blows past the bot's 180s timeout.
+    from claude_cli import SMALLEST_MODEL as _MODEL
     stdout = wrapped_run_p_with_tools(
         None,
         "web_search",
@@ -528,6 +531,7 @@ def fetch(
         allowed_tools=_ALLOWED_TOOLS,
         disallowed_tools=_DISALLOWED_TOOLS,
         timeout_s=timeout_s,
+        model=_MODEL,
     )
     if not stdout:
         log.warning("web_search: `claude` CLI unavailable or errored; returning []")
