@@ -917,6 +917,80 @@ def _resolve_final_url(url: str, timeout_s: float) -> str | None:
         return None
 
 
+# HEAD-only resolution misses ATSes that redirect SILENTLY via the HTML
+# body (Workable, SmartRecruiters): the server returns 200 with a
+# `<title>Current Openings</title>` page, but the URL stays canonical.
+# This helper fetches a small slice of the BODY so the structural gate
+# can see the title. Limited to ATSes where the silent-redirect pattern
+# is known to occur — for everything else HEAD is plenty.
+_SILENT_REDIRECT_DOMAINS = ("apply.workable.com", "jobs.smartrecruiters.com")
+_TITLE_BLOCK_RE = re.compile(r"<title[^>]*>([^<]{0,400})</title>", re.IGNORECASE)
+
+
+def _fetch_title_for_soft_404(url: str, timeout_s: float) -> str | None:
+    """Issue a GET and return the page <title> for known silent-redirect
+    ATS domains. Returns None on any failure or for domains where this
+    overhead isn't justified. Reads at most ~8KB to find the title tag.
+    """
+    if not url or not isinstance(url, str):
+        return None
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return None
+    if not any(host.endswith(d) for d in _SILENT_REDIRECT_DOMAINS):
+        return None
+    try:
+        with requests.get(
+            url,
+            stream=True,
+            allow_redirects=True,
+            timeout=timeout_s,
+            headers={"User-Agent": "FindJobs-Bot/1.0 (+soft-404-check)"},
+        ) as resp:
+            if not (200 <= resp.status_code < 400):
+                return None
+            chunk = resp.raw.read(8192, decode_content=True)
+            if not isinstance(chunk, (bytes, bytearray)):
+                return None
+            head = chunk.decode("utf-8", errors="replace")
+            m = _TITLE_BLOCK_RE.search(head)
+            if not m:
+                return None
+            return m.group(1).strip()
+    except Exception:
+        return None
+
+
+# Title tokens that mark the page as a careers landing rather than a
+# specific role. Pattern matches against the rendered <title>.
+_SOFT_404_TITLE_TOKENS = (
+    "current openings",
+    "all jobs",
+    "all openings",
+    "open roles",
+    "open positions",
+    "job openings",
+    "careers at",
+    "view open positions",
+)
+
+
+def _title_is_soft_404(title: str | None) -> tuple[bool, str]:
+    """Return True iff the page title contains a careers-landing token.
+    Per the TITLE-AS-VETO rule in the verifier prompt — the title is
+    server-set and survives SPA navigation, so it's the strongest
+    structural signal we have.
+    """
+    if not title:
+        return (False, "")
+    low = title.lower()
+    for tok in _SOFT_404_TITLE_TOKENS:
+        if tok in low:
+            return (True, f"closed:title_token:{tok.replace(' ', '_')}")
+    return (False, "")
+
+
 def _web_search_listing_still_open(
     job: Job, timeout_s: int = WEB_SEARCH_VERIFY_TIMEOUT_S,
 ) -> tuple[bool | None, str]:
@@ -2127,6 +2201,18 @@ def prefilter_for_send(
                     job.url, timeout_s=URL_VALIDATION_TIMEOUT_S,
                 ) or job.url
                 is_soft, soft_reason = _url_pattern_is_soft_404(final_url)
+                # If URL-pattern check is clean but the host is a known
+                # silent-redirect ATS, fetch the <title> and check it.
+                # Workable's `apply.workable.com/<co>/j/<id>/` returns
+                # 200 with title "<Company> - Current Openings" when
+                # the role is removed — HEAD-only can't see this.
+                if not is_soft:
+                    page_title = _fetch_title_for_soft_404(
+                        final_url, timeout_s=URL_VALIDATION_TIMEOUT_S,
+                    )
+                    is_soft, soft_reason = _title_is_soft_404(page_title)
+                    if is_soft and page_title:
+                        soft_reason = f"{soft_reason} ({page_title[:60]})"
                 if is_soft:
                     web_search_closed_count += 1
                     if forensic is not None:
