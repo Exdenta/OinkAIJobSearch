@@ -2457,67 +2457,15 @@ def send_per_job_digest(
         )
         return 0
 
-    # ----------------------------------------------------------------
-    # Pig sticker decision — moved inline so it reflects the ALIVE count,
-    # not the pre-gate score-floor count. (Used to live in search_jobs.py
-    # before this restructure.)
-    # ----------------------------------------------------------------
-    try:
-        import pig_stickers as _pigs
-        _pigs.send_sticker(
-            tg, chat_id,
-            _pigs.GOOD_MORNING if alive_jobs else _pigs.NO_MATCHES,
-        )
-    except Exception:
-        log.debug("send_per_job_digest: pig sticker send failed; continuing",
-                  exc_info=True)
-
-    # ----------------------------------------------------------------
-    # Header send (now with accurate count = len(alive_jobs)).
-    # ----------------------------------------------------------------
-    header_status = "ok"
-    header_err = None
-    if not skip_header:
-        try:
-            kb = digest_header_keyboard(
-                run_id=run_id,
-                current_floor=int(min_score or 0),
-                lower_count=int(lower_count_at_step or 0),
-            )
-            header_text = digest_header_mdv2() + "\n\n" + _count_line(
-                alive_jobs,
-                min_score=min_score,
-                enriched_count=enriched_count,
-                dropped_below_score=dropped_below_score,
-            )
-            tg.send_message(chat_id, header_text, reply_markup=kb)
-        except Exception as e:
-            header_status = "error"
-            header_err = {"class": type(e).__name__, "message": str(e)[:300]}
-            log.error("send_per_job_digest: header send failed for %s: %s",
-                      chat_id, e)
-            if _forensic is not None:
-                _forensic.log_step(
-                    "telegram.send_header",
-                    input={"chat_id": chat_id, "job_count": len(alive_jobs),
-                           "min_score": min_score},
-                    output={"status": header_status},
-                    error=header_err,
-                    chat_id=chat_id,
-                )
-            return 0
-        if _forensic is not None:
-            _forensic.log_step(
-                "telegram.send_header",
-                input={"chat_id": chat_id, "job_count": len(alive_jobs),
-                       "min_score": min_score},
-                output={"status": header_status},
-                chat_id=chat_id,
-            )
-
+    # Header card + pig sticker were removed 2026-05-25 — operator
+    # asked for per-job cards only, no preamble. `skip_header`,
+    # `min_score`, `enriched_count`, `dropped_below_score`,
+    # `lower_count_at_step`, `run_id` are kept on the signature only
+    # for back-compat with existing callers; they don't influence
+    # output anymore.
     if not alive_jobs:
-        return 1 if not skip_header else 0
-    sent = 1 if not skip_header else 0
+        return 0
+    sent = 0
 
     # ----------------------------------------------------------------
     # Per-job loop — pure send now, no gates. Every job in alive_jobs
