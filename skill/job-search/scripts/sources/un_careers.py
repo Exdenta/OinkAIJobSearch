@@ -102,12 +102,14 @@ def _step(op: str, *, input: Any | None = None) -> Iterator[Any]:
 
 def _run_claude(prompt: str, *, timeout_s: int) -> str | None:
     """Use the instrumented wrapper when available, else plain run_p."""
+    # Pin to haiku (2026-05-25) — see same fix in devex/web_search.
+    from claude_cli import SMALLEST_MODEL as _MODEL
     if _HAS_WRAPPED:
         try:
-            return _wrapped_run_p(None, "un_careers", prompt, timeout_s=timeout_s)  # type: ignore[misc]
+            return _wrapped_run_p(None, "un_careers", prompt, timeout_s=timeout_s, model=_MODEL)  # type: ignore[misc]
         except Exception:
             log.exception("un_careers: wrapped_run_p failed; falling back to run_p")
-    return run_p(prompt, timeout_s=timeout_s)
+    return run_p(prompt, timeout_s=timeout_s, model=_MODEL)
 
 
 # ---------------------------------------------------------------------------

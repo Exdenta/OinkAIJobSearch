@@ -147,10 +147,13 @@ def fetch(filters: dict | None = None) -> list[Job]:
         SOURCE_KEY, cap, timeout_s, LANDING_URL,
     )
 
+    # Pin to haiku (2026-05-25) — see same fix in devex/web_search.
+    from claude_cli import SMALLEST_MODEL as _MODEL
     stdout = run_p_with_tools(
         prompt,
         allowed_tools="WebFetch WebSearch",
         timeout_s=timeout_s,
+        model=_MODEL,
     )
     if stdout is None:
         log.warning("%s.fetch: CLI unavailable or failed; returning []", SOURCE_KEY)
