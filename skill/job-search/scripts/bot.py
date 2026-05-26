@@ -2925,17 +2925,189 @@ def _apply_tailor(
 # or env file.
 _CONTINUOUS_MODE_TRUTHY = ("1", "true", "yes", "on")
 
+# Process-wide registry of {chat_id -> Thread} for continuous-searcher daemon
+# threads. The startup pass and the live-spawn hook both consult this to dedup:
+# starting twice for the same chat_id is a no-op for the second call. The lock
+# guards entry + the dedup check so two near-simultaneous live spawns can't both
+# slip past the "already running" branch.
+_CONTINUOUS_REGISTRY_LOCK = threading.Lock()
+_CONTINUOUS_REGISTRY: dict[int, threading.Thread] = {}
+
 
 def _continuous_mode_enabled() -> bool:
     return (os.environ.get("HRYU_CONTINUOUS_MODE", "") or "").strip().lower() \
         in _CONTINUOUS_MODE_TRUTHY
 
 
-def _maybe_start_continuous_searcher(db: DB) -> threading.Thread | None:
-    """Spawn the Phase-3 continuous searcher in a background daemon thread.
+def _parse_continuous_chat_ids_env() -> list[int]:
+    """Parse the comma-separated HRYU_CONTINUOUS_CHAT_ID env var.
 
-    Returns the Thread (for tests / observability) or None when continuous
-    mode is disabled.
+    Returns the list of positive ints, dropping blanks and bad tokens.
+    An empty / unset env var yields []. Pulled into a helper so the resolver
+    and the tests can share parsing logic.
+    """
+    chat_raw = (os.environ.get("HRYU_CONTINUOUS_CHAT_ID", "") or "").strip()
+    chat_ids: list[int] = []
+    for tok in chat_raw.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            cid = int(tok)
+        except ValueError:
+            cid = 0
+        if cid > 0:
+            chat_ids.append(cid)
+    return chat_ids
+
+
+def _resolve_continuous_chat_ids(db: DB) -> list[int]:
+    """Decide which chat_ids the continuous searcher should run for at startup.
+
+    Resolution order:
+      1. If HRYU_CONTINUOUS_CHAT_ID is set and parses to ≥1 positive int,
+         use exactly those ids. This is the operator-override path: pin
+         the loop to a single user for debugging without touching the DB.
+      2. Otherwise, fall back to every onboarded user in the DB (the new
+         default — see `db.onboarded_chat_ids`).
+
+    When the env var is set but malformed (only invalid tokens), we log a
+    warning and fall back to the DB list. That avoids a silent "operator
+    typo wiped everyone's continuous mode" failure mode.
+    """
+    env_ids = _parse_continuous_chat_ids_env()
+    env_raw = (os.environ.get("HRYU_CONTINUOUS_CHAT_ID", "") or "").strip()
+    if env_ids:
+        return env_ids
+    if env_raw:
+        log.warning(
+            "HRYU_CONTINUOUS_CHAT_ID set but parsed to no valid ids (got %r) "
+            "— falling back to onboarded users from DB",
+            env_raw,
+        )
+    try:
+        return list(db.onboarded_chat_ids())
+    except Exception:
+        log.exception("resolver: db.onboarded_chat_ids failed; returning empty list")
+        return []
+
+
+def _continuous_interval_and_floor() -> tuple[int, int]:
+    """Pull (interval_seconds, min_sleep_seconds) from defaults with a safe
+    fallback. Extracted so spawn paths share one source of truth.
+    """
+    try:
+        from defaults import DEFAULTS as _DEFAULTS
+        interval = int(_DEFAULTS.get("continuous_interval_seconds", 7200))
+        min_sleep = int(_DEFAULTS.get("continuous_min_sleep_seconds", 60))
+    except Exception:
+        interval, min_sleep = 7200, 60
+    return interval, min_sleep
+
+
+def _spawn_continuous_searcher_thread(
+    db: DB,
+    chat_id: int,
+    startup_delay: int,
+    *,
+    interval: int | None = None,
+    min_sleep: int | None = None,
+) -> threading.Thread | None:
+    """Spawn a daemon thread running ContinuousSearcher for one chat_id.
+
+    Idempotent: if `chat_id` already has a live thread in the registry, this
+    is a no-op (returns the existing Thread). The dedup check + registry
+    insert are guarded by `_CONTINUOUS_REGISTRY_LOCK`.
+
+    Returns the (new or existing) Thread, or None when chat_id is invalid.
+    """
+    if chat_id <= 0:
+        log.warning("spawn_continuous_searcher: refusing non-positive chat_id=%r", chat_id)
+        return None
+
+    if interval is None or min_sleep is None:
+        _interval, _min_sleep = _continuous_interval_and_floor()
+        if interval is None:
+            interval = _interval
+        if min_sleep is None:
+            min_sleep = _min_sleep
+
+    import time as _time
+    from continuous_searcher import ContinuousSearcher
+
+    with _CONTINUOUS_REGISTRY_LOCK:
+        existing = _CONTINUOUS_REGISTRY.get(chat_id)
+        # is_alive() check lets a crashed thread be replaced. A daemon thread
+        # that ran ContinuousSearcher to completion (e.g. via cancellation)
+        # is no longer alive, so a future live-spawn call is allowed to retry.
+        if existing is not None and existing.is_alive():
+            log.info(
+                "continuous_searcher chat_id=%d already running — skipping duplicate spawn",
+                chat_id,
+            )
+            return existing
+
+        def _runner():
+            if startup_delay > 0:
+                log.info(
+                    "continuous_searcher chat_id=%d: staggered startup sleep %ds",
+                    chat_id, startup_delay,
+                )
+                _time.sleep(startup_delay)
+            loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(loop)
+                searcher = ContinuousSearcher(
+                    db=db,
+                    chat_id=chat_id,
+                    interval_seconds=interval,
+                    min_sleep_seconds=min_sleep,
+                )
+                try:
+                    loop.run_until_complete(searcher.run_forever())
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    log.exception(
+                        "continuous_searcher thread crashed (chat_id=%d)", chat_id,
+                    )
+            finally:
+                try:
+                    loop.close()
+                except Exception:
+                    pass
+
+        t = threading.Thread(
+            target=_runner,
+            daemon=True,
+            name=f"continuous_searcher_{chat_id}",
+        )
+        _CONTINUOUS_REGISTRY[chat_id] = t
+        t.start()
+
+    log.info(
+        "continuous_searcher started: chat_id=%d interval=%ds startup_delay=%ds (daemon thread)",
+        chat_id, interval, startup_delay,
+    )
+    return t
+
+
+def _maybe_start_continuous_searcher(db: DB) -> list[threading.Thread] | None:
+    """Spawn the Phase-3 continuous searcher in background daemon threads.
+
+    Returns the list of Threads (for tests / observability) or None when
+    continuous mode is disabled.
+
+    Resolution
+    ----------
+    The chat-id list is resolved via `_resolve_continuous_chat_ids`:
+      • HRYU_CONTINUOUS_CHAT_ID set      → use those ids (operator override)
+      • HRYU_CONTINUOUS_CHAT_ID empty    → every onboarded user in the DB
+
+    Spawning is delegated to `_spawn_continuous_searcher_thread`, which is
+    the same code path used by the live-spawn hook from onboarding.py. The
+    registry guards against double-spawn when an onboarded user appears in
+    both the startup pass and a concurrent live-spawn.
 
     Architecture
     ------------
@@ -2957,41 +3129,16 @@ def _maybe_start_continuous_searcher(db: DB) -> threading.Thread | None:
     if not _continuous_mode_enabled():
         return None
 
-    chat_raw = (os.environ.get("HRYU_CONTINUOUS_CHAT_ID", "") or "").strip()
-    # Comma-separated list of chat_ids — one searcher daemon thread per id.
-    # Single-id env values stay back-compat ("433775883" still parses to [433775883]).
-    chat_ids: list[int] = []
-    for tok in chat_raw.split(","):
-        tok = tok.strip()
-        if not tok:
-            continue
-        try:
-            cid = int(tok)
-        except ValueError:
-            cid = 0
-        if cid > 0:
-            chat_ids.append(cid)
+    chat_ids = _resolve_continuous_chat_ids(db)
     if not chat_ids:
         log.warning(
-            "continuous_mode enabled but HRYU_CONTINUOUS_CHAT_ID missing or "
-            "invalid (got %r) — skipping searcher",
-            chat_raw,
+            "continuous_mode enabled but resolver returned no chat_ids — "
+            "no onboarded users in DB and no HRYU_CONTINUOUS_CHAT_ID override; "
+            "skipping searcher",
         )
         return None
 
-    # Interval — read from defaults at startup so operators can tune it
-    # in one place without touching env vars. defaults.DEFAULTS is the
-    # canonical source; we only fall back to a hard-coded 7200s if the
-    # key disappeared somehow.
-    try:
-        from defaults import DEFAULTS as _DEFAULTS
-        interval = int(_DEFAULTS.get("continuous_interval_seconds", 7200))
-        min_sleep = int(_DEFAULTS.get("continuous_min_sleep_seconds", 60))
-    except Exception:
-        interval, min_sleep = 7200, 60
-
-    from continuous_searcher import ContinuousSearcher
-    import time as _time
+    interval, min_sleep = _continuous_interval_and_floor()
 
     # Stagger across the chat_id list so N users don't all fire scoring
     # concurrently (cuts peak Claude-API load by N×). Stagger = interval/N:
@@ -2999,51 +3146,60 @@ def _maybe_start_continuous_searcher(db: DB) -> threading.Thread | None:
     n = len(chat_ids)
     stagger_step = interval // n if n > 0 else 0
 
-    def _make_runner(cid: int, startup_delay: int):
-        def _runner():
-            if startup_delay > 0:
-                log.info(
-                    "continuous_searcher chat_id=%d: staggered startup sleep %ds",
-                    cid, startup_delay,
-                )
-                _time.sleep(startup_delay)
-            loop = asyncio.new_event_loop()
-            try:
-                asyncio.set_event_loop(loop)
-                searcher = ContinuousSearcher(
-                    db=db,
-                    chat_id=cid,
-                    interval_seconds=interval,
-                    min_sleep_seconds=min_sleep,
-                )
-                try:
-                    loop.run_until_complete(searcher.run_forever())
-                except asyncio.CancelledError:
-                    pass
-                except Exception:
-                    log.exception("continuous_searcher thread crashed (chat_id=%d)", cid)
-            finally:
-                try:
-                    loop.close()
-                except Exception:
-                    pass
-        return _runner
-
-    threads: list = []
+    threads: list[threading.Thread] = []
     for idx, cid in enumerate(chat_ids):
         delay = idx * stagger_step
-        t = threading.Thread(
-            target=_make_runner(cid, delay),
-            daemon=True,
-            name=f"continuous_searcher_{cid}",
+        t = _spawn_continuous_searcher_thread(
+            db, cid, delay, interval=interval, min_sleep=min_sleep,
         )
-        t.start()
-        threads.append(t)
-        log.info(
-            "continuous_searcher started: chat_id=%d interval=%ds stagger_delay=%ds (daemon thread)",
-            cid, interval, delay,
-        )
+        if t is not None:
+            threads.append(t)
     return threads
+
+
+# Range of seconds for the live-spawn random startup delay. Picking a few
+# minutes keeps a newly-onboarded user from slamming sources at the same
+# instant the operator finishes the wizard, while still firing the first
+# iteration "soon" (so the user sees results inside one coffee break, not
+# one cycle later). Constants are module-level so tests can monkey-patch.
+_LIVE_SPAWN_DELAY_MIN = 60
+_LIVE_SPAWN_DELAY_MAX = 300
+
+
+def start_continuous_searcher_for(db: DB, chat_id: int) -> threading.Thread | None:
+    """Public live-spawn hook. Called from onboarding.finalize after the user
+    completes the wizard.
+
+    No-ops when:
+      • continuous mode is OFF (HRYU_CONTINUOUS_MODE unset/zero)
+      • HRYU_CONTINUOUS_CHAT_ID is set AND `chat_id` is NOT in the list —
+        operator pinned to a specific subset, so we honor the pin and do
+        NOT auto-add new onboarded users.
+      • a thread is already registered for `chat_id` (idempotent).
+
+    Picks a small random startup delay (`_LIVE_SPAWN_DELAY_MIN`…`_MAX`s) so
+    the first iteration doesn't fire at the exact moment the user finishes
+    the wizard — the user-facing summary card lands first, and the search
+    runs in the background a few minutes later.
+    """
+    if not _continuous_mode_enabled():
+        return None
+
+    # If the operator pinned a specific chat_id list, the live-spawn hook
+    # respects that pin. New users get no thread until the operator opts in
+    # (this matches the "operator can restrict" constraint in the spec).
+    env_ids = _parse_continuous_chat_ids_env()
+    if env_ids and chat_id not in env_ids:
+        log.info(
+            "start_continuous_searcher_for chat_id=%d: env-pinned to %r; "
+            "skipping live-spawn",
+            chat_id, env_ids,
+        )
+        return None
+
+    import random as _random
+    delay = _random.randint(_LIVE_SPAWN_DELAY_MIN, _LIVE_SPAWN_DELAY_MAX)
+    return _spawn_continuous_searcher_thread(db, chat_id, delay)
 
 
 # ---------- main loop ----------
