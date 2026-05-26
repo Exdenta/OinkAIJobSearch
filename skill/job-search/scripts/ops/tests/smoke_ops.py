@@ -102,6 +102,11 @@ class FakeTG:
         })
         return 1
 
+    def send_plain(self, chat_id, text) -> int:
+        # Mirror TelegramClient.send_plain — admin summary uses this path
+        # to bypass MarkdownV2 escaping (URLs autolink, raw '(' is fine).
+        return self.send_message(chat_id, text, parse_mode="")
+
 
 # ---------------------------------------------------------------------------
 # Fake MonitorStore — minimum surface needed by ops/. Returns canned rows in

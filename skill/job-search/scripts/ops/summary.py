@@ -365,10 +365,34 @@ def deliver_daily_summary(
             return
 
         body = build_daily_summary(store, run_id, db=db)
-        for chunk in _chunk_by_size(body):
-            # send_plain bypasses the MarkdownV2 parser; our body contains
-            # raw '(', '_', '-' etc. and we don't want to escape every URL.
-            tg.send_plain(op, chunk)
+        chunks = _chunk_by_size(body)
+        # SIGTERM trace (2026-05-26): wrap each chunk send in a try-block
+        # that catches BaseException so SystemExit / KeyboardInterrupt
+        # caused by a `kill` during the Telegram POST gets logged. The
+        # "delivered N/M chunks" line at start/end lets operators spot
+        # interrupted deliveries from logs alone (no more silent loss).
+        log.info(
+            "admin_summary: delivering run_id=%s — %d chunk(s) to chat %s",
+            run_id, len(chunks), op,
+        )
+        delivered = 0
+        for i, chunk in enumerate(chunks):
+            try:
+                # send_plain bypasses the MarkdownV2 parser; our body contains
+                # raw '(', '_', '-' etc. and we don't want to escape every URL.
+                tg.send_plain(op, chunk)
+                delivered += 1
+            except BaseException:  # noqa: BLE001 — SIGTERM-aware
+                log.exception(
+                    "admin_summary: chunk %d/%d send aborted "
+                    "(run_id=%s, delivered=%d before abort)",
+                    i + 1, len(chunks), run_id, delivered,
+                )
+                raise
+        log.info(
+            "admin_summary: run_id=%s delivered %d/%d chunk(s)",
+            run_id, delivered, len(chunks),
+        )
     except Exception:
         log.exception(
             "deliver_daily_summary: unhandled error swallowed (run_id=%s)",
