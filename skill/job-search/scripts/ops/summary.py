@@ -248,10 +248,6 @@ def _user_chat_for_run(sources: Iterable[Any]) -> int | None:
 # Render
 # ---------------------------------------------------------------------------
 
-# How many recent pipeline runs to show in the admin table.
-_ADMIN_RUNS_TO_SHOW = 8
-
-
 def _format_runs_table(rows: list[Any], store: Any) -> str:
     """Render the recent-runs table body as a box-drawing-character table.
     Wrapped in <pre>...</pre> by the caller for Telegram HTML monospace.
@@ -299,24 +295,27 @@ def _format_runs_table(rows: list[Any], store: Any) -> str:
 
 
 def build_daily_summary(store: Any, run_id: int, db: Any | None = None) -> str:
-    """Render the per-run admin message body.
+    """Render the per-iter admin message body.
 
-    2026-05-26: operator asked for the bare facts in a single compact
-    table — the previous queue/funnel/contents triplet was too long.
-    Body is just the last N pipeline runs in a box-drawing-character
-    table, wrapped in <pre>...</pre> so Telegram HTML renders it
-    monospace. `run_id` and `db` kept on the signature for back-compat
-    with the existing caller in search_jobs.run.
+    2026-05-26: operator wants a SINGLE row — the iter that just
+    finished — not a history of recent runs. We fetch the specific
+    pipeline row matching `run_id` and render it in the same
+    box-drawing table shape as before (header + one data row).
+    Wrapped in <pre>…</pre> so Telegram HTML renders monospace.
     """
+    run = None
     try:
-        rows = store.recent_pipeline_runs(_ADMIN_RUNS_TO_SHOW)
+        # pipeline_run_with_sources(run_id) returns (run_row, sources_rows).
+        # We only need the run_row; sources are still useful inside
+        # _format_runs_table for the User column.
+        run, _src = store.pipeline_run_with_sources(int(run_id))
     except Exception:
-        log.exception("admin_summary: recent_pipeline_runs failed")
-        rows = []
+        log.exception("admin_summary: pipeline_run lookup failed (run_id=%s)", run_id)
 
-    if not rows:
-        return "<pre>(no recent runs)</pre>"
-    table = _format_runs_table(list(rows), store)
+    if run is None:
+        return "<pre>(no run data for #%d)</pre>" % int(run_id or 0)
+
+    table = _format_runs_table([run], store)
     return "<pre>" + table + "</pre>"
 
 

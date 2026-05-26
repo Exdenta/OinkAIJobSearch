@@ -401,9 +401,11 @@ check("│" in summary and "├" in summary,
 print("\n6. build_daily_summary — empty-input edge case")
 
 store2 = FakeStore()
-# FakeStore.recent_pipeline_runs returns [] when no runs registered.
+# FakeStore.pipeline_run_with_sources raises KeyError when the run_id
+# isn't registered → build_daily_summary catches it and emits the
+# "(no run data)" placeholder.
 out = build_daily_summary(store2, 99, db=None)
-check("(no recent runs)" in out, "empty-state placeholder visible")
+check("no run data" in out, "empty-state placeholder visible")
 check("<pre>" in out, "still wrapped in <pre> on empty")
 
 
@@ -432,9 +434,12 @@ check("6" in out and "18" in out, "web + linkedin hits present")
 
 
 # ---------------------------------------------------------------------------
-# 8. build_daily_summary — multiple runs preserved in order
+# 8. build_daily_summary — only the requested run is rendered (single row)
 # ---------------------------------------------------------------------------
-print("\n8. build_daily_summary — multiple runs")
+# Per 2026-05-26 operator request, the body shows ONLY the iter that just
+# finished. Even when many runs exist in the store, only the matching
+# run_id's row appears.
+print("\n8. build_daily_summary — only requested run rendered")
 
 store4 = FakeStore()
 for rid, raw, sent in [(101, 540, 0), (102, 541, 1), (103, 543, 5)]:
@@ -449,8 +454,9 @@ for rid, raw, sent in [(101, 540, 0), (102, 541, 1), (103, 543, 5)]:
         {"source_key": "linkedin", "status": "ok", "raw_count": 10, "user_chat_id": 433775883},
     ])
 out = build_daily_summary(store4, 103, db=None)
-check("#101" in out and "#102" in out and "#103" in out,
-      "all three runs appear in the table")
+check("#103" in out, "requested run id appears")
+check("#101" not in out and "#102" not in out,
+      "other runs are NOT rendered (only the requested one)")
 
 
 # ---------------------------------------------------------------------------
