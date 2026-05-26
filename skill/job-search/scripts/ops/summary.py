@@ -294,21 +294,77 @@ def _format_runs_table(rows: list[Any], store: Any) -> str:
     return "\n".join(lines)
 
 
+def _sent_jobs_for_run(
+    db: Any,
+    chat_id: int | None,
+    started: float,
+    finished: float,
+) -> list[dict]:
+    """Return jobs shipped during this iter's time window. List shape:
+    [{"title": str, "url": str, "company": str, "source": str}, ...]
+    in send order. Empty when nothing shipped (or DB unavailable).
+    """
+    if db is None or chat_id is None or not started:
+        return []
+    # Pad the window slightly: flushes can write `sent_at` a hair before
+    # the run's `finished_at` is updated (concurrent context exit).
+    lo = float(started) - 10.0
+    hi = max(float(finished or 0.0), time.time()) + 60.0
+    try:
+        with db._conn() as c:
+            rows = c.execute(
+                """
+                SELECT j.title, j.url, j.company, j.source, s.sent_at
+                  FROM sent_messages s JOIN jobs j ON j.job_id = s.job_id
+                 WHERE s.chat_id = ? AND s.sent_at BETWEEN ? AND ?
+                 ORDER BY s.sent_at
+                """,
+                (int(chat_id), lo, hi),
+            ).fetchall()
+    except Exception:
+        log.exception("admin_summary: sent_jobs lookup failed")
+        return []
+    return [
+        {
+            "title": (r["title"] or "(no title)"),
+            "url": (r["url"] or ""),
+            "company": (r["company"] or ""),
+            "source": (r["source"] or "?"),
+        }
+        for r in rows
+    ]
+
+
+def _html_escape(s: str) -> str:
+    """Minimal HTML escape — only the three chars Telegram cares about
+    in <pre> bodies and href attributes."""
+    return (
+        (s or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
 def build_daily_summary(store: Any, run_id: int, db: Any | None = None) -> str:
     """Render the per-iter admin message body.
 
-    2026-05-26: operator wants a SINGLE row — the iter that just
-    finished — not a history of recent runs. We fetch the specific
-    pipeline row matching `run_id` and render it in the same
-    box-drawing table shape as before (header + one data row).
-    Wrapped in <pre>…</pre> so Telegram HTML renders monospace.
+    Layout (HTML mode, Telegram parse_mode="HTML"):
+
+      <pre>...single-row table...</pre>
+      [optional]
+      Sent N:
+      • <a href="URL">Title</a> — Company
+
+    Only the iter that just finished is shown. The "Sent" block is
+    omitted when zero jobs shipped (the table's Sent column already
+    tells the operator that).
     """
     run = None
+    sources: list = []
     try:
-        # pipeline_run_with_sources(run_id) returns (run_row, sources_rows).
-        # We only need the run_row; sources are still useful inside
-        # _format_runs_table for the User column.
-        run, _src = store.pipeline_run_with_sources(int(run_id))
+        run, sources = store.pipeline_run_with_sources(int(run_id))
     except Exception:
         log.exception("admin_summary: pipeline_run lookup failed (run_id=%s)", run_id)
 
@@ -316,7 +372,26 @@ def build_daily_summary(store: Any, run_id: int, db: Any | None = None) -> str:
         return "<pre>(no run data for #%d)</pre>" % int(run_id or 0)
 
     table = _format_runs_table([run], store)
-    return "<pre>" + table + "</pre>"
+    body = "<pre>" + table + "</pre>"
+
+    # Append the titles+URLs of jobs that shipped during this iter.
+    user_chat = _user_chat_for_run(sources)
+    started = float(_row_get(run, "started_at", 0) or 0)
+    finished = float(_row_get(run, "finished_at", 0) or 0)
+    sent = _sent_jobs_for_run(db, user_chat, started, finished)
+    if sent:
+        lines = [f"\n📤 Sent {len(sent)}:"]
+        for j in sent:
+            title = _html_escape(j["title"])
+            comp = _html_escape(j["company"])
+            url = _html_escape(j["url"])
+            comp_suffix = f" — {comp}" if comp else ""
+            if url:
+                lines.append(f"• <a href=\"{url}\">{title}</a>{comp_suffix}")
+            else:
+                lines.append(f"• {title}{comp_suffix}")
+        body += "\n".join(lines)
+    return body
 
 
 def _chunk_by_size(body: str, limit: int = _TELEGRAM_MSG_LIMIT) -> list[str]:
