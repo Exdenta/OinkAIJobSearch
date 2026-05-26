@@ -248,72 +248,76 @@ def _user_chat_for_run(sources: Iterable[Any]) -> int | None:
 # Render
 # ---------------------------------------------------------------------------
 
-def build_daily_summary(store: Any, run_id: int, db: Any | None = None) -> str:
-    """Render the per-run admin message body. See module docstring.
+# How many recent pipeline runs to show in the admin table.
+_ADMIN_RUNS_TO_SHOW = 8
 
-    Signature keeps the legacy (store, run_id) prefix so older test
-    harnesses that don't pass `db` get a slightly thinner message (the
-    queue + queue-contents sections are skipped when `db` is None, since
-    they need direct access to the main DB; the funnel section
-    degrades to fetched-only).
+
+def _format_runs_table(rows: list[Any], store: Any) -> str:
+    """Render the recent-runs table body as a box-drawing-character table.
+    Wrapped in <pre>...</pre> by the caller for Telegram HTML monospace.
+    """
+    # Column widths tuned to fit ~70-char phone screens.
+    header = "│ Run  │ Time  │   User    │ Raw │ Sent │ Web │ LinkedIn │  Dur  │"
+    sep    = "├──────┼───────┼───────────┼─────┼──────┼─────┼──────────┼───────┤"
+    lines = [header, sep]
+    import json
+    for r in rows:
+        rid = f"#{int(_row_get(r, 'id', 0) or 0)}"
+        started = float(_row_get(r, "started_at", 0) or 0)
+        finished = float(_row_get(r, "finished_at", 0) or 0)
+        ts = time.strftime("%H:%M", time.localtime(started)) if started else "—"
+        # Derive user from per-user source rows.
+        user_chat = "—"
+        try:
+            _, sources = store.pipeline_run_with_sources(int(_row_get(r, "id", 0) or 0))
+            uc = _user_chat_for_run(sources)
+            if uc is not None:
+                user_chat = str(uc)
+        except Exception:
+            pass
+        raw = int(_row_get(r, "jobs_raw", 0) or 0)
+        sent = int(_row_get(r, "jobs_sent", 0) or 0)
+        extra_raw = _row_get(r, "extra_json")
+        web = li = 0
+        try:
+            if extra_raw:
+                e = json.loads(extra_raw) if isinstance(extra_raw, str) else dict(extra_raw)
+                web = int(e.get("web_hits") or 0)
+                li = int(e.get("linkedin_user_hits") or 0)
+        except Exception:
+            pass
+        dur = int(max(0, finished - started)) if (started and finished) else 0
+        dur_s = f"{dur}s"
+        lines.append(
+            f"│ {rid:<4} │ {ts:<5} │ {user_chat:<9} │ {raw:<3} │ {sent:<4} │ {web:<3} │ {li:<8} │ {dur_s:<5} │"
+        )
+        lines.append(sep)
+    # Replace last separator with a closing border (visual polish).
+    if len(lines) > 2:
+        lines[-1] = sep.replace("├", "└").replace("┼", "┴").replace("┤", "┘")
+    return "\n".join(lines)
+
+
+def build_daily_summary(store: Any, run_id: int, db: Any | None = None) -> str:
+    """Render the per-run admin message body.
+
+    2026-05-26: operator asked for the bare facts in a single compact
+    table — the previous queue/funnel/contents triplet was too long.
+    Body is just the last N pipeline runs in a box-drawing-character
+    table, wrapped in <pre>...</pre> so Telegram HTML renders it
+    monospace. `run_id` and `db` kept on the signature for back-compat
+    with the existing caller in search_jobs.run.
     """
     try:
-        run, sources = store.pipeline_run_with_sources(run_id)
+        rows = store.recent_pipeline_runs(_ADMIN_RUNS_TO_SHOW)
     except Exception:
-        log.exception("admin_summary: pipeline_run_with_sources failed")
-        run, sources = None, []
+        log.exception("admin_summary: recent_pipeline_runs failed")
+        rows = []
 
-    started = float(_row_get(run, "started_at", 0) or 0)
-    finished = float(_row_get(run, "finished_at", 0) or 0)
-    user_chat = _user_chat_for_run(sources)
-
-    lines: list[str] = []
-
-    # ---- 1. Queue depths (all users) ----
-    lines.append("Queue")
-    qrows = _queue_per_user(db)
-    if not qrows:
-        lines.append("  (empty)")
-    else:
-        for chat, depth, age in qrows:
-            if age is None:
-                lines.append(f"  chat {chat}: {depth}")
-            else:
-                lines.append(f"  chat {chat}: {depth}  (oldest {age:.1f}h)")
-    lines.append("")
-
-    # ---- 2. Per-source funnel (this run) ----
-    funnel = _funnel_for_run(db, sources, user_chat, started, finished)
-    chat_label = f"chat {user_chat}" if user_chat is not None else "global"
-    lines.append(f"Sources this run ({chat_label})")
-    if not funnel:
-        lines.append("  (no source data)")
-    else:
-        lines.append("  source           fetched  scored  matched  queued")
-        for src, f, sc, m, q in funnel:
-            lines.append(
-                f"  {src:<16} {f:>7}  {sc:>6}  {m:>7}  {q:>6}"
-            )
-    lines.append("")
-
-    # ---- 3. Queue contents (all users) ----
-    lines.append("Queue contents")
-    by_chat = _queue_entries_per_user(db)
-    if not by_chat:
-        lines.append("  (empty)")
-    else:
-        for chat in sorted(by_chat):
-            lines.append(f"  chat {chat}:")
-            for e in by_chat[chat]:
-                src = e["source"]
-                comp = f" — {e['company']}" if e["company"] else ""
-                lines.append(
-                    f"    [{e['match_score']}] {e['title']}{comp}  ({src})"
-                )
-                if e["url"]:
-                    lines.append(f"      {e['url']}")
-
-    return "\n".join(lines)
+    if not rows:
+        return "<pre>(no recent runs)</pre>"
+    table = _format_runs_table(list(rows), store)
+    return "<pre>" + table + "</pre>"
 
 
 def _chunk_by_size(body: str, limit: int = _TELEGRAM_MSG_LIMIT) -> list[str]:
@@ -378,9 +382,11 @@ def deliver_daily_summary(
         delivered = 0
         for i, chunk in enumerate(chunks):
             try:
-                # send_plain bypasses the MarkdownV2 parser; our body contains
-                # raw '(', '_', '-' etc. and we don't want to escape every URL.
-                tg.send_plain(op, chunk)
+                # 2026-05-26: body is now an HTML <pre> block so the
+                # box-drawing runs table aligns on mobile (Telegram's
+                # default text font is variable-width). HTML mode also
+                # avoids MarkdownV2's escape-everything tax.
+                tg.send_message(op, chunk, parse_mode="HTML")
                 delivered += 1
             except BaseException:  # noqa: BLE001 — SIGTERM-aware
                 log.exception(

@@ -378,88 +378,79 @@ check(ok, "broken envelope → deliver_alert swallows")
 
 
 # ---------------------------------------------------------------------------
-# 5. build_daily_summary — three sections present
+# 5. build_daily_summary — recent runs table
 # ---------------------------------------------------------------------------
-# The admin message format was simplified 2026-05-24 to: queue depths,
-# per-source funnel for THIS run, queue contents. No header / footer /
-# anomalies / cost block — the operator asked for the bare facts only.
-print("\n5. build_daily_summary — three sections present")
+# The admin message format was simplified 2026-05-26 to a single compact
+# recent-runs table (the queue/funnel/contents triplet was too long).
+# Body is HTML-wrapped <pre>…</pre> for monospace alignment on mobile.
+print("\n5. build_daily_summary — recent runs table")
 
 store = FakeStore()
 _seed_default(store)
 summary = build_daily_summary(store, 2031, db=None)
-check(contains_all(summary, [
-    "Queue",
-    "Sources this run",
-    "Queue contents",
-    "hackernews",
-]), "admin message contains queue, funnel, contents")
-check("fetched" in summary and "scored" in summary,
-      "funnel header names the per-step columns")
+check("<pre>" in summary and "</pre>" in summary, "body wrapped in <pre>…</pre>")
+check("Run" in summary and "Time" in summary and "User" in summary,
+      "table header present")
+check("│" in summary and "├" in summary,
+      "box-drawing characters present")
 
 
 # ---------------------------------------------------------------------------
-# 6. build_daily_summary — empty inputs still render the three sections
+# 6. build_daily_summary — empty inputs still render
 # ---------------------------------------------------------------------------
 print("\n6. build_daily_summary — empty-input edge case")
 
-now = time.time()
 store2 = FakeStore()
-zero_run = {
-    "id": 99, "kind": "daily_digest", "status": "ok", "exit_code": 0,
-    "users_total": 0, "jobs_raw": 0, "jobs_sent": 0, "error_count": 0,
-    "started_at": now - 5, "finished_at": now, "extra_json": None,
-}
-store2.run_with_sources[99] = (zero_run, [])
+# FakeStore.recent_pipeline_runs returns [] when no runs registered.
 out = build_daily_summary(store2, 99, db=None)
-check("Queue" in out, "queue section present")
-check("Sources this run" in out, "funnel section present")
-check("Queue contents" in out, "contents section present")
-check("(empty)" in out or "(no source data)" in out,
-      "empty-state placeholder visible")
+check("(no recent runs)" in out, "empty-state placeholder visible")
+check("<pre>" in out, "still wrapped in <pre> on empty")
 
 
 # ---------------------------------------------------------------------------
-# 7. build_daily_summary — failed sources don't appear in the funnel
+# 7. build_daily_summary — single-run table renders
 # ---------------------------------------------------------------------------
-# Failed source rows have raw_count=0, so the funnel-row filter drops them
-# (a row that contributed nothing at every step is not worth a line).
-print("\n7. build_daily_summary — failed-only sources are dropped")
+print("\n7. build_daily_summary — single-run table")
 
+now = time.time()
 store3 = FakeStore()
-fail_run = {
-    "id": 100, "kind": "daily_digest", "status": "partial", "exit_code": 1,
-    "users_total": 1, "jobs_raw": 0, "jobs_sent": 0, "error_count": 5,
-    "started_at": now - 10, "finished_at": now, "extra_json": None,
+one_run = {
+    "id": 100, "kind": "daily_digest", "status": "ok", "exit_code": 0,
+    "users_total": 1, "jobs_raw": 540, "jobs_sent": 0, "error_count": 0,
+    "started_at": now - 700, "finished_at": now,
+    "extra_json": '{"web_hits": 6, "linkedin_user_hits": 18}',
 }
-store3.run_with_sources[100] = (fail_run, [
-    {"source_key": "hackernews",    "status": "failed", "raw_count": 0, "user_chat_id": None},
-    {"source_key": "remote_boards", "status": "failed", "raw_count": 0, "user_chat_id": None},
+store3.recent_runs_rows.append(one_run)
+store3.run_with_sources[100] = (one_run, [
+    {"source_key": "linkedin", "status": "ok", "raw_count": 18, "user_chat_id": 385675637},
 ])
 out = build_daily_summary(store3, 100, db=None)
-check("(no source data)" in out, "all-zero funnel renders the placeholder")
+check("#100" in out, "run id present")
+check("540" in out, "raw count present")
+check("385675637" in out, "user chat_id present in User column")
+check("6" in out and "18" in out, "web + linkedin hits present")
 
 
 # ---------------------------------------------------------------------------
-# 8. build_daily_summary — per-user source attribution
+# 8. build_daily_summary — multiple runs preserved in order
 # ---------------------------------------------------------------------------
-print("\n8. build_daily_summary — per-user source attribution")
+print("\n8. build_daily_summary — multiple runs")
 
 store4 = FakeStore()
-anom_run = {
-    "id": 101, "kind": "daily_digest", "status": "ok", "exit_code": 0,
-    "users_total": 7, "jobs_raw": 142, "jobs_sent": 31, "error_count": 0,
-    "started_at": now - 261, "finished_at": now,
-    "extra_json": '{"anomalies": ["linkedin 0 results x 3 runs in a row"]}',
-}
-store4.run_with_sources[101] = (anom_run, [
-    {"source_key": "hackernews", "status": "ok", "raw_count": 12, "user_chat_id": None},
-    {"source_key": "linkedin",   "status": "ok", "raw_count":  5, "user_chat_id": 555},
-])
-out = build_daily_summary(store4, 101, db=None)
-check("chat 555" in out, "funnel header names the per-user chat_id")
-check("linkedin" in out and "hackernews" in out,
-      "both per-user and global sources appear in the funnel")
+for rid, raw, sent in [(101, 540, 0), (102, 541, 1), (103, 543, 5)]:
+    run = {
+        "id": rid, "status": "ok", "exit_code": 0, "users_total": 1,
+        "jobs_raw": raw, "jobs_sent": sent, "error_count": 0,
+        "started_at": now - 1000, "finished_at": now,
+        "extra_json": '{"web_hits": 2, "linkedin_user_hits": 10}',
+    }
+    store4.recent_runs_rows.append(run)
+    store4.run_with_sources[rid] = (run, [
+        {"source_key": "linkedin", "status": "ok", "raw_count": 10, "user_chat_id": 433775883},
+    ])
+out = build_daily_summary(store4, 103, db=None)
+check("#101" in out and "#102" in out and "#103" in out,
+      "all three runs appear in the table")
 
 
 # ---------------------------------------------------------------------------
