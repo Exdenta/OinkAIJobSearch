@@ -514,6 +514,28 @@ class DB:
                 "SELECT * FROM users WHERE resume_path IS NOT NULL AND resume_path <> ''"
             ))
 
+    def onboarded_chat_ids(self) -> list[int]:
+        """Return chat_ids of users who have completed onboarding AND have a
+        non-empty user_profile blob — i.e. users the continuous searcher can
+        meaningfully run against.
+
+        Used by bot.py to bootstrap continuous-mode threads when the operator
+        leaves `HRYU_CONTINUOUS_CHAT_ID` unset (the new default — every onboarded
+        user gets a searcher thread). Ordered by chat_id ascending so the
+        startup stagger is deterministic across restarts.
+        """
+        with self._conn() as c:
+            rows = c.execute(
+                """
+                SELECT chat_id FROM users
+                WHERE onboarding_completed_at IS NOT NULL
+                  AND user_profile IS NOT NULL
+                  AND user_profile <> ''
+                ORDER BY chat_id ASC
+                """,
+            ).fetchall()
+        return [int(r["chat_id"]) for r in rows]
+
     # ---------- web login: email lookup / allocation ----------
 
     def find_user_by_email(self, email: str | None) -> sqlite3.Row | None:
