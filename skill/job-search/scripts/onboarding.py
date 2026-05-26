@@ -947,6 +947,16 @@ def _finalize(
     except Exception:
         log.exception("finalize: mark_onboarding_complete failed")
 
+    # Live-spawn the continuous searcher for this newly-onboarded user.
+    # No-op when HRYU_CONTINUOUS_MODE is off, or when the operator pinned a
+    # specific chat_id list that excludes this user (see bot.start_continuous_searcher_for).
+    # Lazy import: keeps onboarding.py importable in tests that don't load bot.py.
+    try:
+        from bot import start_continuous_searcher_for as _live_spawn
+        _live_spawn(db, chat_id)
+    except Exception:
+        log.exception("finalize: live-spawn of continuous searcher failed")
+
     # Summary card + final buttons.
     tg.send_message(
         chat_id,
