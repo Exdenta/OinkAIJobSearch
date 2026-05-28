@@ -71,7 +71,37 @@ DEFAULTS: dict = {
     # prefs + 10 jobs (~37k chars prompt) routinely hit the old 240s
     # ceiling, forcing split-retries. 1200 (~20 min) gives Sonnet breathing
     # room without inviting indefinite hangs.
+    #
+    # IMPORTANT (2026-05-28): `ai_enrich_timeout_s` now governs the HAIKU
+    # triage pass only (in two-pass mode) and the SINGLE-PASS Sonnet
+    # fallback. The PRIMARY Sonnet rescore in two-pass mode uses the
+    # tighter `ai_sonnet_timeout_s` knob below. 1200s here is kept as
+    # generous belt-and-braces for the slow paths — those don't risk a
+    # 4-worker pool stalling a whole iter the way a batched Sonnet
+    # rescore did.
     "ai_enrich_timeout_s":  1200,
+    # Sonnet RESCORE-pass timeout (two-pass mode only). 300s is sized
+    # against measured Sonnet-batch latency over the trailing 7d (n=94,
+    # `caller='job_enrich:sonnet'` in `claude_calls`):
+    #
+    #   p50: 117.1s   p90: 351.6s   p95: 407.9s   p99: 507.3s   max: 530.9s
+    #
+    # 14/94 (≈15%) of Sonnet batches at the OLD batch=10 exceeded 300s.
+    # After the 2026-05-28 batch-size cap (batch=10 → batch=5) the input
+    # payload drops from ~25k → ~19k tokens; expected new ceiling is
+    # roughly 530 × 5/10 ≈ 265s (under the 300s cut). So 300s should
+    # almost never fire on healthy Sonnet calls — it's a cap on the
+    # PATHOLOGICAL slow-success cases that were monopolising a worker
+    # for 5-9 minutes and silently consuming the iter's wall-time
+    # budget without triggering the existing split-retry (split-retry
+    # fires on parse/empty failures, not on slow successes).
+    #
+    # Recovery on timeout: the batch is retried ONCE at `batch_size=1`.
+    # Single-job batches drop the prompt payload to ~13k tokens; if
+    # THAT also times out we log + drop the job (do not fall back to
+    # the Haiku verdict — that would mix verdict provenance in
+    # `job_scores`). One retry only; no recursive escalation.
+    "ai_sonnet_timeout_s":  300,
 
     # Two-pass scoring. Default ON as of 2026-05-19 — single-pass Sonnet
     # was 63% of monthly AI spend. Two-pass: Haiku triages every posting

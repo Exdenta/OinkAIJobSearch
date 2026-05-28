@@ -75,10 +75,18 @@ log = logging.getLogger(__name__)
 # Kept as plain string sentinels (not Enum) so they appear verbatim in the
 # JSONL forensic stream and are grep-friendly.
 _BATCH_OK = "ok"
-_BATCH_CLI_MISSING = "cli_missing"      # wrapped_run_p returned None
+_BATCH_CLI_MISSING = "cli_missing"      # wrapped_run_p returned None and elapsed << timeout (true CLI absence or fast crash)
+_BATCH_TIMEOUT = "timeout"              # wrapped_run_p returned None and elapsed ≈ timeout_s — slow CLI cut off by transport
 _BATCH_EMPTY_RESULT = "empty_result"    # CLI envelope had result="" — Haiku produced no JSON
 _BATCH_PARSE_ERROR = "parse_error"      # body wasn't a JSON object / no `results` list
 _BATCH_PARTIAL = "partial"              # results parsed but fewer verdicts than postings sent
+
+# Fraction of `timeout_s` at or above which a None result is attributed to
+# timeout rather than a genuinely missing CLI. 0.9 leaves margin for the
+# Python-side overhead between subprocess.TimeoutExpired and the wrapper
+# returning, while still being well above the sub-second latency of a
+# `claude` binary that isn't installed.
+_TIMEOUT_ELAPSED_THRESHOLD = 0.9
 
 
 _PROMPT = """OUTPUT STYLE — caveman english
@@ -822,6 +830,7 @@ def enrich_jobs_ai(
     triage_floor: int = 2,
     triage_ceiling: int = 6,
     sonnet_max_jobs_per_call: int | None = None,
+    sonnet_timeout_s: int | None = None,
     workers: int = 4,
     db=None,
     chat_id: int | None = None,
@@ -872,6 +881,19 @@ def enrich_jobs_ai(
                        the prompt template (~9k fixed-overhead doctrine
                        tokens) makes 10-job batches stall 5-9 minutes.
                        Ignored in single-pass mode.
+      sonnet_timeout_s: SONNET-pass per-CLI-call timeout in two-pass mode.
+                       Defaults to None → falls back to `timeout_s`
+                       (legacy behaviour). Set tight (≈ 300s) to cap
+                       worst-case Sonnet batch wall time; on hit, the
+                       affected batch is retried ONCE at batch_size=1.
+                       Single-job batches that ALSO time out are
+                       LOGGED + DROPPED — we do NOT fall back to the
+                       Haiku verdict because that would mix verdict
+                       provenance in `job_scores` (some rows tagged
+                       "sonnet" but actually from Haiku). Haiku
+                       triage in two-pass mode keeps the generous
+                       `timeout_s` budget so the cheap fast call is
+                       unaffected. Ignored in single-pass mode.
       db, chat_id:     Optional persistent score-cache wiring. When BOTH
                        are provided, we look up cached verdicts (keyed
                        by Job.job_id + the current profile_hash) before
@@ -1044,21 +1066,52 @@ def enrich_jobs_ai(
     sonnet_batch_size = int(sonnet_max_jobs_per_call or max_jobs_per_call)
     if sonnet_batch_size < 1:
         sonnet_batch_size = max_jobs_per_call
+    # Sonnet gets its OWN, tighter timeout (production: 300s vs Haiku's
+    # 1200s). The split is justified by measured latency: Sonnet p95 was
+    # 408s and the worst-case batch hit 530s pre-batch-cap; Haiku p99
+    # is 176s. Same per-call budget for both would either over-tax
+    # Haiku (waste capacity / mask real failures) or under-tax Sonnet
+    # (silently burn the iter's wall-time budget on slow successes).
+    # Fall back to `timeout_s` for callers that don't supply the
+    # dedicated knob (legacy + test paths).
+    effective_sonnet_timeout = int(
+        sonnet_timeout_s if sonnet_timeout_s is not None else timeout_s
+    )
     log.info(
         "enrich_jobs_ai: two-pass — %d/%d jobs in Sonnet window "
         "[floor=%d, ceiling=%d); trusted-top=%d; rescoring with %s "
-        "(batch=%d)",
+        "(batch=%d, timeout=%ds)",
         len(survivors), len(to_score), triage_floor, triage_ceiling,
         trusted_haiku_top_count, MID_MODEL, sonnet_batch_size,
+        effective_sonnet_timeout,
     )
+    # Track Sonnet drops (batch-1 retry that also timed out). The pool
+    # populates this set; we use it to evict the Haiku verdict for those
+    # jobs from `merged` so the downstream pipeline doesn't see a
+    # silent Haiku-only verdict where Sonnet was meant to vote.
+    sonnet_dropped_ext_ids: set[str] = set()
     sonnet_out = _enrich_pool(
-        survivors, resume_text, prefs_text, timeout_s,
+        survivors, resume_text, prefs_text, effective_sonnet_timeout,
         sonnet_batch_size, model=MID_MODEL, pass_label="sonnet",
         workers=workers,
+        # Sonnet timeout recovery: retry timed-out batches at
+        # batch_size=1, drop on second-pass timeout (no Haiku fallback;
+        # see _enrich_pool docstring for provenance rationale).
+        timeout_retry_with_batch_one=True,
+        dropped_ext_ids_out=sonnet_dropped_ext_ids,
     )
 
-    # Merge: Sonnet overwrites Haiku where present, else Haiku stands.
+    # Merge: Sonnet overwrites Haiku where present, else Haiku stands —
+    # EXCEPT for jobs Sonnet was supposed to grade but dropped
+    # (transport failure on batch=1 retry). Those are evicted from the
+    # merged map entirely; the downstream send pipeline treats them as
+    # "no verdict" rather than letting a Haiku-3 leak through with
+    # honest-but-wrong provenance ("Haiku triaged this as borderline
+    # AND Sonnet voted on it" — the second clause is false).
     merged = dict(first_out)
+    if sonnet_dropped_ext_ids:
+        for ext_id in sonnet_dropped_ext_ids:
+            merged.pop(ext_id, None)
     upgrades = downgrades = unchanged = 0
     for ext_id, sonnet_v in sonnet_out.items():
         prev = (first_out.get(ext_id) or {}).get("match_score") or 0
@@ -1071,9 +1124,11 @@ def enrich_jobs_ai(
         else:
             unchanged += 1
     log.info(
-        "enrich_jobs_ai: two-pass merge — upgrades=%d downgrades=%d unchanged=%d "
-        "(survivors not re-scored: %d)",
-        upgrades, downgrades, unchanged, len(survivors) - len(sonnet_out),
+        "enrich_jobs_ai: two-pass merge — upgrades=%d downgrades=%d "
+        "unchanged=%d (survivors not re-scored: %d, sonnet-dropped: %d)",
+        upgrades, downgrades, unchanged,
+        len(survivors) - len(sonnet_out) - len(sonnet_dropped_ext_ids),
+        len(sonnet_dropped_ext_ids),
     )
 
     # ----- Persist freshly-scored verdicts back to the cache ----------
@@ -1150,6 +1205,8 @@ def _enrich_pool(
     model: str,
     pass_label: str,
     workers: int = 4,
+    timeout_retry_with_batch_one: bool = False,
+    dropped_ext_ids_out: set[str] | None = None,
 ) -> dict[str, dict]:
     """Run one model over a job pool, batching as needed. Returns the
     {external_id → enrichment} map. Used for both single-pass Haiku and
@@ -1160,6 +1217,27 @@ def _enrich_pool(
     short-lived sqlite3 connections (DB._conn opens a new connection per
     call) and `forensic.log_step` is thread-safe, so concurrent dispatch
     is safe. Pass `workers=1` to fall back to serial dispatch.
+
+    `timeout_retry_with_batch_one`: when True, any batch that hits
+    `_BATCH_TIMEOUT` is retried ONCE at batch_size=1 (one CLI call per
+    job in the timed-out chunk). Single-job batches have the smallest
+    possible prompt payload — if THAT also times out we log and drop
+    the job rather than fall back to a different model's verdict (which
+    would mix verdict provenance in `job_scores`). Currently used for
+    the Sonnet rescore pass only; the Haiku triage pass keeps the
+    original "best-effort, no timeout recovery" behaviour because its
+    timeout is generous (1200s) and the wall-time cost of a stuck
+    Haiku batch is one of 4 workers, not the whole iter's budget.
+
+    `dropped_ext_ids_out`: optional set populated with the external_ids
+    of jobs that were scheduled for this pool but produced NO verdict
+    (transport-dropped — batch=1 retry timed out). The caller uses this
+    to evict the Haiku-only verdict from the merged output: keeping it
+    would be CORRECT provenance for "Haiku scored, Sonnet skipped" but
+    INCORRECT for "Haiku triaged, Sonnet was supposed to vote but
+    transport failed" — those are semantically different outcomes and
+    only the latter is a drop. Only populated when
+    `timeout_retry_with_batch_one=True`.
     """
     chunks: list[list[Job]] = [
         jobs[start:start + max_jobs_per_call]
@@ -1178,12 +1256,18 @@ def _enrich_pool(
 
     out: dict[str, dict] = {}
     failed_batches = 0
+    # Track which chunks timed out so we can retry them at batch_size=1.
+    # We collect the chunk's job list (not just the index) so the retry
+    # can re-issue per-job calls without re-deriving membership.
+    timed_out_chunks: list[list[Job]] = []
     if workers <= 1 or total_batches <= 1:
         for ic in enumerate(chunks, start=1):
             verdicts, reason = _run(ic)
             out.update(verdicts)
             if reason != _BATCH_OK:
                 failed_batches += 1
+            if reason == _BATCH_TIMEOUT:
+                timed_out_chunks.append(ic[1])
     else:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         log.info(
@@ -1191,9 +1275,12 @@ def _enrich_pool(
             pass_label, total_batches, workers,
         )
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [pool.submit(_run, ic)
-                       for ic in enumerate(chunks, start=1)]
+            futures = {
+                pool.submit(_run, ic): ic[1]
+                for ic in enumerate(chunks, start=1)
+            }
             for fut in as_completed(futures):
+                chunk_for_future = futures[fut]
                 try:
                     verdicts, reason = fut.result()
                 except Exception:
@@ -1203,6 +1290,8 @@ def _enrich_pool(
                 out.update(verdicts)
                 if reason != _BATCH_OK:
                     failed_batches += 1
+                if reason == _BATCH_TIMEOUT:
+                    timed_out_chunks.append(chunk_for_future)
     if failed_batches:
         log.warning(
             "enrich_jobs_ai[%s]: %d/%d batch(es) failed silently — verdicts only "
@@ -1210,6 +1299,128 @@ def _enrich_pool(
             pass_label, failed_batches, total_batches,
             total_batches - failed_batches, total_batches,
         )
+
+    # ---- Timeout-recovery path: retry timed-out chunks at batch_size=1.
+    # Only fires when the caller opted in (Sonnet rescore today). Each
+    # timed-out chunk's jobs go through one CLI call apiece. We drop
+    # `allow_split_retry` for these single-job calls — there's nothing
+    # smaller to split into — but `_enrich_one_chunk` still measures
+    # elapsed time and stamps `_BATCH_TIMEOUT` again if the single-job
+    # call ALSO exceeds the timeout. Those final timeouts are logged
+    # and dropped: we deliberately do NOT fall back to a Haiku verdict
+    # because mixing verdict provenance in `job_scores` (some rows
+    # tagged "sonnet" but actually from Haiku) would silently corrupt
+    # the model-attribution metrics the operator uses to tune knobs.
+    if timeout_retry_with_batch_one and timed_out_chunks:
+        # Flatten + de-dupe (same job in multiple chunks is impossible by
+        # construction, but cheap to defend against).
+        retry_jobs: list[Job] = []
+        seen_ext: set[str] = set()
+        for ch in timed_out_chunks:
+            for j in ch:
+                if j.external_id in seen_ext:
+                    continue
+                seen_ext.add(j.external_id)
+                retry_jobs.append(j)
+
+        log.warning(
+            "enrich_jobs_ai[%s]: %d batch(es) timed out — retrying %d jobs "
+            "at batch_size=1 (cap=%ds)",
+            pass_label, len(timed_out_chunks), len(retry_jobs), timeout_s,
+        )
+
+        # batch_size=1 → one chunk per job. We re-use the same worker
+        # pool size; serial would also work but parallelising shaves the
+        # tail when multiple batches timed out in the same iter.
+        retry_total = len(retry_jobs)
+        recovered: dict[str, dict] = {}
+
+        def _retry_one(idx_job):
+            idx, j = idx_job
+            return j, _enrich_one_chunk(
+                [j], resume_text, prefs_text, timeout_s,
+                batch_idx=idx, total_batches=retry_total,
+                # No split-retry on a single-job chunk (there's nothing
+                # to split); `_enrich_one_chunk` already guards on
+                # `len(chunk) >= 2` but explicit-better-than-implicit.
+                allow_split_retry=False,
+                model=model, pass_label=pass_label,
+            )
+
+        if workers <= 1 or retry_total <= 1:
+            for ij in enumerate(retry_jobs, start=1):
+                j, (verdicts, reason) = _retry_one(ij)
+                if reason == _BATCH_OK:
+                    recovered.update(verdicts)
+        else:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futs = {
+                    pool.submit(_retry_one, ij): ij[1]
+                    for ij in enumerate(retry_jobs, start=1)
+                }
+                for fut in as_completed(futs):
+                    try:
+                        j, (verdicts, reason) = fut.result()
+                    except Exception:
+                        log.exception(
+                            "enrich_jobs_ai[%s]: batch=1 retry worker raised",
+                            pass_label,
+                        )
+                        continue
+                    if reason == _BATCH_OK:
+                        recovered.update(verdicts)
+
+        recovered_count = len(recovered)
+        dropped_count = retry_total - recovered_count
+        out.update(recovered)
+
+        # Report dropped IDs so the caller can evict the corresponding
+        # Haiku-only verdicts from the final merged map. Without this
+        # the Haiku-3 vote leaks through tagged as "haiku" — wrong
+        # provenance: this isn't "Haiku scored, Sonnet skipped" (which
+        # would be a legitimate haiku label), it's "Sonnet was supposed
+        # to vote but transport failed", which is a drop not a
+        # downgrade.
+        if dropped_ext_ids_out is not None:
+            recovered_ids = set(recovered.keys())
+            for j in retry_jobs:
+                if j.external_id not in recovered_ids:
+                    dropped_ext_ids_out.add(j.external_id)
+
+        log.info(
+            "enrich_jobs_ai[%s]: timeout retry recovered %d/%d jobs "
+            "(dropped %d as unrecoverable)",
+            pass_label, recovered_count, retry_total, dropped_count,
+        )
+
+        # Single forensic line summarising the timeout-recovery pass.
+        # Operators chasing "where did 3 jobs in pipeline_run #N go?"
+        # can `jq 'select(.op=="enrich_jobs_ai.sonnet_timeout")'` and
+        # find the exact recovered/dropped split for the run.
+        try:
+            from forensic import log_step as _flog
+            _flog(
+                "enrich_jobs_ai.sonnet_timeout",
+                input={
+                    "batch_size": max_jobs_per_call,
+                    "n_jobs": retry_total,
+                    "timeout_s": timeout_s,
+                    "pass": pass_label,
+                    "model": model,
+                    "timed_out_batches": len(timed_out_chunks),
+                },
+                output={
+                    "recovered_count": recovered_count,
+                    "dropped_count": dropped_count,
+                },
+            )
+        except Exception:
+            log.debug(
+                "enrich_jobs_ai.sonnet_timeout forensic emit failed; continuing",
+                exc_info=True,
+            )
+
     return out
 
 
@@ -1273,18 +1484,43 @@ def _enrich_one_chunk(
     # forensic line carries the model used (handy when comparing pass
     # outcomes post-hoc).
     caller = f"job_enrich:{pass_label}"
+    # Measure wall time around the CLI call so we can distinguish a
+    # timeout (CLI returned None because subprocess.TimeoutExpired fired,
+    # elapsed ≈ timeout_s) from a true CLI absence / immediate crash
+    # (elapsed ≈ 0). The two need different recovery paths: split-retry
+    # is right for the "small chance the prompt confused the model"
+    # cases (empty/parse/missing-fast), but a slow-success cutoff just
+    # means the model is taking too long on THIS payload and a smaller
+    # batch is the only thing that'll help. See `_BATCH_TIMEOUT`.
+    import time as _time
+    _started = _time.monotonic()
     stdout = wrapped_run_p(None, caller, prompt, timeout_s=timeout_s, model=model)
+    _elapsed = _time.monotonic() - _started
 
     reason = _BATCH_OK
     out: dict[str, dict] = {}
     body_head = ""
 
     if stdout is None:
-        reason = _BATCH_CLI_MISSING
-        log.warning(
-            "enrich_jobs_ai: batch %d/%d CLI unavailable — %d jobs at risk",
-            batch_idx, total_batches, len(chunk),
-        )
+        # Distinguish timeout (slow CLI cut off) from true CLI-missing.
+        # `claude_cli.run_p` catches subprocess.TimeoutExpired and returns
+        # None — same return shape as "CLI not on PATH" — but elapsed time
+        # disambiguates: a timeout takes ~timeout_s, a missing CLI takes
+        # ~0s. Threshold at 90% of timeout_s leaves headroom for the
+        # wrapper / Python overhead.
+        if timeout_s > 0 and _elapsed >= timeout_s * _TIMEOUT_ELAPSED_THRESHOLD:
+            reason = _BATCH_TIMEOUT
+            log.warning(
+                "enrich_jobs_ai: batch %d/%d TIMED OUT after %.1fs (cap=%ds, "
+                "model=%s) — %d jobs at risk",
+                batch_idx, total_batches, _elapsed, timeout_s, model, len(chunk),
+            )
+        else:
+            reason = _BATCH_CLI_MISSING
+            log.warning(
+                "enrich_jobs_ai: batch %d/%d CLI unavailable — %d jobs at risk",
+                batch_idx, total_batches, len(chunk),
+            )
     else:
         body = extract_assistant_text(stdout)
         body_head = (body or "")[:200]
