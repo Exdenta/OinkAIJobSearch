@@ -8,9 +8,15 @@ Covers:
 None of these publishes a free JSON or RSS feed, and their HTML layouts drift
 often enough that maintaining BeautifulSoup selectors is not worth it. Instead,
 we delegate the fetch-and-extract step to a Claude agent: at run time this
-module shells out to the `claude` CLI with a strict JSON-only prompt and a
-target URL, and Claude uses its own WebFetch / WebSearch tools to pull the
-current listings.
+module shells out to the `claude` CLI with a strict JSON-only prompt, a
+target URL, and an explicit `--allowed-tools WebFetch` grant, and Claude
+uses its own WebFetch tool to pull the current listings.
+
+The `--allowed-tools` grant is load-bearing: without it the CLI prompts the
+user interactively for tool permission, and in a non-interactive subprocess
+that prompt becomes the textual response ("I need permission to use
+WebFetch…") instead of the JSON envelope this adapter expects. See the
+2026-05 fix in `sources/un_careers.py` for the same class of bug.
 
 Requirements (on the machine that runs the cron):
   1. The `claude` CLI on PATH, already logged in (Anthropic account).
@@ -29,8 +35,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from claude_cli import run_p, extract_assistant_text, parse_json_block
-from instrumentation.wrappers import wrapped_run_p
+from claude_cli import run_p_with_tools, extract_assistant_text, parse_json_block
+from instrumentation.wrappers import wrapped_run_p_with_tools
 import forensic
 from dedupe import Job
 from text_utils import fix_mojibake
@@ -43,6 +49,20 @@ BOARDS: dict[str, str] = {
     "wantapply":         "https://wantapply.com/",
     "remoterocketship":  "https://www.remoterocketship.com/jobs/category/software-engineer",
 }
+
+
+# Tool grants for the curated-boards sub-agent. Each board's prompt instructs
+# Claude to ``Use the WebFetch tool to load the URL below`` — without an
+# explicit ``--allowed-tools`` grant the CLI prompts interactively, and in a
+# non-interactive subprocess that prompt becomes a textual "I need
+# permission…" response instead of JSON. We do NOT grant WebSearch: the
+# prompt only ever asks Claude to WebFetch the target URL (and at most one
+# "next page" link). Keeping the allow list minimal narrows the attack
+# surface. See sources/un_careers.py / sources/devex.py for the same fix.
+_ALLOWED_TOOLS = "WebFetch"
+# Belt-and-suspenders: forbid filesystem/shell so a successful prompt-injection
+# in a fetched board page can't escalate.
+_DISALLOWED_TOOLS = "Bash,Edit,Write,Read"
 
 # The prompt is deliberately strict: it asks for JSON only, gives a clear schema,
 # and embeds the title/location gates so Claude drops obvious noise on its side.
@@ -94,8 +114,20 @@ def _scrape_one(board_key: str, url: str, filters: dict) -> list[Job]:
         # Tag the underlying CLI call with the specific board so claude_calls
         # rolls up per-board cost/elapsed.
         # Pin to haiku (2026-05-25) — see same fix in devex/web_search.
+        # Use the tool-aware wrapper: the prompt asks for WebFetch, and
+        # without an explicit --allowed-tools grant the CLI prompts the
+        # user interactively (textual response, never JSON). See the
+        # 2026-05 fix in sources/un_careers.py for the same class of bug.
         from claude_cli import SMALLEST_MODEL as _MODEL
-        stdout = wrapped_run_p(None, f"curated_boards:{board_key}", prompt, timeout_s=timeout_s, model=_MODEL)
+        stdout = wrapped_run_p_with_tools(
+            None,
+            f"curated_boards:{board_key}",
+            prompt,
+            allowed_tools=_ALLOWED_TOOLS,
+            disallowed_tools=_DISALLOWED_TOOLS,
+            timeout_s=timeout_s,
+            model=_MODEL,
+        )
         if not stdout:
             fctx.set_output({"raw_count": 0, "reason": "cli_missing_or_empty"})
             return []
