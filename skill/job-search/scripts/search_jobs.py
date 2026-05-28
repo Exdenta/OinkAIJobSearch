@@ -994,6 +994,16 @@ def run(
             quiet = bool(msg_cfg.get("quiet_if_empty"))
             ai_enrich = bool(filters.get("ai_enrich", True))
             enrich_timeout_s = int(filters.get("ai_enrich_timeout_s") or 240)
+            # Sonnet rescore-pass timeout (two-pass mode only). Distinct
+            # from `ai_enrich_timeout_s` because measured Sonnet p95
+            # (408s) is 2.3× Haiku p99 (176s); same cap for both either
+            # over-taxes Haiku or under-taxes Sonnet. Falls back to
+            # `enrich_timeout_s` when the dedicated knob isn't set.
+            sonnet_timeout_s = (
+                int(filters["ai_sonnet_timeout_s"])
+                if filters.get("ai_sonnet_timeout_s")
+                else enrich_timeout_s
+            )
             global_cap = int(filters.get("max_total") or 0)
             # Default AI match-score floor applied when a user hasn't set their own
             # via the bot's ⭐ button. Because the keyword pre-filter has been removed
@@ -1230,6 +1240,14 @@ def run(
                                     if filters.get("ai_sonnet_max_jobs_per_call")
                                     else None
                                 ),
+                                # ai_sonnet_timeout_s=300 (defaults):
+                                # tight Sonnet-only cap. On timeout the
+                                # batch is retried at batch_size=1; if
+                                # those single-job calls also time out
+                                # the jobs are dropped (no Haiku
+                                # fallback — verdict provenance stays
+                                # honest).
+                                sonnet_timeout_s=sonnet_timeout_s,
                                 workers=int(filters.get("ai_enrich_workers") or 4),
                                 db=db,
                                 chat_id=chat_id,
