@@ -202,6 +202,21 @@ def extract_assistant_text(cli_stdout: str) -> str:
     Unwrap that envelope and return the inner assistant text. If the envelope
     can't be parsed we return the raw stdout, which covers the case where a
     caller used `--output-format text` or stripped the envelope already.
+
+    Semantics around an empty `result`:
+      * Standard Claude-CLI envelopes always carry a `result` key. When that
+        key is present we return its literal value — including the empty
+        string — instead of falling through to the raw envelope text. The
+        old behavior conflated "model produced nothing" with "model
+        produced an opaque envelope", which made it impossible for
+        telemetry to count silent-empty replies separately. See the
+        `_is_empty_result_envelope` helper in job_enrich.py for the
+        upstream signal that this change now makes consistent — and the
+        `result_chars` column in `claude_calls` for the downstream signal
+        operators query.
+      * Older / hypothetical envelopes that lack a `result` key still fall
+        through to `content` / `text` / `message`, then to the raw stdout
+        — preserving the prior fallback chain for non-CLI inputs.
     """
     s = (cli_stdout or "").strip()
     if not s:
@@ -211,7 +226,14 @@ def extract_assistant_text(cli_stdout: str) -> str:
     except json.JSONDecodeError:
         return s
     if isinstance(envelope, dict):
-        for key in ("result", "content", "text", "message"):
+        # The CLI's canonical envelope key. When it is present (even as ""),
+        # honor it literally so callers can distinguish "model emitted
+        # nothing" from "model emitted something we couldn't parse".
+        if "result" in envelope and isinstance(envelope["result"], str):
+            return envelope["result"]
+        # Legacy / defensive fallback: pre-existing callers relied on these
+        # keys when the envelope shape didn't match the current CLI.
+        for key in ("content", "text", "message"):
             val = envelope.get(key)
             if isinstance(val, str) and val.strip():
                 return val
