@@ -45,6 +45,12 @@ class CallStatus:
     NON_ZERO = "non_zero"
     CLI_MISSING = "cli_missing"
     EXCEPTION = "exception"
+    # CLI subprocess succeeded and returned a well-formed JSON envelope, but
+    # the envelope's `result` field was the empty string — i.e. the model
+    # silently produced nothing. Distinct from CLI_MISSING (which is
+    # subprocess-level) so operators can detect quota / safety / corrupted
+    # prompt issues without grepping the forensic logs.
+    EMPTY_RESULT = "empty_result"
 
 
 class MonitorStore:
@@ -181,11 +187,21 @@ class MonitorStore:
         exit_code: Optional[int] = None,
         started_at: float,
         finished_at: float,
+        result_chars: int = 0,
     ) -> int:
         """Append a claude_calls row with computed cost surrogate.
 
         Cost is calculated from `model + prompt_chars + output_chars`
         via `cost.estimate_cost_us` and stored in micro-USD.
+
+        `output_chars` is the wire-level subprocess stdout length (the
+        full JSON envelope when `--output-format json` is used).
+        `result_chars` is the length of the parsed `result` field — the
+        model's assistant text. Splitting them lets operators tell apart
+        "subprocess produced no output" (both == 0) from "envelope present
+        but model emitted nothing" (output_chars > 0, result_chars == 0).
+        Old callers that omit `result_chars` get 0, which is the same
+        meaning as historical rows pre-migration (no signal available).
         """
         cost_us = estimate_cost_us(model, prompt_chars, output_chars)
         with self._db._conn() as c:
@@ -193,13 +209,13 @@ class MonitorStore:
                 """
                 INSERT INTO claude_calls
                   (pipeline_run_id, chat_id, caller, model, prompt_chars,
-                   output_chars, elapsed_ms, exit_code, status, cost_estimate_us,
-                   started_at, finished_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   output_chars, result_chars, elapsed_ms, exit_code, status,
+                   cost_estimate_us, started_at, finished_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     pipeline_run_id, chat_id, caller, model,
-                    int(prompt_chars), int(output_chars),
+                    int(prompt_chars), int(output_chars), int(result_chars),
                     int(elapsed_ms), exit_code, status, int(cost_us),
                     float(started_at), float(finished_at),
                 ),
@@ -297,11 +313,17 @@ class MonitorStore:
               'count':         total calls,
               'cost_us':       summed micro-USD,
               'prompt_chars':  summed,
-              'output_chars':  summed,
+              'output_chars':  summed (wire-level subprocess stdout),
+              'result_chars':  summed (model's parsed `result` field),
               'by_model':      {model_or_'default': count, ...},
               'by_caller':     {caller: count, ...},
               'by_status':     {status: count, ...},
             }
+
+        `result_chars` is included for the same reasons as in
+        `record_claude_call` — operators querying the window summary
+        can spot windows where the subprocess returned data but the
+        model produced none.
         """
         with self._db._conn() as c:
             tot = c.execute(
@@ -309,7 +331,8 @@ class MonitorStore:
                 SELECT COUNT(*) AS n,
                        COALESCE(SUM(cost_estimate_us), 0) AS cost_us,
                        COALESCE(SUM(prompt_chars), 0)     AS prompt_chars,
-                       COALESCE(SUM(output_chars), 0)     AS output_chars
+                       COALESCE(SUM(output_chars), 0)     AS output_chars,
+                       COALESCE(SUM(result_chars), 0)     AS result_chars
                 FROM claude_calls
                 WHERE finished_at >= ?
                 """,
@@ -356,6 +379,7 @@ class MonitorStore:
             "cost_us": int(tot["cost_us"] or 0) if tot else 0,
             "prompt_chars": int(tot["prompt_chars"] or 0) if tot else 0,
             "output_chars": int(tot["output_chars"] or 0) if tot else 0,
+            "result_chars": int(tot["result_chars"] or 0) if tot else 0,
             "by_model": by_model,
             "by_caller": by_caller,
             "by_status": by_status,
@@ -369,9 +393,14 @@ class MonitorStore:
         per-agent share block to the daily digest.
 
             [
-              {caller, n, cost_us, prompt_chars, output_chars, elapsed_ms},
+              {caller, n, cost_us, prompt_chars, output_chars,
+               result_chars, elapsed_ms},
               ...
             ]
+
+        `result_chars` (model assistant text length) is surfaced
+        alongside `output_chars` (wire-level subprocess stdout) so
+        operators can see per-caller silent-empty rates.
         """
         with self._db._conn() as c:
             rows = c.execute(
@@ -381,6 +410,7 @@ class MonitorStore:
                        COALESCE(SUM(cost_estimate_us), 0)  AS cost_us,
                        COALESCE(SUM(prompt_chars), 0)      AS prompt_chars,
                        COALESCE(SUM(output_chars), 0)      AS output_chars,
+                       COALESCE(SUM(result_chars), 0)      AS result_chars,
                        COALESCE(SUM(elapsed_ms), 0)        AS elapsed_ms
                 FROM claude_calls
                 WHERE finished_at >= ?
@@ -396,6 +426,7 @@ class MonitorStore:
                 "cost_us":      int(r["cost_us"]),
                 "prompt_chars": int(r["prompt_chars"]),
                 "output_chars": int(r["output_chars"]),
+                "result_chars": int(r["result_chars"]),
                 "elapsed_ms":   int(r["elapsed_ms"]),
             }
             for r in rows
