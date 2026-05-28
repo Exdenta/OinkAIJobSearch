@@ -75,21 +75,58 @@ DEFAULTS: dict = {
 
     # Two-pass scoring. Default ON as of 2026-05-19 — single-pass Sonnet
     # was 63% of monthly AI spend. Two-pass: Haiku triages every posting
-    # cheap, Sonnet re-scores only postings >= triage_floor. Cost cut
-    # ~5-8× vs single-pass Sonnet; Sonnet still arbitrates the borderline
-    # 3-vs-4 boundary where Haiku alone was noisy.
+    # cheap, Sonnet re-scores only postings in the
+    # [triage_floor, triage_ceiling) window. Cost cut ~5-8× vs single-
+    # pass Sonnet; Sonnet still arbitrates the borderline 3-vs-4 boundary
+    # where Haiku alone was noisy.
     #   ai_two_pass:        master toggle. False → single-pass Sonnet.
     #                       True  → Haiku triage + Sonnet rescore.
     #   ai_triage_floor:    Haiku score threshold for promotion to Sonnet.
     #                       2 keeps anything plausibly relevant; raise to
     #                       3 for an even tighter funnel if cost still high.
+    #   ai_triage_ceiling:  Haiku score AT OR ABOVE which the Sonnet rescore
+    #                       is SKIPPED — Haiku's verdict is trusted as-is.
+    #                       Default 5: Haiku's 5/5 verdicts pass through
+    #                       untouched. Rationale: Haiku is rarely wrong at
+    #                       the top end (forensic 7d window 2026-05-21..28
+    #                       showed Sonnet downgrading Haiku 5 → <5 on
+    #                       ~3-4% of cases), and Sonnet at best confirms
+    #                       a 5 — the marginal quality gain doesn't justify
+    #                       the per-batch Sonnet latency (53s/job on the
+    #                       worst 7d batches). Set to 6 to send EVERYTHING
+    #                       (including 5s) through Sonnet, or 4 for an even
+    #                       tighter Sonnet funnel that trusts 4s and 5s.
+    #                       This is NOT a heuristic score cap: the prompt's
+    #                       full scoring doctrine still applies to every
+    #                       Sonnet call; this knob only controls WHICH
+    #                       Haiku verdicts are routed to Sonnet at all.
     "ai_two_pass":        True,
     "ai_triage_floor":    2,
+    "ai_triage_ceiling":  5,
 
-    # Per-batch chunk size (algorithm v2.1). Bumped from 5 → 10 once we
-    # promoted the scorer to Sonnet — Sonnet handles the bigger prompt
-    # comfortably and the larger batch halves the per-pool wall time.
-    "ai_max_jobs_per_call": 10,
+    # Per-batch chunk size. Separate knobs per pass because Haiku and
+    # Sonnet have very different latency profiles on this prompt template
+    # (~9.1k fixed-overhead tokens of doctrine + per-job briefs).
+    #   ai_max_jobs_per_call:       used for the primary pass (Haiku in
+    #                               two-pass mode, Sonnet in single-pass
+    #                               mode). Haiku at 10/batch is fast and
+    #                               cheap; we keep the historical value.
+    #   ai_sonnet_max_jobs_per_call: used for the Sonnet RESCORE pass
+    #                                only (two-pass mode). Lowered 10 → 5
+    #                                in 2026-05-28 after forensic showed
+    #                                Sonnet batches of 10 routinely
+    #                                stalling 5-9 min (worst 7d:
+    #                                347-530s, 53s/job). At batch=5 the
+    #                                doctrine+briefs payload drops from
+    #                                ~25k → ~19k input tokens; combined
+    #                                with the existing 4-worker pool,
+    #                                same total wall time but no single
+    #                                batch monopolises a worker > a few
+    #                                minutes. Set equal to
+    #                                ai_max_jobs_per_call to disable the
+    #                                per-pass split.
+    "ai_max_jobs_per_call":         10,
+    "ai_sonnet_max_jobs_per_call":  5,
     # Parallel batch dispatch (v2.1). Each batch is one `claude -p` sub-
     # process; firing N at once roughly divides wall time by N. Anthropic
     # API + claude CLI handle their own rate limits; the OS subprocess
