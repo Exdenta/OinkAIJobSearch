@@ -21,10 +21,18 @@ publicly:
 Maintaining a custom DOM scraper for a target like this is not worth it: the
 underlying Inspira UI changes shape with every quarterly release, and the
 front-end is built specifically to make scraping painful. Instead we follow
-the same Claude-CLI delegation pattern as ``curated_boards.py``: shell out to
-the ``claude`` CLI with a strict JSON-only prompt, let it use its own
-``WebFetch`` tool to render the page through a real browser-like fetcher, and
-parse whatever JSON comes back into ``Job`` objects.
+the same Claude-CLI delegation pattern as ``sources/devex.py`` and
+``sources/ub_doctoral.py``: shell out to the ``claude`` CLI with a strict
+JSON-only prompt AND an explicit ``--allowed-tools WebFetch`` grant, let it
+use its own ``WebFetch`` tool to render the page through a real browser-like
+fetcher, and parse whatever JSON comes back into ``Job`` objects.
+
+The ``--allowed-tools`` grant is load-bearing: without it the CLI prompts the
+user interactively for tool permission, and in a non-interactive subprocess
+that prompt becomes the textual response ("I need permission to use
+WebFetch…") instead of the JSON envelope the adapter expects. That was the
+fix in 2026-05 — until then this adapter quietly returned ``[]`` on every
+run while the model asked for permissions nobody could grant.
 
 This keeps the adapter robust to layout drift (the prompt describes the
 *shape* of what we want, not which CSS selector to read) and isolates the
@@ -46,7 +54,7 @@ import logging
 from contextlib import contextmanager
 from typing import Any, Iterator
 
-from claude_cli import extract_assistant_text, parse_json_block, run_p
+from claude_cli import extract_assistant_text, parse_json_block, run_p_with_tools
 from dedupe import Job
 from text_utils import fix_mojibake
 
@@ -59,8 +67,8 @@ log = logging.getLogger(__name__)
 # These live in the broader project (per-step JSONL forensic logs and a
 # Claude-cost-tracking wrapper). When they're available we use them; when they
 # aren't (older checkouts, isolated test environments) we degrade silently to
-# plain ``run_p`` + a no-op forensic context. The adapter must keep working in
-# both worlds — that's why every reference is guarded.
+# plain ``run_p_with_tools`` + a no-op forensic context. The adapter must keep
+# working in both worlds — that's why every reference is guarded.
 # ---------------------------------------------------------------------------
 
 try:  # forensic.step / forensic.log_step
@@ -70,12 +78,28 @@ except Exception:  # ImportError or transitive failure
     _forensic = None  # type: ignore[assignment]
     _HAS_FORENSIC = False
 
-try:  # wrapped_run_p (claude_calls + forensic prompt-head capture)
-    from instrumentation.wrappers import wrapped_run_p as _wrapped_run_p  # type: ignore
+try:  # wrapped_run_p_with_tools (claude_calls + forensic prompt-head capture)
+    from instrumentation.wrappers import wrapped_run_p_with_tools as _wrapped_run_p_with_tools  # type: ignore
     _HAS_WRAPPED = True
 except Exception:
-    _wrapped_run_p = None  # type: ignore[assignment]
+    _wrapped_run_p_with_tools = None  # type: ignore[assignment]
     _HAS_WRAPPED = False
+
+
+# Tool grants for the UN Careers sub-agent. The Inspira SPA serves listings
+# only after a real browser-like fetch, so WebFetch is REQUIRED — without an
+# explicit ``--allowed-tools`` grant the CLI prompts interactively, and in a
+# non-interactive subprocess that prompt becomes a textual response ("I need
+# permission to use WebFetch…") instead of the JSON envelope the adapter
+# expects. See devex.py / web_search.py / ub_doctoral.py for the same fix.
+#
+# We do NOT grant WebSearch: the prompt only ever asks Claude to WebFetch the
+# landing page (and at most one in-portal pagination link). Keeping the allow
+# list minimal narrows the attack surface and the cost ceiling.
+_ALLOWED_TOOLS = "WebFetch"
+# Belt-and-suspenders: forbid filesystem/shell so a successful prompt-injection
+# in a fetched UN page can't escalate.
+_DISALLOWED_TOOLS = "Bash,Edit,Write,Read"
 
 
 class _NoopStepCtx:
@@ -101,15 +125,34 @@ def _step(op: str, *, input: Any | None = None) -> Iterator[Any]:
 
 
 def _run_claude(prompt: str, *, timeout_s: int) -> str | None:
-    """Use the instrumented wrapper when available, else plain run_p."""
+    """Use the instrumented wrapper when available, else plain run_p_with_tools.
+
+    UN Careers requires an explicit ``WebFetch`` grant — the Inspira SPA only
+    surfaces postings after a browser-like fetch, so without
+    ``--allowed-tools WebFetch`` the CLI prompts interactively and the model
+    responds with a textual "I need permission…" string instead of JSON.
+    Mirrors the fix in ``sources/devex.py`` and ``sources/web_search.py``.
+    """
     # Pin to haiku (2026-05-25) — see same fix in devex/web_search.
     from claude_cli import SMALLEST_MODEL as _MODEL
-    if _HAS_WRAPPED:
+    if _HAS_WRAPPED and _wrapped_run_p_with_tools is not None:
         try:
-            return _wrapped_run_p(None, "un_careers", prompt, timeout_s=timeout_s, model=_MODEL)  # type: ignore[misc]
+            return _wrapped_run_p_with_tools(  # type: ignore[misc]
+                None, "un_careers", prompt,
+                allowed_tools=_ALLOWED_TOOLS,
+                disallowed_tools=_DISALLOWED_TOOLS,
+                timeout_s=timeout_s,
+                model=_MODEL,
+            )
         except Exception:
-            log.exception("un_careers: wrapped_run_p failed; falling back to run_p")
-    return run_p(prompt, timeout_s=timeout_s, model=_MODEL)
+            log.exception("un_careers: wrapped_run_p_with_tools failed; falling back to run_p_with_tools")
+    return run_p_with_tools(
+        prompt,
+        allowed_tools=_ALLOWED_TOOLS,
+        disallowed_tools=_DISALLOWED_TOOLS,
+        timeout_s=timeout_s,
+        model=_MODEL,
+    )
 
 
 # ---------------------------------------------------------------------------
