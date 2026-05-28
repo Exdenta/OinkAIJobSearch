@@ -1217,6 +1217,19 @@ def run(
                                 max_jobs_per_call=int(filters.get("ai_max_jobs_per_call") or 10),
                                 two_pass=bool(filters.get("ai_two_pass", False)),
                                 triage_floor=int(filters.get("ai_triage_floor") or 2),
+                                # ai_triage_ceiling=5 (defaults): skip
+                                # Sonnet rescore on Haiku=5 verdicts.
+                                # ai_sonnet_max_jobs_per_call=5
+                                # (defaults): smaller Sonnet batches cap
+                                # worst-case per-batch wall time when the
+                                # ~9k-token doctrine + briefs combine to
+                                # stall a Sonnet call past 5 minutes.
+                                triage_ceiling=int(filters.get("ai_triage_ceiling") or 6),
+                                sonnet_max_jobs_per_call=(
+                                    int(filters["ai_sonnet_max_jobs_per_call"])
+                                    if filters.get("ai_sonnet_max_jobs_per_call")
+                                    else None
+                                ),
                                 workers=int(filters.get("ai_enrich_workers") or 4),
                                 db=db,
                                 chat_id=chat_id,
