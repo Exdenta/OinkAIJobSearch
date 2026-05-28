@@ -820,6 +820,8 @@ def enrich_jobs_ai(
     *,
     two_pass: bool = False,
     triage_floor: int = 2,
+    triage_ceiling: int = 6,
+    sonnet_max_jobs_per_call: int | None = None,
     workers: int = 4,
     db=None,
     chat_id: int | None = None,
@@ -845,13 +847,31 @@ def enrich_jobs_ai(
                        resume alone.
       timeout_s:       Per-CLI-call timeout. The caller passes the full
                        batch timeout; individual chunks share it.
-      max_jobs_per_call: Chunk size. v2 default is 5 — small chunks keep
-                       Haiku's prompt window comfortable and let split-
-                       retry recover individual misses cheaply.
+      max_jobs_per_call: PRIMARY-pass chunk size. In two-pass mode this is
+                       the Haiku batch size; in single-pass mode it's the
+                       Sonnet batch size.
       two_pass:        Off by default in v2. When True, runs a Sonnet
-                       re-score on Haiku survivors at `triage_floor`.
+                       re-score on Haiku survivors in the
+                       [triage_floor, triage_ceiling) score window.
                        Operator can flip this on if Haiku noise returns.
-      triage_floor:    Only meaningful when `two_pass=True`.
+      triage_floor:    Only meaningful when `two_pass=True`. Haiku score
+                       must be AT OR ABOVE this to be sent to Sonnet.
+      triage_ceiling:  Only meaningful when `two_pass=True`. Haiku scores
+                       AT OR ABOVE this are TRUSTED and skip the Sonnet
+                       rescore — saves the expensive call when Haiku is
+                       already saying "perfect fit". Default 6 (open) for
+                       backwards compatibility; production sets 5 via
+                       defaults.ai_triage_ceiling so Haiku=5 verdicts pass
+                       straight through. The full scoring doctrine still
+                       applies to every Sonnet call this knob does fire on
+                       — it controls ROUTING only, not what Sonnet looks at.
+      sonnet_max_jobs_per_call: SONNET-pass chunk size in two-pass mode.
+                       Defaults to None → falls back to max_jobs_per_call
+                       (legacy behaviour). Set smaller than the Haiku
+                       batch size to cut Sonnet wall time per batch when
+                       the prompt template (~9k fixed-overhead doctrine
+                       tokens) makes 10-job batches stall 5-9 minutes.
+                       Ignored in single-pass mode.
       db, chat_id:     Optional persistent score-cache wiring. When BOTH
                        are provided, we look up cached verdicts (keyed
                        by Job.job_id + the current profile_hash) before
@@ -950,14 +970,68 @@ def enrich_jobs_ai(
         merged_out.update(first_out)
         return merged_out
 
-    survivors: list[Job] = [
-        j for j in to_score
-        if int((first_out.get(j.external_id) or {}).get("match_score") or 0)
-           >= triage_floor
-    ]
+    # Window: triage_floor (inclusive) .. triage_ceiling (exclusive).
+    # Haiku verdicts AT OR ABOVE triage_ceiling are TRUSTED — Sonnet
+    # gets no chance to re-grade them. We are BETTING that the Haiku-5
+    # downgrade rate is low; the 7d aggregate Sonnet downgrade rate
+    # across the full Haiku>=2 pool is ~55%, and we do NOT have a
+    # Haiku=5-specific number yet (job_scores stamps only the final
+    # model; merge logs aggregate). The per-job forensic emit below is
+    # the audit trail that lets the operator look at any individual 5/5
+    # alert and ask "would Sonnet have downgraded it?" — and the basis
+    # for measuring the trust-Haiku-5 error rate over time.
+    # The triage_ceiling=6 default keeps every score (incl. 5) routed
+    # to Sonnet so existing callers / tests see no behaviour change;
+    # defaults.ai_triage_ceiling=5 is what flips this on in production.
+    survivors: list[Job] = []
+    trusted_top_jobs: list[Job] = []
+    for j in to_score:
+        haiku_score = int(
+            (first_out.get(j.external_id) or {}).get("match_score") or 0
+        )
+        if haiku_score >= triage_ceiling:
+            trusted_top_jobs.append(j)
+        elif haiku_score >= triage_floor:
+            survivors.append(j)
+
+    # Per-job forensic emit: ONE line per Haiku verdict that bypassed
+    # Sonnet. Shape `{job_id, ext_id, title, company, haiku_score,
+    # triage_ceiling}` so an operator chasing a bogus 5/5 alert can
+    # `jq 'select(.op=="enrich_jobs_ai.trusted_top")'` the forensic
+    # stream and find the audit trail in O(1). This is the SINGLE place
+    # in the codebase where a verdict can be promoted to a final score
+    # without a Sonnet vote, so it needs to be queryable per-job.
+    if trusted_top_jobs:
+        try:
+            from forensic import log_step as _flog
+            for j in trusted_top_jobs:
+                haiku_v = first_out.get(j.external_id) or {}
+                _flog(
+                    "enrich_jobs_ai.trusted_top",
+                    input={
+                        "job_id": j.job_id,
+                        "ext_id": j.external_id,
+                        "title": j.title,
+                        "company": j.company,
+                    },
+                    output={
+                        "haiku_score": int(haiku_v.get("match_score") or 0),
+                        "triage_ceiling": triage_ceiling,
+                        "why_match": haiku_v.get("why_match", ""),
+                    },
+                )
+        except Exception:
+            log.debug(
+                "enrich_jobs_ai.trusted_top forensic emit failed; continuing",
+                exc_info=True,
+            )
+    trusted_haiku_top_count = len(trusted_top_jobs)
     if not survivors:
-        log.info("enrich_jobs_ai: two-pass — 0 survivors at triage_floor=%d",
-                 triage_floor)
+        log.info(
+            "enrich_jobs_ai: two-pass — 0 survivors in Haiku window "
+            "[floor=%d, ceiling=%d) (trusted-top=%d)",
+            triage_floor, triage_ceiling, trusted_haiku_top_count,
+        )
         # No Sonnet pass: the only verdicts produced were Haiku's. Persist
         # them under the haiku label.
         if cache_enabled and phash and first_out:
@@ -967,14 +1041,19 @@ def enrich_jobs_ai(
         merged_out.update(first_out)
         return merged_out
 
+    sonnet_batch_size = int(sonnet_max_jobs_per_call or max_jobs_per_call)
+    if sonnet_batch_size < 1:
+        sonnet_batch_size = max_jobs_per_call
     log.info(
-        "enrich_jobs_ai: two-pass — %d/%d jobs survived Haiku triage "
-        "(floor=%d), re-scoring with %s",
-        len(survivors), len(to_score), triage_floor, MID_MODEL,
+        "enrich_jobs_ai: two-pass — %d/%d jobs in Sonnet window "
+        "[floor=%d, ceiling=%d); trusted-top=%d; rescoring with %s "
+        "(batch=%d)",
+        len(survivors), len(to_score), triage_floor, triage_ceiling,
+        trusted_haiku_top_count, MID_MODEL, sonnet_batch_size,
     )
     sonnet_out = _enrich_pool(
         survivors, resume_text, prefs_text, timeout_s,
-        max_jobs_per_call, model=MID_MODEL, pass_label="sonnet",
+        sonnet_batch_size, model=MID_MODEL, pass_label="sonnet",
         workers=workers,
     )
 
