@@ -295,11 +295,24 @@ class CallCtx:
         output_chars: int,
         exit_code: int | None,
         status: str,
+        *,
+        result_chars: int = 0,
     ) -> None:
+        """Record the call shape inside the with-block.
+
+        `output_chars` is the wire-level subprocess stdout length;
+        `result_chars` is the parsed `result` field length (i.e. the
+        model's assistant text). Splitting them lets the resulting
+        `claude_calls` row distinguish a CLI-side failure from a
+        model-emitted-nothing failure. Old callers that don't pass
+        `result_chars` get 0 — the same back-compat default as
+        `record_claude_call`.
+        """
         self._recorded = True
         self._payload = {
             "prompt_chars": int(prompt_chars or 0),
             "output_chars": int(output_chars or 0),
+            "result_chars": int(result_chars or 0),
             "exit_code": exit_code,
             "status": status,
         }
@@ -346,12 +359,14 @@ def claude_call(
             status = payload["status"]
             prompt_chars = payload["prompt_chars"]
             output_chars = payload["output_chars"]
+            result_chars = payload.get("result_chars", 0)
             exit_code = payload["exit_code"]
         else:
             # Either caller never called .record(), or an exception bubbled.
             status = "exception"
             prompt_chars = ctx._payload.get("prompt_chars", 0)
             output_chars = ctx._payload.get("output_chars", 0)
+            result_chars = ctx._payload.get("result_chars", 0)
             exit_code = ctx._payload.get("exit_code")
         try:
             store.record_claude_call(
@@ -361,6 +376,7 @@ def claude_call(
                 model=model,
                 prompt_chars=prompt_chars,
                 output_chars=output_chars,
+                result_chars=result_chars,
                 elapsed_ms=elapsed_ms,
                 exit_code=exit_code,
                 status=status,
