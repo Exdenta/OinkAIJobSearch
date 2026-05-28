@@ -87,19 +87,29 @@ DEFAULTS: dict = {
     #   ai_triage_ceiling:  Haiku score AT OR ABOVE which the Sonnet rescore
     #                       is SKIPPED — Haiku's verdict is trusted as-is.
     #                       Default 5: Haiku's 5/5 verdicts pass through
-    #                       untouched. Rationale: Haiku is rarely wrong at
-    #                       the top end (forensic 7d window 2026-05-21..28
-    #                       showed Sonnet downgrading Haiku 5 → <5 on
-    #                       ~3-4% of cases), and Sonnet at best confirms
-    #                       a 5 — the marginal quality gain doesn't justify
-    #                       the per-batch Sonnet latency (53s/job on the
-    #                       worst 7d batches). Set to 6 to send EVERYTHING
-    #                       (including 5s) through Sonnet, or 4 for an even
-    #                       tighter Sonnet funnel that trusts 4s and 5s.
-    #                       This is NOT a heuristic score cap: the prompt's
-    #                       full scoring doctrine still applies to every
-    #                       Sonnet call; this knob only controls WHICH
-    #                       Haiku verdicts are routed to Sonnet at all.
+    #                       untouched. Rationale: this is an explicit BET
+    #                       that the Haiku-5-specific downgrade rate is low
+    #                       enough to be worth the per-batch Sonnet latency
+    #                       saved per skip (53s/job on the worst 7d
+    #                       batches). The only measurement we currently
+    #                       have is the 7d aggregate Sonnet downgrade rate
+    #                       across the full Haiku>=2 pool (~55%); the
+    #                       Haiku=5-specific sub-rate is UNMEASURED
+    #                       (`job_scores` stamps only the final model and
+    #                       the merge-counter log lines aggregate across
+    #                       the whole rescore pool). The audit trail for
+    #                       this bet is the `enrich_jobs_ai.trusted_top`
+    #                       forensic stream — one line per skipped
+    #                       Haiku-top — which lets the operator
+    #                       retrospectively measure the false-positive
+    #                       rate of trusted 5s. Set to 6 to disable the
+    #                       skip entirely (send EVERYTHING, including 5s,
+    #                       through Sonnet), or 4 for an even tighter
+    #                       Sonnet funnel that trusts 4s and 5s. This is
+    #                       NOT a heuristic score cap: the prompt's full
+    #                       scoring doctrine still applies to every Sonnet
+    #                       call; this knob only controls WHICH Haiku
+    #                       verdicts are routed to Sonnet at all.
     "ai_two_pass":        True,
     "ai_triage_floor":    2,
     "ai_triage_ceiling":  5,
