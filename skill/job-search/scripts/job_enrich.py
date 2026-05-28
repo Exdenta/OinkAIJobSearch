@@ -972,25 +972,60 @@ def enrich_jobs_ai(
 
     # Window: triage_floor (inclusive) .. triage_ceiling (exclusive).
     # Haiku verdicts AT OR ABOVE triage_ceiling are TRUSTED — Sonnet
-    # gets no chance to re-grade them. Rationale: Haiku is rarely wrong
-    # at the top end; Sonnet's incremental value is negligible there but
-    # its per-batch latency is large (~50s/job worst case). Skipping
-    # Haiku=5 verdicts cuts the Sonnet workload by the share of 5s the
-    # primary pass produces.
+    # gets no chance to re-grade them. We are BETTING that the Haiku-5
+    # downgrade rate is low; the 7d aggregate Sonnet downgrade rate
+    # across the full Haiku>=2 pool is ~55%, and we do NOT have a
+    # Haiku=5-specific number yet (job_scores stamps only the final
+    # model; merge logs aggregate). The per-job forensic emit below is
+    # the audit trail that lets the operator look at any individual 5/5
+    # alert and ask "would Sonnet have downgraded it?" — and the basis
+    # for measuring the trust-Haiku-5 error rate over time.
     # The triage_ceiling=6 default keeps every score (incl. 5) routed
     # to Sonnet so existing callers / tests see no behaviour change;
     # defaults.ai_triage_ceiling=5 is what flips this on in production.
-    survivors: list[Job] = [
-        j for j in to_score
-        if triage_floor <= int(
+    survivors: list[Job] = []
+    trusted_top_jobs: list[Job] = []
+    for j in to_score:
+        haiku_score = int(
             (first_out.get(j.external_id) or {}).get("match_score") or 0
-        ) < triage_ceiling
-    ]
-    trusted_haiku_top_count = sum(
-        1 for j in to_score
-        if int((first_out.get(j.external_id) or {}).get("match_score") or 0)
-           >= triage_ceiling
-    )
+        )
+        if haiku_score >= triage_ceiling:
+            trusted_top_jobs.append(j)
+        elif haiku_score >= triage_floor:
+            survivors.append(j)
+
+    # Per-job forensic emit: ONE line per Haiku verdict that bypassed
+    # Sonnet. Shape `{job_id, ext_id, title, company, haiku_score,
+    # triage_ceiling}` so an operator chasing a bogus 5/5 alert can
+    # `jq 'select(.op=="enrich_jobs_ai.trusted_top")'` the forensic
+    # stream and find the audit trail in O(1). This is the SINGLE place
+    # in the codebase where a verdict can be promoted to a final score
+    # without a Sonnet vote, so it needs to be queryable per-job.
+    if trusted_top_jobs:
+        try:
+            from forensic import log_step as _flog
+            for j in trusted_top_jobs:
+                haiku_v = first_out.get(j.external_id) or {}
+                _flog(
+                    "enrich_jobs_ai.trusted_top",
+                    input={
+                        "job_id": j.job_id,
+                        "ext_id": j.external_id,
+                        "title": j.title,
+                        "company": j.company,
+                    },
+                    output={
+                        "haiku_score": int(haiku_v.get("match_score") or 0),
+                        "triage_ceiling": triage_ceiling,
+                        "why_match": haiku_v.get("why_match", ""),
+                    },
+                )
+        except Exception:
+            log.debug(
+                "enrich_jobs_ai.trusted_top forensic emit failed; continuing",
+                exc_info=True,
+            )
+    trusted_haiku_top_count = len(trusted_top_jobs)
     if not survivors:
         log.info(
             "enrich_jobs_ai: two-pass — 0 survivors in Haiku window "

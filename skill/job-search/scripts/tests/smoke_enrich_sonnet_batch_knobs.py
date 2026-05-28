@@ -408,6 +408,182 @@ def test_sonnet_split_retry_still_fires_at_batch_5() -> None:
     )
 
 
+def _read_forensic_lines(state_dir: str) -> list[dict]:
+    """Slurp every forensic JSONL line written under STATE_DIR. The
+    forensic writer rotates files but the test never hits the rotation
+    threshold, so log.0.jsonl typically contains everything."""
+    log_dir = Path(state_dir) / "forensic_logs"
+    out: list[dict] = []
+    if not log_dir.is_dir():
+        return out
+    for p in sorted(log_dir.glob("log.*.jsonl")):
+        for line in p.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return out
+
+
+def test_trusted_top_emits_per_job_forensic() -> None:
+    section(
+        "4. trusted-top Haiku verdicts emit a per-job forensic line — "
+        "audit trail for any 5/5 alert that bypassed Sonnet"
+    )
+
+    td = tempfile.mkdtemp()
+    os.environ["STATE_DIR"] = td
+    os.environ.pop("FORENSIC_OFF", None)
+
+    for mod in ("forensic", "job_enrich"):
+        if mod in sys.modules:
+            del sys.modules[mod]
+    import job_enrich
+
+    # Same shape as test 1: top band skips Sonnet, mid band goes to
+    # Sonnet. We only care that the top band shows up in the forensic
+    # log here.
+    jobs = _make_jobs(8)
+    top_ids = {j.external_id for j in jobs[0:5]}
+    mid_ids = {j.external_id for j in jobs[5:8]}
+
+    def score_for(ext_id: str) -> int:
+        if ext_id in top_ids:
+            return 5
+        if ext_id in mid_ids:
+            return 3
+        return 1
+
+    def fake_wrapped_run_p(store, caller, prompt, **kwargs):
+        present = [j for j in jobs if j.external_id in prompt]
+        if "sonnet" in caller:
+            return _sonnet_response_for(present)
+        return _haiku_response_for(present, score_for)
+
+    job_enrich.wrapped_run_p = fake_wrapped_run_p
+
+    job_enrich.enrich_jobs_ai(
+        jobs=jobs,
+        resume_text="MLOps engineer, 8 years Python and AWS.",
+        prefs_text="MLOps engineer prefs",
+        timeout_s=60,
+        max_jobs_per_call=10,
+        two_pass=True,
+        triage_floor=2,
+        triage_ceiling=5,
+        sonnet_max_jobs_per_call=5,
+        workers=1,
+    )
+
+    all_lines = _read_forensic_lines(td)
+    trusted_lines = [
+        ln for ln in all_lines
+        if ln.get("op") == "enrich_jobs_ai.trusted_top"
+    ]
+
+    # 1) Exactly one forensic line per trusted-top job.
+    _assert(
+        len(trusted_lines) == len(top_ids),
+        f"one trusted_top forensic line per Haiku-5 job "
+        f"(expected {len(top_ids)}, got {len(trusted_lines)})",
+    )
+
+    # 2) Every top-band ext_id is represented exactly once.
+    logged_ext_ids = sorted(
+        (ln.get("input", {}) or {}).get("ext_id") for ln in trusted_lines
+    )
+    _assert(
+        logged_ext_ids == sorted(top_ids),
+        f"trusted_top lines cover every Haiku-5 ext_id "
+        f"(missing={set(top_ids) - set(logged_ext_ids)}, "
+        f"extras={set(logged_ext_ids) - set(top_ids)})",
+    )
+
+    # 3) Shape contract: each line carries job_id, ext_id, title,
+    #    haiku_score, triage_ceiling. This is what the operator will
+    #    `jq` over when chasing a bad 5/5 alert — if any of these go
+    #    missing the audit trail breaks.
+    sample = trusted_lines[0]
+    inp = sample.get("input", {}) or {}
+    outp = sample.get("output", {}) or {}
+    for key in ("job_id", "ext_id", "title", "company"):
+        _assert(
+            key in inp and inp[key] not in (None, ""),
+            f"trusted_top.input carries {key!r} (sample={inp!r})",
+        )
+    _assert(
+        outp.get("haiku_score") == 5,
+        f"trusted_top.output.haiku_score==5 (got {outp.get('haiku_score')!r})",
+    )
+    _assert(
+        outp.get("triage_ceiling") == 5,
+        f"trusted_top.output.triage_ceiling==5 "
+        f"(got {outp.get('triage_ceiling')!r})",
+    )
+
+    # 4) Mid-band ids must NOT show up as trusted_top — they went to
+    #    Sonnet and should be auditable through enrich_jobs_ai.batch
+    #    forensic lines instead.
+    for mid in mid_ids:
+        _assert(
+            mid not in logged_ext_ids,
+            f"mid-band id {mid!r} is NOT logged as trusted_top",
+        )
+
+
+def test_trusted_top_no_emit_when_ceiling_open() -> None:
+    section(
+        "5. triage_ceiling=6 (open / legacy default) emits zero "
+        "trusted_top lines — every Haiku verdict still goes to Sonnet"
+    )
+
+    td = tempfile.mkdtemp()
+    os.environ["STATE_DIR"] = td
+    os.environ.pop("FORENSIC_OFF", None)
+
+    for mod in ("forensic", "job_enrich"):
+        if mod in sys.modules:
+            del sys.modules[mod]
+    import job_enrich
+
+    jobs = _make_jobs(6)
+
+    def fake_wrapped_run_p(store, caller, prompt, **kwargs):
+        present = [j for j in jobs if j.external_id in prompt]
+        if "sonnet" in caller:
+            return _sonnet_response_for(present)
+        # All Haiku=5 — yet ceiling=6 means none are "trusted".
+        return _haiku_response_for(present, lambda eid: 5)
+
+    job_enrich.wrapped_run_p = fake_wrapped_run_p
+
+    job_enrich.enrich_jobs_ai(
+        jobs=jobs,
+        resume_text="MLOps engineer.",
+        prefs_text="MLOps engineer prefs",
+        timeout_s=60,
+        max_jobs_per_call=10,
+        two_pass=True,
+        triage_floor=2,
+        triage_ceiling=6,            # legacy / backwards-compat default
+        sonnet_max_jobs_per_call=5,
+        workers=1,
+    )
+
+    all_lines = _read_forensic_lines(td)
+    trusted_lines = [
+        ln for ln in all_lines
+        if ln.get("op") == "enrich_jobs_ai.trusted_top"
+    ]
+    _assert(
+        trusted_lines == [],
+        f"ceiling=6 emits zero trusted_top lines (got {len(trusted_lines)})",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
@@ -418,6 +594,8 @@ if __name__ == "__main__":
         test_triage_ceiling_skips_top_end()
         test_sonnet_batch_size_drives_chunking()
         test_sonnet_split_retry_still_fires_at_batch_5()
+        test_trusted_top_emits_per_job_forensic()
+        test_trusted_top_no_emit_when_ceiling_open()
     except AssertionError as e:
         print(f"\nFAILED: {e}")
         sys.exit(1)
