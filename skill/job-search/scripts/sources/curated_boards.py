@@ -35,7 +35,13 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from claude_cli import run_p_with_tools, extract_assistant_text, parse_json_block
+from claude_cli import (
+    TOOLS_DENY_SHELL_FS,
+    TOOLS_WEB_FETCH_ONLY,
+    extract_assistant_text,
+    parse_json_block,
+    run_p_with_tools,
+)
 from instrumentation.wrappers import wrapped_run_p_with_tools
 import forensic
 from dedupe import Job
@@ -59,10 +65,10 @@ BOARDS: dict[str, str] = {
 # prompt only ever asks Claude to WebFetch the target URL (and at most one
 # "next page" link). Keeping the allow list minimal narrows the attack
 # surface. See sources/un_careers.py / sources/devex.py for the same fix.
-_ALLOWED_TOOLS = "WebFetch"
+_ALLOWED_TOOLS = TOOLS_WEB_FETCH_ONLY
 # Belt-and-suspenders: forbid filesystem/shell so a successful prompt-injection
 # in a fetched board page can't escalate.
-_DISALLOWED_TOOLS = "Bash,Edit,Write,Read"
+_DISALLOWED_TOOLS = TOOLS_DENY_SHELL_FS
 
 # The prompt is deliberately strict: it asks for JSON only, gives a clear schema,
 # and embeds the title/location gates so Claude drops obvious noise on its side.

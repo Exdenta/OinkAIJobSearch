@@ -54,7 +54,13 @@ import logging
 from contextlib import contextmanager
 from typing import Any, Iterator
 
-from claude_cli import extract_assistant_text, parse_json_block, run_p_with_tools
+from claude_cli import (
+    TOOLS_DENY_SHELL_FS,
+    TOOLS_WEB_FETCH_ONLY,
+    extract_assistant_text,
+    parse_json_block,
+    run_p_with_tools,
+)
 from dedupe import Job
 from text_utils import fix_mojibake
 
@@ -96,10 +102,10 @@ except Exception:
 # We do NOT grant WebSearch: the prompt only ever asks Claude to WebFetch the
 # landing page (and at most one in-portal pagination link). Keeping the allow
 # list minimal narrows the attack surface and the cost ceiling.
-_ALLOWED_TOOLS = "WebFetch"
+_ALLOWED_TOOLS = TOOLS_WEB_FETCH_ONLY
 # Belt-and-suspenders: forbid filesystem/shell so a successful prompt-injection
 # in a fetched UN page can't escalate.
-_DISALLOWED_TOOLS = "Bash,Edit,Write,Read"
+_DISALLOWED_TOOLS = TOOLS_DENY_SHELL_FS
 
 
 class _NoopStepCtx:

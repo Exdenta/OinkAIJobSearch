@@ -47,6 +47,75 @@ SMALLEST_MODEL = os.environ.get("CLAUDE_SMALLEST_MODEL", "haiku")
 MID_MODEL = os.environ.get("CLAUDE_MID_MODEL", "sonnet")
 
 
+# ---------------------------------------------------------------------------
+# Canonical tool-grant strings for `run_p_with_tools(allowed_tools=...,
+# disallowed_tools=...)`.
+#
+# Format: comma-separated tool names. The `claude` CLI's `--allowed-tools`
+# and `--disallowed-tools` flags accept BOTH comma- and space-separated
+# input (the flag is declared `<tools...>`), so either works, but we
+# standardize on commas project-wide so a future grep / audit only has to
+# match one form. The two outliers that previously used space-separated
+# strings (`sources/ub_doctoral.py`, `telegram_client._web_search_listing_
+# still_open`) have been migrated to use these constants.
+#
+# WHY DENY `Bash,Edit,Write,Read`:
+#   Every AI sub-agent we spawn with WebFetch/WebSearch is, by definition,
+#   pulling untrusted third-party text (job postings, recruiter blog
+#   posts, ATS pages) into its context window. A malicious page can
+#   include prompt-injection payloads that try to coerce the agent into
+#   side effects — exfiltrating files via `Read`, writing payloads with
+#   `Edit`/`Write`, or executing commands with `Bash`. We deny those four
+#   capabilities even when the sub-agent has no legitimate need for them,
+#   as a belt-and-suspenders defense: the agent could only ever invoke
+#   them via injection, so blocking them is pure upside.
+#
+#   The four-tool deny list (`Bash,Edit,Write,Read`) is the project-wide
+#   convention because those are the keystone capabilities — shell
+#   execution + filesystem read/write. Other tools that exist on the CLI
+#   (Grep, Glob, NotebookEdit, Task, etc.) either can't directly cause
+#   exfiltration/execution (Grep/Glob are search-only) or aren't
+#   reachable from the prompts we ship. If new high-risk tools land
+#   upstream, extend `TOOLS_DENY_SHELL_FS` here in one place.
+#
+# Usage example:
+#
+#     from claude_cli import (
+#         run_p_with_tools,
+#         TOOLS_WEB_BOTH,
+#         TOOLS_DENY_SHELL_FS,
+#     )
+#     stdout = run_p_with_tools(
+#         prompt,
+#         allowed_tools=TOOLS_WEB_BOTH,
+#         disallowed_tools=TOOLS_DENY_SHELL_FS,
+#         ...
+#     )
+
+#: Allow both web tools (the WebSearch+WebFetch pair every job-discovery
+#: sub-agent needs).
+TOOLS_WEB_BOTH = "WebSearch,WebFetch"
+
+#: Allow ONLY WebFetch (no search). Used by callers that load a known URL
+#: directly (no discovery step) — currently ``sources/un_careers.py`` and
+#: ``sources/curated_boards.py``, both of which point Claude at a specific
+#: landing page and parse what it returns. Keeping the allow list minimal
+#: narrows the prompt-injection attack surface.
+TOOLS_WEB_FETCH_ONLY = "WebFetch"
+
+#: Deny shell + filesystem read/write. Use as the canonical
+#: `disallowed_tools` for any caller that grants web tools to an agent
+#: processing third-party text (prompt-injection defense).
+TOOLS_DENY_SHELL_FS = "Bash,Edit,Write,Read"
+
+#: Deny ALL high-risk capabilities — including the web tools themselves.
+#: Use for "synthesizer" / "manager" agents that should reason over
+#: already-fetched fixtures and never call out to the network or the
+#: filesystem. Equivalent to `TOOLS_WEB_BOTH + "," + TOOLS_DENY_SHELL_FS`
+#: but spelled out so the wire format is grep-able.
+TOOLS_DENY_WEB_AND_SHELL_FS = "WebSearch,WebFetch,Bash,Edit,Write,Read"
+
+
 def run_p(
     prompt: str,
     timeout_s: int = 180,

@@ -66,7 +66,14 @@ import re
 from contextlib import contextmanager
 from typing import Any, Iterator
 
-from claude_cli import extract_assistant_text, parse_json_block, run_p, run_p_with_tools
+from claude_cli import (
+    TOOLS_DENY_SHELL_FS,
+    TOOLS_WEB_BOTH,
+    extract_assistant_text,
+    parse_json_block,
+    run_p,
+    run_p_with_tools,
+)
 from dedupe import Job
 from text_utils import fix_mojibake
 
@@ -102,10 +109,12 @@ except Exception:
 # Google ``site:`` queries). WebFetch is granted as a best-effort fallback in
 # case Claude's fetch path bypasses DataDome on a given run; the prompt tells
 # the agent to back off after one WebFetch failure.
-_ALLOWED_TOOLS = "WebSearch,WebFetch"
+#
 # Belt-and-suspenders: forbid filesystem/shell so a successful prompt-injection
-# in a future search-result snippet can't escalate.
-_DISALLOWED_TOOLS = "Bash,Edit,Write,Read"
+# in a future search-result snippet can't escalate. Delegates to the
+# project-wide canonical constants in ``claude_cli``.
+_ALLOWED_TOOLS = TOOLS_WEB_BOTH
+_DISALLOWED_TOOLS = TOOLS_DENY_SHELL_FS
 
 
 class _NoopStepCtx:
