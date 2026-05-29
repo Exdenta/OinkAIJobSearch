@@ -39,7 +39,13 @@ import re
 from datetime import date, timedelta
 from typing import Any
 
-from claude_cli import run_p, extract_assistant_text, parse_json_block
+from claude_cli import (
+    TOOLS_DENY_SHELL_FS,
+    TOOLS_WEB_BOTH,
+    extract_assistant_text,
+    parse_json_block,
+    run_p,
+)
 from instrumentation.wrappers import wrapped_run_p, wrapped_run_p_with_tools
 from dedupe import Job
 from text_utils import fix_mojibake
@@ -117,10 +123,12 @@ log = logging.getLogger(__name__)
 # snippet / company. Without these grants the CLI denies every WebSearch call
 # and the agent returns {"jobs": []} after burning ~15s of context — see the
 # 2026-04 zero-runs incident on chat 169016071 (forensic_logs/log.0.jsonl).
-_ALLOWED_TOOLS = "WebSearch,WebFetch"
+#
 # Belt-and-suspenders: explicitly forbid filesystem / shell access so a
 # successful prompt-injection in the candidate's free-text can't escalate.
-_DISALLOWED_TOOLS = "Bash,Edit,Write,Read"
+# Delegates to the project-wide canonical constants in ``claude_cli``.
+_ALLOWED_TOOLS = TOOLS_WEB_BOTH
+_DISALLOWED_TOOLS = TOOLS_DENY_SHELL_FS
 
 
 # Domains we already cover with dedicated, cheaper adapters. Tell the sub-agent

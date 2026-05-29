@@ -1007,7 +1007,12 @@ def _web_search_listing_still_open(
     if not (job.url or "").strip():
         return (None, "unknown:no_url")
     try:
-        from claude_cli import extract_assistant_text, parse_json_block
+        from claude_cli import (
+            TOOLS_DENY_SHELL_FS,
+            TOOLS_WEB_BOTH,
+            extract_assistant_text,
+            parse_json_block,
+        )
     except ImportError:
         return (None, "unknown:claude_cli_import")
     # Route through the instrumented wrapper so each verifier call is
@@ -1164,11 +1169,16 @@ def _web_search_listing_still_open(
         from claude_cli import SMALLEST_MODEL as _LIVENESS_MODEL
     except ImportError:
         _LIVENESS_MODEL = "haiku"
+    # Tool grants standardized via canonical constants in ``claude_cli`` —
+    # comma-separated allow list + explicit deny list for shell/filesystem
+    # (prompt-injection defense: WebFetch loads untrusted job-posting HTML
+    # whose page content lands directly in the agent's context window).
     stdout = wrapped_run_p_with_tools(
         None,
         "web_search_liveness",
         prompt,
-        allowed_tools="WebFetch WebSearch",
+        allowed_tools=TOOLS_WEB_BOTH,
+        disallowed_tools=TOOLS_DENY_SHELL_FS,
         timeout_s=timeout_s,
         output_format="json",
         model=_LIVENESS_MODEL,

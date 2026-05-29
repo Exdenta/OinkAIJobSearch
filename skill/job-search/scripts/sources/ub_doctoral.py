@@ -54,6 +54,8 @@ import logging
 from typing import Any
 
 from claude_cli import (
+    TOOLS_DENY_SHELL_FS,
+    TOOLS_WEB_BOTH,
     extract_assistant_text,
     parse_json_block,
     run_p_with_tools,
@@ -148,10 +150,14 @@ def fetch(filters: dict | None = None) -> list[Job]:
     )
 
     # Pin to haiku (2026-05-25) — see same fix in devex/web_search.
+    # Tool grants standardized via canonical constants in ``claude_cli`` —
+    # comma-separated allow list + explicit deny list for shell/filesystem
+    # (prompt-injection defense for untrusted page contents).
     from claude_cli import SMALLEST_MODEL as _MODEL
     stdout = run_p_with_tools(
         prompt,
-        allowed_tools="WebFetch WebSearch",
+        allowed_tools=TOOLS_WEB_BOTH,
+        disallowed_tools=TOOLS_DENY_SHELL_FS,
         timeout_s=timeout_s,
         model=_MODEL,
     )

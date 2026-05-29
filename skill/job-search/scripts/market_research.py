@@ -43,10 +43,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 from claude_cli import (
-    run_p_with_tools,
-    run_p,
+    TOOLS_DENY_SHELL_FS,
+    TOOLS_DENY_WEB_AND_SHELL_FS,
+    TOOLS_WEB_BOTH,
     extract_assistant_text,
     parse_json_block,
+    run_p,
+    run_p_with_tools,
 )
 from instrumentation.wrappers import wrapped_run_p_with_tools
 
@@ -84,10 +87,13 @@ _MAX_LOCATION_LEN = 64
 _HISTORICAL_WINDOW_MONTHS = "24"
 _PROJECTION_WINDOW_MONTHS = "12-18"
 
-_WORKER_ALLOWED_TOOLS    = "WebSearch,WebFetch"
-_WORKER_DISALLOWED_TOOLS = "Bash,Edit,Write,Read"
+# Tool grants delegate to the project-wide canonical constants in
+# `claude_cli` so a future audit only has to look in one place. See
+# `claude_cli.py` for the rationale on the deny list.
+_WORKER_ALLOWED_TOOLS    = TOOLS_WEB_BOTH
+_WORKER_DISALLOWED_TOOLS = TOOLS_DENY_SHELL_FS
 _MANAGER_ALLOWED_TOOLS    = ""
-_MANAGER_DISALLOWED_TOOLS = "WebSearch,WebFetch,Bash,Edit,Write,Read"
+_MANAGER_DISALLOWED_TOOLS = TOOLS_DENY_WEB_AND_SHELL_FS
 
 _VALID_CONFIDENCE = frozenset({"high", "medium", "low"})
 
