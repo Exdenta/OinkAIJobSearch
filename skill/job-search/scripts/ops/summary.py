@@ -1,22 +1,40 @@
-"""Per-run admin message — queue depths, per-source funnel, queue contents.
+"""Per-run operator message — bare facts only, no table formatting.
 
-Replaces the earlier "daily digest with AI cost block" format. The
-operator asked for the bare facts only, with no other content:
+Restyled 2026-05-29 per the operator's request. One message per pipeline
+run (the continuous searcher delivers one per finished iteration, and a
+run is always for a single user). Layout:
 
-  1. Accumulated jobs per user (queue depth + oldest age).
-  2. Per-source funnel for THIS run — fetched → scored → matched (≥4)
-     → queued. One line per source that contributed at any step.
-  3. Title + URL of every position currently sitting in the quality
-     buffer, grouped per user.
+  👤 <user_id> — <N> positions sent
+  💵 $<total_cost_usd>
+  🔢 <in> in · <out> out · <cache-read> · <cache-write> (<total>)
 
-No header decoration, no anomalies, no footer, no cost numbers. The
-caller in search_jobs.py keeps using `deliver_daily_summary(tg, store,
-run_id, db)`; the legacy module name is preserved so nothing else has to
-change.
+  📤 Positions:
+  • [<score>] <Title> — <Company>
+  • ...
 
-Plain text (no parse_mode) — URLs auto-linkify in Telegram and we
-sidestep MDv2 escaping headaches across long bodies. Telegram's 4096
-char ceiling is respected by chunking when the queue grows past it.
+That is ALL the operator sees — no recent-runs table, no per-source
+funnel, no queue contents, no anomalies/footer.
+
+Cost and token usage are summed from `claude_calls` over the run's time
+window. The table HAS `pipeline_run_id` / `chat_id` columns but the
+instrumentation does not populate them, so attribution is by TIME WINDOW.
+That is accurate in practice: `continuous_searcher` runs are staggered
+hours apart and each lasts ~25 min, so at most one run is ever active —
+the window catches exactly that run's calls. `cost_actual_us` (the CLI
+envelope's real `total_cost_usd`) is preferred per row, falling back to
+the char-count surrogate `cost_estimate_us`.
+
+The positions list + scores come from `sent_messages ⨝ jobs ⨝
+job_scores` on (chat_id, job_id). Every db-backed figure degrades to
+0 / empty when `db is None` (e.g. smoke tests pass no db).
+
+The caller in search_jobs.py keeps using `deliver_daily_summary(tg,
+store, run_id, db)`; the legacy module/function names are preserved so
+nothing else has to change.
+
+parse_mode="HTML" — titles render as clickable links; only the four
+HTML-significant chars are escaped. Telegram's 4096-char ceiling is
+respected by line-boundary chunking when a run ships a long list.
 """
 from __future__ import annotations
 
@@ -51,185 +69,45 @@ def _row_get(row: Any, key: str, default: Any = None) -> Any:
     return getattr(row, key, default)
 
 
+def _html_escape(s: str) -> str:
+    """Minimal HTML escape — only the four chars Telegram cares about
+    in visible text and href attributes."""
+    return (
+        (s or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def _fmt_usd(micros: Any) -> str:
+    """Render micro-USD (millionths of a dollar) as `$D.DDDD`."""
+    try:
+        return f"${(int(micros or 0) / 1_000_000):.4f}"
+    except (TypeError, ValueError):
+        return "$0.0000"
+
+
+def _humanize_int(n: Any) -> str:
+    """Compact human token count: 812 → '812', 12839 → '12.8K',
+    8_570_764 → '8.57M'. Operators scan magnitude, not exact digits."""
+    try:
+        n = int(n or 0)
+    except (TypeError, ValueError):
+        return "0"
+    if n < 1_000:
+        return str(n)
+    if n < 1_000_000:
+        return f"{n / 1_000:.1f}K"
+    return f"{n / 1_000_000:.2f}M"
+
+
 # ---------------------------------------------------------------------------
 # Data helpers — all best-effort. A missing table or unexpected row shape
-# returns an empty result rather than raising — the operator message must
-# never block the digest pipeline.
+# returns an empty / zeroed result rather than raising — the operator
+# message must never block the digest pipeline.
 # ---------------------------------------------------------------------------
-
-def _queue_per_user(db: Any) -> list[tuple[int, int, float | None]]:
-    """Return [(chat_id, depth, oldest_age_hours), ...] for every chat with
-    a non-empty queue. Sorted by chat_id for deterministic output."""
-    if db is None:
-        return []
-    try:
-        with db._conn() as c:
-            rows = c.execute(
-                """
-                SELECT chat_id, COUNT(*) AS depth, MIN(queued_at) AS oldest
-                  FROM queued_matches
-                 GROUP BY chat_id
-                 ORDER BY chat_id
-                """,
-            ).fetchall()
-    except Exception:
-        log.exception("admin_summary: queue_per_user query failed")
-        return []
-    now = time.time()
-    out: list[tuple[int, int, float | None]] = []
-    for r in rows:
-        try:
-            chat = int(r["chat_id"])
-            depth = int(r["depth"])
-            oldest = float(r["oldest"]) if r["oldest"] else None
-        except (KeyError, TypeError, ValueError):
-            continue
-        age_h = (now - oldest) / 3600.0 if oldest else None
-        out.append((chat, depth, age_h))
-    return out
-
-
-def _queue_entries_per_user(db: Any) -> dict[int, list[dict]]:
-    """For every chat with queued jobs, return ordered entries enriched
-    with title/url/source from the jobs table. Order matches send order:
-    match_score DESC, queued_at ASC.
-    """
-    if db is None:
-        return {}
-    try:
-        with db._conn() as c:
-            rows = c.execute(
-                """
-                SELECT q.chat_id, q.job_id, q.match_score, q.queued_at,
-                       j.title, j.url, j.source, j.company
-                  FROM queued_matches q
-             LEFT JOIN jobs j ON j.job_id = q.job_id
-                 ORDER BY q.chat_id, q.match_score DESC, q.queued_at ASC
-                """,
-            ).fetchall()
-    except Exception:
-        log.exception("admin_summary: queue_entries query failed")
-        return {}
-    by_chat: dict[int, list[dict]] = {}
-    for r in rows:
-        try:
-            chat = int(r["chat_id"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        by_chat.setdefault(chat, []).append({
-            "job_id":      r["job_id"],
-            "match_score": int(r["match_score"] or 0),
-            "title":       (r["title"] or "(no title)"),
-            "url":         (r["url"] or ""),
-            "source":      (r["source"] or "?"),
-            "company":     (r["company"] or ""),
-        })
-    return by_chat
-
-
-def _funnel_for_run(
-    db: Any,
-    sources: Iterable[Any],
-    user_chat: int | None,
-    started: float,
-    finished: float,
-) -> list[tuple[str, int, int, int, int]]:
-    """Build the per-source funnel rows for one pipeline run.
-
-    Each row: (source, fetched, scored, matched_ge4, queued).
-      * fetched  — `source_runs.raw_count` for the run.
-      * scored   — count of `job_scores` rows for this user whose job's
-                   source matches, where `scored_at` falls inside this
-                   run's time window.
-      * matched  — same query, restricted to match_score >= 4.
-      * queued   — count of `queued_matches` rows for this user with the
-                   same source, queued during the run window.
-
-    Sources that contributed zero at every step are dropped — the
-    operator only sees rows that did SOMETHING.
-    """
-    # Aggregate fetched per source key. Per-user sources (linkedin /
-    # web_search) and global sources both land here; same name → same
-    # bucket.
-    fetched_by_src: dict[str, int] = {}
-    for s in sources or []:
-        key = str(_row_get(s, "source_key", "") or "")
-        if not key:
-            continue
-        raw = int(_row_get(s, "raw_count", 0) or 0)
-        fetched_by_src[key] = fetched_by_src.get(key, 0) + raw
-
-    if not fetched_by_src and not user_chat:
-        return []
-
-    # Per-source counts for scored / matched / queued within the run window.
-    scored_by_src: dict[str, int] = {}
-    matched_by_src: dict[str, int] = {}
-    queued_by_src: dict[str, int] = {}
-
-    if db is not None and user_chat is not None and started > 0:
-        # Be generous on the upper bound — flushes/score writes can land
-        # slightly after `finished_at`. Use now() as a safe ceiling.
-        upper = max(finished, time.time())
-        try:
-            with db._conn() as c:
-                for r in c.execute(
-                    """
-                    SELECT j.source AS src,
-                           COUNT(*)                                        AS scored,
-                           SUM(CASE WHEN s.match_score >= 4 THEN 1 ELSE 0 END) AS matched
-                      FROM job_scores s
-                      JOIN jobs j ON j.job_id = s.job_id
-                     WHERE s.chat_id = ?
-                       AND s.scored_at BETWEEN ? AND ?
-                     GROUP BY j.source
-                    """,
-                    (int(user_chat), float(started), float(upper)),
-                ).fetchall():
-                    src = str(r["src"] or "")
-                    if not src:
-                        continue
-                    scored_by_src[src] = int(r["scored"] or 0)
-                    matched_by_src[src] = int(r["matched"] or 0)
-
-                for r in c.execute(
-                    """
-                    SELECT j.source AS src, COUNT(*) AS n
-                      FROM queued_matches q
-                      JOIN jobs j ON j.job_id = q.job_id
-                     WHERE q.chat_id = ?
-                       AND q.queued_at BETWEEN ? AND ?
-                     GROUP BY j.source
-                    """,
-                    (int(user_chat), float(started), float(upper)),
-                ).fetchall():
-                    src = str(r["src"] or "")
-                    if not src:
-                        continue
-                    queued_by_src[src] = int(r["n"] or 0)
-        except Exception:
-            log.exception("admin_summary: funnel query failed")
-
-    all_srcs = sorted(
-        set(fetched_by_src) | set(scored_by_src)
-        | set(matched_by_src) | set(queued_by_src),
-        key=lambda k: (
-            -fetched_by_src.get(k, 0),
-            -scored_by_src.get(k, 0),
-            k,
-        ),
-    )
-    rows: list[tuple[str, int, int, int, int]] = []
-    for src in all_srcs:
-        f = fetched_by_src.get(src, 0)
-        sc = scored_by_src.get(src, 0)
-        m = matched_by_src.get(src, 0)
-        q = queued_by_src.get(src, 0)
-        if f == 0 and sc == 0 and m == 0 and q == 0:
-            continue
-        rows.append((src, f, sc, m, q))
-    return rows
-
 
 def _user_chat_for_run(sources: Iterable[Any]) -> int | None:
     """Pipeline runs are per-user — the first per-user source row tells us
@@ -244,54 +122,56 @@ def _user_chat_for_run(sources: Iterable[Any]) -> int | None:
     return None
 
 
-# ---------------------------------------------------------------------------
-# Render
-# ---------------------------------------------------------------------------
+def _cost_tokens_for_run(
+    db: Any,
+    started: float,
+    finished: float,
+) -> dict:
+    """Sum cost + token usage from `claude_calls` over this run's window.
 
-def _format_runs_table(rows: list[Any], store: Any) -> str:
-    """Render the recent-runs table body as a box-drawing-character table.
-    Wrapped in <pre>...</pre> by the caller for Telegram HTML monospace.
+    Window is [started, max(finished, now)] on `finished_at`. The upper
+    bound floats to `now()` because this is often called before the run's
+    `finished_at` is stamped (the summary is built mid-finish), and a call
+    can land a hair after the run row updates. Staggered runs mean no other
+    run's calls fall inside the window.
+
+    Cost prefers `cost_actual_us` (the CLI envelope's real total_cost_usd)
+    and falls back per row to the char-count surrogate `cost_estimate_us`.
+
+    Returns zeros on any failure or when `db is None`.
     """
-    # Column widths tuned to fit ~70-char phone screens.
-    header = "│ Run  │ Time  │   User    │ Raw │ Sent │ Web │ LinkedIn │  Dur  │"
-    sep    = "├──────┼───────┼───────────┼─────┼──────┼─────┼──────────┼───────┤"
-    lines = [header, sep]
-    import json
-    for r in rows:
-        rid = f"#{int(_row_get(r, 'id', 0) or 0)}"
-        started = float(_row_get(r, "started_at", 0) or 0)
-        finished = float(_row_get(r, "finished_at", 0) or 0)
-        ts = time.strftime("%H:%M", time.localtime(started)) if started else "—"
-        # Derive user from per-user source rows.
-        user_chat = "—"
-        try:
-            _, sources = store.pipeline_run_with_sources(int(_row_get(r, "id", 0) or 0))
-            uc = _user_chat_for_run(sources)
-            if uc is not None:
-                user_chat = str(uc)
-        except Exception:
-            pass
-        raw = int(_row_get(r, "jobs_raw", 0) or 0)
-        sent = int(_row_get(r, "jobs_sent", 0) or 0)
-        extra_raw = _row_get(r, "extra_json")
-        web = li = 0
-        try:
-            if extra_raw:
-                e = json.loads(extra_raw) if isinstance(extra_raw, str) else dict(extra_raw)
-                web = int(e.get("web_hits") or 0)
-                li = int(e.get("linkedin_user_hits") or 0)
-        except Exception:
-            pass
-        dur = int(max(0, finished - started)) if (started and finished) else 0
-        dur_s = f"{dur}s"
-        lines.append(
-            f"│ {rid:<4} │ {ts:<5} │ {user_chat:<9} │ {raw:<3} │ {sent:<4} │ {web:<3} │ {li:<8} │ {dur_s:<5} │"
-        )
-        lines.append(sep)
-    # Replace last separator with a closing border (visual polish).
-    if len(lines) > 2:
-        lines[-1] = sep.replace("├", "└").replace("┼", "┴").replace("┤", "┘")
-    return "\n".join(lines)
+    zero = {"cost_us": 0, "in_tok": 0, "out_tok": 0, "cr_tok": 0, "cc_tok": 0, "calls": 0}
+    if db is None or not started:
+        return zero
+    upper = max(float(finished or 0.0), time.time())
+    try:
+        with db._conn() as c:
+            r = c.execute(
+                """
+                SELECT COUNT(*)                                              AS calls,
+                       COALESCE(SUM(COALESCE(cost_actual_us, cost_estimate_us)), 0) AS cost_us,
+                       COALESCE(SUM(input_tokens), 0)                        AS in_tok,
+                       COALESCE(SUM(output_tokens), 0)                       AS out_tok,
+                       COALESCE(SUM(cache_read_tokens), 0)                   AS cr_tok,
+                       COALESCE(SUM(cache_creation_tokens), 0)               AS cc_tok
+                  FROM claude_calls
+                 WHERE finished_at BETWEEN ? AND ?
+                """,
+                (float(started), float(upper)),
+            ).fetchone()
+    except Exception:
+        log.exception("admin_summary: cost/token window query failed")
+        return zero
+    if r is None:
+        return zero
+    return {
+        "cost_us": int(r["cost_us"] or 0),
+        "in_tok":  int(r["in_tok"] or 0),
+        "out_tok": int(r["out_tok"] or 0),
+        "cr_tok":  int(r["cr_tok"] or 0),
+        "cc_tok":  int(r["cc_tok"] or 0),
+        "calls":   int(r["calls"] or 0),
+    }
 
 
 def _sent_jobs_for_run(
@@ -300,66 +180,61 @@ def _sent_jobs_for_run(
     started: float,
     finished: float,
 ) -> list[dict]:
-    """Return jobs shipped during this iter's time window. List shape:
-    [{"title": str, "url": str, "company": str, "source": str}, ...]
-    in send order. Empty when nothing shipped (or DB unavailable).
+    """Return jobs shipped during this run's window, with their match score.
+
+    List shape, ordered best-match-first (NULL scores last):
+      [{"title", "url", "company", "source", "score": int | None}, ...]
+
+    Score comes from `job_scores` via LEFT JOIN on (chat_id, job_id) — a
+    job with no persisted score row yields score=None. Empty when nothing
+    shipped or `db` is unavailable.
     """
     if db is None or chat_id is None or not started:
         return []
-    # Pad the window slightly: flushes can write `sent_at` a hair before
-    # the run's `finished_at` is updated (concurrent context exit).
+    # Pad the window slightly: a flush can write `sent_at` a hair before
+    # the run's `finished_at` is stamped (concurrent context exit).
     lo = float(started) - 10.0
     hi = max(float(finished or 0.0), time.time()) + 60.0
     try:
         with db._conn() as c:
             rows = c.execute(
                 """
-                SELECT j.title, j.url, j.company, j.source, s.sent_at
-                  FROM sent_messages s JOIN jobs j ON j.job_id = s.job_id
+                SELECT j.title, j.url, j.company, j.source, s.sent_at,
+                       sc.match_score
+                  FROM sent_messages s
+                  JOIN jobs j ON j.job_id = s.job_id
+             LEFT JOIN job_scores sc
+                    ON sc.chat_id = s.chat_id AND sc.job_id = s.job_id
                  WHERE s.chat_id = ? AND s.sent_at BETWEEN ? AND ?
-                 ORDER BY s.sent_at
+                 ORDER BY sc.match_score DESC, s.sent_at
                 """,
                 (int(chat_id), lo, hi),
             ).fetchall()
     except Exception:
         log.exception("admin_summary: sent_jobs lookup failed")
         return []
-    return [
-        {
-            "title": (r["title"] or "(no title)"),
-            "url": (r["url"] or ""),
+    out: list[dict] = []
+    for r in rows:
+        score = r["match_score"]
+        out.append({
+            "title":   (r["title"] or "(no title)"),
+            "url":     (r["url"] or ""),
             "company": (r["company"] or ""),
-            "source": (r["source"] or "?"),
-        }
-        for r in rows
-    ]
+            "source":  (r["source"] or "?"),
+            "score":   int(score) if score is not None else None,
+        })
+    return out
 
 
-def _html_escape(s: str) -> str:
-    """Minimal HTML escape — only the three chars Telegram cares about
-    in <pre> bodies and href attributes."""
-    return (
-        (s or "")
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-    )
-
+# ---------------------------------------------------------------------------
+# Render
+# ---------------------------------------------------------------------------
 
 def build_daily_summary(store: Any, run_id: int, db: Any | None = None) -> str:
-    """Render the per-iter admin message body.
+    """Render the per-run operator message body (see module docstring).
 
-    Layout (HTML mode, Telegram parse_mode="HTML"):
-
-      <pre>...single-row table...</pre>
-      [optional]
-      Sent N:
-      • <a href="URL">Title</a> — Company
-
-    Only the iter that just finished is shown. The "Sent" block is
-    omitted when zero jobs shipped (the table's Sent column already
-    tells the operator that).
+    Only the run identified by `run_id` is described. Returns a plain
+    placeholder string when the run id is unknown.
     """
     run = None
     sources: list = []
@@ -369,29 +244,54 @@ def build_daily_summary(store: Any, run_id: int, db: Any | None = None) -> str:
         log.exception("admin_summary: pipeline_run lookup failed (run_id=%s)", run_id)
 
     if run is None:
-        return "<pre>(no run data for #%d)</pre>" % int(run_id or 0)
+        return "(no run data for #%d)" % int(run_id or 0)
 
-    table = _format_runs_table([run], store)
-    body = "<pre>" + table + "</pre>"
-
-    # Append the titles+URLs of jobs that shipped during this iter.
     user_chat = _user_chat_for_run(sources)
     started = float(_row_get(run, "started_at", 0) or 0)
     finished = float(_row_get(run, "finished_at", 0) or 0)
+
+    ct = _cost_tokens_for_run(db, started, finished)
     sent = _sent_jobs_for_run(db, user_chat, started, finished)
+
+    # Headline count: when we can enumerate the shipped messages (db
+    # present) use that, so the number matches the list shown directly
+    # below it. Otherwise fall back to the run's own tally.
+    if db is not None:
+        n_sent = len(sent)
+    else:
+        n_sent = int(_row_get(run, "jobs_sent", 0) or 0)
+
+    user_label = str(user_chat) if user_chat is not None else "—"
+    total_tok = ct["in_tok"] + ct["out_tok"] + ct["cr_tok"] + ct["cc_tok"]
+
+    lines = [
+        f"👤 {user_label} — {n_sent} position{'' if n_sent == 1 else 's'} sent",
+        f"💵 {_fmt_usd(ct['cost_us'])}",
+        (
+            f"🔢 {_humanize_int(ct['in_tok'])} in · "
+            f"{_humanize_int(ct['out_tok'])} out · "
+            f"{_humanize_int(ct['cr_tok'])} cache-read · "
+            f"{_humanize_int(ct['cc_tok'])} cache-write "
+            f"({_humanize_int(total_tok)} total)"
+        ),
+    ]
+
     if sent:
-        lines = [f"\n📤 Sent {len(sent)}:"]
+        lines.append("")
+        lines.append("📤 Positions:")
         for j in sent:
+            score = j.get("score")
+            score_txt = f"[{score}]" if score is not None else "[?]"
             title = _html_escape(j["title"])
             comp = _html_escape(j["company"])
             url = _html_escape(j["url"])
             comp_suffix = f" — {comp}" if comp else ""
             if url:
-                lines.append(f"• <a href=\"{url}\">{title}</a>{comp_suffix}")
+                lines.append(f"• {score_txt} <a href=\"{url}\">{title}</a>{comp_suffix}")
             else:
-                lines.append(f"• {title}{comp_suffix}")
-        body += "\n".join(lines)
-    return body
+                lines.append(f"• {score_txt} {title}{comp_suffix}")
+
+    return "\n".join(lines)
 
 
 def _chunk_by_size(body: str, limit: int = _TELEGRAM_MSG_LIMIT) -> list[str]:
@@ -421,14 +321,14 @@ def deliver_daily_summary(
     run_id: int,
     db: Any | None = None,
 ) -> None:
-    """Send the admin message to the operator. NEVER raises.
+    """Send the operator message. NEVER raises.
 
     Suppressed when:
       * `OPERATOR_CHAT_ID` is not set, OR
       * `quiet_alerts` toggle is '1'.
 
-    Chunks the body across multiple Telegram messages if it exceeds
-    the per-message limit (the queue can grow long).
+    Chunks the body across multiple Telegram messages if it exceeds the
+    per-message limit (a run that ships many positions can run long).
     """
     try:
         op = _operator_chat_id()
@@ -456,10 +356,8 @@ def deliver_daily_summary(
         delivered = 0
         for i, chunk in enumerate(chunks):
             try:
-                # 2026-05-26: body is now an HTML <pre> block so the
-                # box-drawing runs table aligns on mobile (Telegram's
-                # default text font is variable-width). HTML mode also
-                # avoids MarkdownV2's escape-everything tax.
+                # HTML mode: position titles render as clickable <a> links
+                # and we sidestep MarkdownV2's escape-everything tax.
                 tg.send_message(op, chunk, parse_mode="HTML")
                 delivered += 1
             except BaseException:  # noqa: BLE001 — SIGTERM-aware

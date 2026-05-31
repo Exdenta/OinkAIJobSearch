@@ -255,7 +255,7 @@ def cmd_stats(tg: TelegramClient, store: Any, chat_id: int, args: list[str]) -> 
     # Claude CLI block.
     lines.append("")
     lines.append("Claude CLI")
-    call_cells = "  | ".join(_pad(str(s.get("calls", 0)), 4) for s in summaries)
+    call_cells = "  | ".join(_pad(str(s.get("count", 0)), 4) for s in summaries)
     lines.append("  " + _pad("calls", 18) + " " + call_cells)
 
     # by_model breakdown — first window only (don't double-stuff the page).
@@ -275,11 +275,13 @@ def cmd_stats(tg: TelegramClient, store: Any, chat_id: int, args: list[str]) -> 
     )
     lines.append("  " + _pad("prompt chars", 18) + " " + char_cells)
 
+    # `cost_us` is per-row COALESCE(cost_actual_us, cost_estimate_us) — the
+    # real CLI-envelope cost when present, char-count surrogate otherwise.
     cost_cells = "  | ".join(
-        _pad(_fmt_dollars(s.get("cost_estimate_us", 0)), 6) for s in summaries
+        _pad(_fmt_dollars(s.get("cost_us", 0)), 6) for s in summaries
     )
     lines.append(
-        "  " + _pad("est. cost (surr.)", 18) + " " + cost_cells + "    surrogate · ±25%"
+        "  " + _pad("cost (USD)", 18) + " " + cost_cells + "    actual when available, else surrogate"
     )
 
     # Errors (delivered) — count from recent_errors per window. delivered_at != NULL

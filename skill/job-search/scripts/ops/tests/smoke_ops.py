@@ -145,12 +145,12 @@ class FakeStore:
         # 24h window asks for since=now-86400. Threshold halfway between.
         if since_ts < time.time() - 2 * 86400:
             return {
-                "calls": 974,
+                "count": 974,
                 "by_model": {"haiku": 900, "opus": 60, "sonnet": 14},
                 "by_caller": {"job_enrich": 800, "market_research:worker": 100, "fit_analyzer": 74},
                 "prompt_chars": 8_900_000,
                 "output_chars": 1_200_000,
-                "cost_estimate_us": 2_180_000,  # $2.18
+                "cost_us": 2_180_000,  # $2.18
                 "active_users": 11,
                 "digests_sent": 218,
             }
@@ -199,7 +199,7 @@ def _seed_default(store: FakeStore) -> None:
         },
     ]
     store.window_summary = {
-        "calls": 142,
+        "count": 142,
         "by_model": {"haiku": 128, "opus": 12, "sonnet": 2},
         "by_caller": {
             "job_enrich": 88,
@@ -210,7 +210,7 @@ def _seed_default(store: FakeStore) -> None:
         },
         "prompt_chars": 1_200_000,
         "output_chars": 180_000,
-        "cost_estimate_us": 310_000,  # $0.31
+        "cost_us": 310_000,  # $0.31
         "active_users": 5,
         "digests_sent": 31,
     }
@@ -378,21 +378,22 @@ check(ok, "broken envelope → deliver_alert swallows")
 
 
 # ---------------------------------------------------------------------------
-# 5. build_daily_summary — recent runs table
+# 5. build_daily_summary — bare-facts operator message
 # ---------------------------------------------------------------------------
-# The admin message format was simplified 2026-05-26 to a single compact
-# recent-runs table (the queue/funnel/contents triplet was too long).
-# Body is HTML-wrapped <pre>…</pre> for monospace alignment on mobile.
-print("\n5. build_daily_summary — recent runs table")
+# Restyled 2026-05-29: user-id + positions-sent headline, then cost, then
+# token usage, then the scored positions list. No table, no <pre>, no
+# box-drawing. (db=None here, so cost/tokens are $0 / 0 and the positions
+# list is empty — those db-backed paths are exercised live, not in smoke.)
+print("\n5. build_daily_summary — bare-facts operator message")
 
 store = FakeStore()
 _seed_default(store)
 summary = build_daily_summary(store, 2031, db=None)
-check("<pre>" in summary and "</pre>" in summary, "body wrapped in <pre>…</pre>")
-check("Run" in summary and "Time" in summary and "User" in summary,
-      "table header present")
-check("│" in summary and "├" in summary,
-      "box-drawing characters present")
+check("<pre>" not in summary and "│" not in summary,
+      "no table / box-drawing formatting")
+check("👤 100 — 31 positions sent" in summary, "user-id + positions headline")
+check("💵 $" in summary, "total_cost_usd row present")
+check("cache-read" in summary and "total)" in summary, "token usage line present")
 
 
 # ---------------------------------------------------------------------------
@@ -406,13 +407,13 @@ store2 = FakeStore()
 # "(no run data)" placeholder.
 out = build_daily_summary(store2, 99, db=None)
 check("no run data" in out, "empty-state placeholder visible")
-check("<pre>" in out, "still wrapped in <pre> on empty")
+check("#99" in out, "placeholder names the missing run id")
 
 
 # ---------------------------------------------------------------------------
-# 7. build_daily_summary — single-run table renders
+# 7. build_daily_summary — single run renders headline + cost + tokens
 # ---------------------------------------------------------------------------
-print("\n7. build_daily_summary — single-run table")
+print("\n7. build_daily_summary — single-run headline")
 
 now = time.time()
 store3 = FakeStore()
@@ -427,10 +428,10 @@ store3.run_with_sources[100] = (one_run, [
     {"source_key": "linkedin", "status": "ok", "raw_count": 18, "user_chat_id": 385675637},
 ])
 out = build_daily_summary(store3, 100, db=None)
-check("#100" in out, "run id present")
-check("540" in out, "raw count present")
-check("385675637" in out, "user chat_id present in User column")
-check("6" in out and "18" in out, "web + linkedin hits present")
+check("👤 385675637" in out, "user chat_id in headline")
+check("0 positions sent" in out, "zero positions sent (jobs_sent=0)")
+check("💵 $" in out, "cost row present")
+check(out.count("👤") == 1, "exactly one run rendered")
 
 
 # ---------------------------------------------------------------------------
@@ -454,9 +455,9 @@ for rid, raw, sent in [(101, 540, 0), (102, 541, 1), (103, 543, 5)]:
         {"source_key": "linkedin", "status": "ok", "raw_count": 10, "user_chat_id": 433775883},
     ])
 out = build_daily_summary(store4, 103, db=None)
-check("#103" in out, "requested run id appears")
-check("#101" not in out and "#102" not in out,
-      "other runs are NOT rendered (only the requested one)")
+check("5 positions sent" in out, "requested run's count (jobs_sent=5) appears")
+check(out.count("👤") == 1,
+      "only the requested run is rendered (one headline)")
 
 
 # ---------------------------------------------------------------------------
@@ -551,7 +552,7 @@ check(contains_all(text, [
     "by caller:",
     "job_enrich",
     "prompt chars",
-    "est. cost",
+    "cost (USD)",
     "surrogate",
     "Errors",
 ]), "/stats contains expected anchors")
