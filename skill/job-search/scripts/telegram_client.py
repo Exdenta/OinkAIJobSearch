@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 import requests
 
 from dedupe import Job
+from safe_url import safe_request  # SSRF-guarded HTTP for attacker-controlled job URLs
 
 log = logging.getLogger(__name__)
 
@@ -227,16 +228,18 @@ def _validation_request(
     method: str, url: str, timeout_s: float, *, headers: dict | None = None,
     verify: bool = True,
 ) -> requests.Response:
-    """Single HTTP probe for URL validation. HEAD by default; allow_redirects
-    on so 30x → canonical posting URLs follow correctly. Caller decides
-    whether to retry under verify=False.
+    """Single HTTP probe for URL validation. HEAD by default. Redirects are
+    followed (so 30x → canonical posting URLs resolve correctly) but every
+    hop is SSRF-revalidated by ``safe_request``. Caller decides whether to
+    retry under verify=False. Raises ``SSRFBlocked`` (a RequestException) if
+    the URL or any redirect target resolves to a private/internal address;
+    callers already treat that as a dead URL (drop).
     """
-    return requests.request(
+    return safe_request(
         method,
         url,
         headers=headers or _VALIDATION_HEADERS,
         timeout=timeout_s,
-        allow_redirects=True,
         verify=verify,
     )
 
@@ -941,10 +944,10 @@ def _fetch_title_for_soft_404(url: str, timeout_s: float) -> str | None:
     if not any(host.endswith(d) for d in _SILENT_REDIRECT_DOMAINS):
         return None
     try:
-        with requests.get(
+        with safe_request(
+            "GET",
             url,
             stream=True,
-            allow_redirects=True,
             timeout=timeout_s,
             headers={"User-Agent": "FindJobs-Bot/1.0 (+soft-404-check)"},
         ) as resp:

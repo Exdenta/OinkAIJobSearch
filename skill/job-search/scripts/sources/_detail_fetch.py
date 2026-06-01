@@ -36,6 +36,7 @@ import requests
 import re
 
 from text_utils import strip_html, fix_mojibake
+from safe_url import safe_request  # SSRF guard — detail URLs come from scraped listings
 
 # Pre-strip block patterns: anything inside <script>/<style>/<noscript> is
 # JS/CSS, not body content. text_utils.strip_html leaves it as visible
@@ -86,11 +87,13 @@ def fetch_body_text(
     if cached is not None:
         return cached
     try:
-        resp = requests.get(
+        # safe_request follows redirects with per-hop SSRF revalidation and
+        # raises SSRFBlocked (a RequestException) for private/internal targets.
+        resp = safe_request(
+            "GET",
             url,
             timeout=timeout_s,
             headers={**DEFAULT_HEADERS, **(headers or {})},
-            allow_redirects=True,
         )
     except requests.RequestException as e:
         log.debug("detail_fetch: GET %s raised %s", url, e)
