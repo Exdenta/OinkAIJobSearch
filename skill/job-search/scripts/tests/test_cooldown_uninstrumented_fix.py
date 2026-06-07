@@ -165,12 +165,16 @@ def test_should_run_source_instrumented_still_demotes_on_low_novelty(tmp_db):
 # ---------- (C) reset_uninstrumented_source_cooldowns ----------
 
 # Match the live whitelist used by `search_jobs.run` so the migration
-# we exercise here is byte-for-byte the one production runs.
-_INSTRUMENTED = {"linkedin", "justjoinit", "nofluffjobs", "builtin", "web_search"}
+# we exercise here is byte-for-byte the one production runs. Sourced from
+# the module constant (not a hardcoded literal) so Tier-4's added keys —
+# devex / un_careers / the curated sub-boards — stay in lockstep.
+_INSTRUMENTED = set(search_jobs._P2_INSTRUMENTED_SOURCES)
 
-# A representative subset of the ~18 uninstrumented sources that the
-# live DB had stuck at `half_freq, low_cycles=11`.
-_UNINSTRUMENTED_SAMPLE = ["hackernews", "reliefweb", "devex"]
+# A representative subset of the uninstrumented sources that the live DB
+# had stuck at `half_freq, low_cycles=11`. NOTE: devex/un_careers are now
+# instrumented (Tier 4), so they must NOT appear here — these are sources
+# that genuinely never call record_fetch.
+_UNINSTRUMENTED_SAMPLE = ["hackernews", "reliefweb", "euraxess"]
 
 
 def test_reset_uninstrumented_source_cooldowns(tmp_db):

@@ -157,17 +157,20 @@ Your tools:
 
 Your mission in this single run:
 
-  1. Form up to 4 distinct web searches that will surface FRESH openings
+  1. Form up to 6 distinct web searches that will surface FRESH openings
      matching the candidate's profile above. Good queries target company
      career pages and ATS domains (greenhouse.io, lever.co, ashbyhq.com,
      workable.com, bamboohr.com, personio.jobs, recruitee.com, workday,
      smartrecruiters.com) because they list stable canonical URLs.
 
   2. From the combined search results, pick the 10-{cap} most-promising
-     listings. For each one, call WebFetch on the posting's URL (or the
-     nearest canonical detail page) to pull: exact title, company,
-     location, snippet (1-3 sentences), posting URL (absolute https), and
-     a `posted_at` value (REQUIRED — see step 2a).
+     listings. For each one, call WebFetch on the posting's URL to pull:
+     exact title, company, location, snippet (1-3 sentences), posting URL
+     (absolute https), and a `posted_at` value (REQUIRED — see step 2a).
+     If the URL turns out to be a careers index, org portal, aggregator,
+     or repost rather than ONE specific role, drill through it per the
+     rule in step 3 to find the role's canonical posting URL (or DROP
+     it). Return the SPECIFIC role URL, never the index/portal URL.
 
   2a. EXTRACT `posted_at` AGGRESSIVELY. Downstream sources use this for
       a 7-day freshness gate; an empty value gets the listing dropped
@@ -240,13 +243,36 @@ Your mission in this single run:
          discord.com, t.me, and any URL whose path contains
          /comments/, /discuss/, /threads/, /r/<subreddit>, /forum/, or
          /topics/. These are NEVER acceptable as a posting URL.
-       - ONLY return URLs that point to a CANONICAL JOB POSTING page on a
-         company career page or ATS (greenhouse.io, lever.co, ashbyhq.com,
+       - ONLY return URLs that point to ONE SPECIFIC, APPLY-ABLE JOB
+         POSTING — a single role's canonical page on the EMPLOYER's own
+         site or their ATS (greenhouse.io, lever.co, ashbyhq.com,
          workable.com, bamboohr.com, personio.jobs, recruitee.com,
-         workday, smartrecruiters.com, or the company's own /careers or
-         /jobs page). If a search hit lands on a discussion thread, follow
-         the link OUT of the thread to the canonical posting and return
-         that URL instead — never the thread URL itself.
+         workday, smartrecruiters.com). The URL MUST identify ONE role:
+         it carries a role id or slug in the path (e.g.
+         `/jobs/4012345`, `/o/senior-frontend-engineer`,
+         `…/job/R-12345`) and resolves to that role's apply target.
+         A bare careers INDEX, jobs LISTING, search-results, category,
+         or landing/portal page (e.g. `acme.com/careers`,
+         `acme.com/jobs`, `undp.org/careers`, an org "career gateway")
+         is NOT acceptable — it names no single role and cannot be
+         applied to. Do NOT return it.
+       - REJECT THIRD-PARTY REPOST / AGGREGATOR PAGES. A job-repost
+         "opportunities" blog, newsletter, or any NON-EMPLOYER site that
+         merely re-announces a role someone else is hiring for is NOT a
+         canonical posting (illustrative examples, NOT a closed list:
+         opportunitiesforyouth.org, globalsouthopportunities.com, and
+         similar "opportunities"/"vacancies digest" blogs and mirrors).
+         Return ONLY the ORIGINAL employer/ATS posting, never the
+         repost. If you only have the aggregator's URL, DROP it.
+       - DRILL THROUGH WITH WebFetch. If a search hit lands on a
+         careers index, an org career-gateway/portal, an aggregator, a
+         repost blog, or a discussion thread, you MUST WebFetch that
+         page, locate the SPECIFIC role's canonical posting URL on the
+         employer/ATS site (the one with a role id/slug), and return
+         THAT URL. If, after drilling, you CANNOT find a specific
+         apply-able posting URL with a role identifier, you MUST DROP
+         the listing entirely. NEVER fall back to returning the index /
+         portal / aggregator / repost / thread URL.
 
   4. Return STRICT JSON only — no prose, no markdown, no code fences —
      with this exact shape:
@@ -261,8 +287,12 @@ Your mission in this single run:
 ]}}
 
 Rules:
-  - `url` MUST be an absolute https URL to the posting itself (not a
-    search-results page, not a homepage).
+  - `url` MUST be an absolute https URL to ONE specific apply-able
+    posting (a single role with a role id/slug in the path). It is
+    REJECTED if it is a careers index, jobs listing, search-results
+    page, homepage, org portal/landing page, or a third-party
+    aggregator/repost page. When in doubt, DROP the listing rather than
+    return a non-specific URL.
   - 0 to {cap} entries. Quality over quantity — if the search didn't
     surface anything good, return {{"jobs": []}}.
   - No duplicate URLs.
@@ -332,14 +362,14 @@ def _render_profile_seeds(profile_seeds: dict | None) -> str:
     raw_phrases = profile_seeds.get("seed_phrases") or []
     phrases: list[str] = []
     if isinstance(raw_phrases, list):
-        for s in raw_phrases[:8]:
+        for s in raw_phrases[:12]:
             if isinstance(s, str) and s.strip():
                 phrases.append(s.strip()[:120])
 
     raw_ats = profile_seeds.get("ats_domains") or []
     ats: list[str] = []
     if isinstance(raw_ats, list):
-        for s in raw_ats[:8]:
+        for s in raw_ats[:12]:
             if isinstance(s, str) and s.strip():
                 ats.append(s.strip()[:40])
 
@@ -438,6 +468,7 @@ def fetch(
     db=None,
     min_revisit_age_s: int = 21600,
     cursor_key: str = "",
+    attribution: dict | None = None,
 ) -> list[Job]:
     """Invoke the sub-agent and convert its JSON output into Job objects.
 
@@ -469,6 +500,17 @@ def fetch(
     Respects two timeouts:
       - `ai_web_search_timeout_s`: if set, used; otherwise
       - `ai_scrape_timeout_s`: shared with curated_boards; default 240s.
+
+    `attribution` (M2 per-query telemetry): unlike LinkedIn, the web_search
+    sub-agent forms its OWN internal search queries from the whole
+    `seed_phrases` set, so there is no per-job → per-seed mapping to
+    recover. We therefore attribute every job this round to a SINGLE
+    synthetic query key, ``"web_search:<joined seed phrases>"`` (or
+    ``"web_search:<focus_notes>"`` / ``"web_search:default"`` when seeds
+    are absent). That gives the optimiser a (source_key, query) reward arm
+    for the web_search seed set as a whole — coarser than LinkedIn's
+    per-query attribution but enough to prune a dead seed-set or reward a
+    productive one. Side-channel only; never affects the returned list.
     """
     srcs = filters.get("sources") or {}
     if not srcs.get("web_search", False):
@@ -606,6 +648,18 @@ def fetch(
         except Exception:
             log.exception("web_search: detail-page fetch raised; continuing")
 
+    # M2 per-query attribution: map every job this round to a single
+    # synthetic query key representing the web_search seed set. The
+    # sub-agent's internal queries aren't recoverable per-job, so the
+    # whole seed-set is treated as one reward arm.
+    if attribution is not None and out:
+        qkey = _web_search_query_key(profile_seeds, user_free_text)
+        for _j in out:
+            try:
+                attribution.setdefault(_j.job_id, qkey)
+            except Exception:
+                pass
+
     # Cursor advancement + jobs_seen / jobs_new telemetry. Done last so
     # `out` reflects the post-dedupe / post-body-fetch state.
     if db is not None:
@@ -621,6 +675,28 @@ def fetch(
             log.debug("web_search: db.record_fetch raised; continuing",
                       exc_info=True)
     return out
+
+
+def _web_search_query_key(profile_seeds: dict | None, user_free_text: str | None) -> str:
+    """Build the synthetic (source_key, query) attribution key for a
+    web_search round.
+
+    Prefers the profile's `seed_phrases` (the optimiser-maintained reward
+    arm), falling back to `focus_notes`, then a short head of the user's
+    free text, then a fixed "default" label. Kept short and stable so the
+    same seed set rolls up across runs in `query_runs`.
+    """
+    seeds = profile_seeds or {}
+    phrases = seeds.get("seed_phrases")
+    if isinstance(phrases, list) and phrases:
+        joined = " | ".join(str(p) for p in phrases[:4])
+        return f"web_search:{joined}"[:280]
+    notes = seeds.get("focus_notes")
+    if isinstance(notes, str) and notes.strip():
+        return f"web_search:{notes.strip()}"[:280]
+    if user_free_text and user_free_text.strip():
+        return f"web_search:{user_free_text.strip()[:80]}"
+    return "web_search:default"
 
 
 def _recent_web_search_titles(db, limit: int = 40) -> list[str]:

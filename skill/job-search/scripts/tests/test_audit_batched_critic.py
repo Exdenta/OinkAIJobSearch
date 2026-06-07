@@ -117,6 +117,9 @@ class FakeCLI:
 
     def __init__(self):
         self.calls: list[tuple[str, str]] = []
+        # Per-call model alias the production code passed (proves the
+        # scorer/critic model knobs thread through to the CLI invocation).
+        self.models: list[tuple[str, str | None]] = []
         self.thread_ids: set[int] = set()
         self._lock = threading.Lock()
         self.scorer_handler = None
@@ -126,6 +129,7 @@ class FakeCLI:
                  model=None, **kwargs):
         with self._lock:
             self.calls.append((caller, prompt))
+            self.models.append((caller, model))
             self.thread_ids.add(threading.get_ident())
         if caller.startswith("scoring_audit_critic"):
             return self._dispatch(self.critic_handler, caller, prompt)
@@ -145,6 +149,14 @@ class FakeCLI:
     def n_critic_calls(self) -> int:
         return sum(1 for c, _ in self.calls
                    if c.startswith("scoring_audit_critic"))
+
+    def scorer_models(self) -> set[str | None]:
+        return {m for c, m in self.models
+                if c.startswith("scoring_audit:")}
+
+    def critic_models(self) -> set[str | None]:
+        return {m for c, m in self.models
+                if c.startswith("scoring_audit_critic")}
 
 
 @pytest.fixture
@@ -465,3 +477,86 @@ def test_critic_cli_failure_returns_scorer_output(fake_cli, caplog):
     assert len(out) == 2
     assert any("critic CLI returned None" in rec.message
                for rec in caplog.records), caplog.records
+
+
+def test_model_knobs_thread_to_cli_scorer_and_critic(fake_cli):
+    """The `model` and `critic_model` args reach the right CLI calls.
+
+    Proves the cost knobs are honored end-to-end: every scorer call is
+    dispatched with `model=`, every critic call with `critic_model=`,
+    and the two are kept distinct (no cross-wiring). Drives a round-2
+    rerun so BOTH rounds' scorer + critic models are checked.
+    """
+    jobs = [_make_job(f"j{n}") for n in range(2)]
+    enr = _make_enrichments(jobs, score=3)
+
+    rounds = {"critic": 0}
+
+    def scorer(caller, prompt):
+        return _envelope({"reviews": _scorer_reviews(jobs, score=3, delta=0)})
+
+    def critic(caller, prompt):
+        rounds["critic"] += 1
+        if rounds["critic"] == 1:
+            # Reject round 1 so a round 2 (re-dispatching both models)
+            # actually happens.
+            return _envelope({"approve": False, "issues": [
+                {"id": jobs[0].external_id, "problem": "recheck"},
+            ]})
+        return _envelope({"approve": True, "issues": []})
+
+    fake_cli.scorer_handler = scorer
+    fake_cli.critic_handler = critic
+
+    out = job_enrich.reanalyze_scoring_ai(
+        jobs, enr, resume_text="r", prefs_text="p",
+        batch_size=10, workers=1, critic_rounds=3,
+        model="sonnet", critic_model="sonnet",
+    )
+
+    assert len(out) == 2
+    # Two rounds fired (critic rejected round 1).
+    assert fake_cli.n_scorer_calls() == 2
+    assert fake_cli.n_critic_calls() == 2
+    # Scorer ran on the scorer model; critic ran on the critic model.
+    # No None leaked (would mean the knob never reached wrapped_run_p).
+    assert fake_cli.scorer_models() == {"sonnet"}
+    assert fake_cli.critic_models() == {"sonnet"}
+
+
+def test_distinct_scorer_and_critic_models(fake_cli):
+    """When scorer and critic models differ, each CLI call gets the
+    correct one — guards against the two knobs being cross-wired."""
+    jobs = [_make_job(f"j{n}") for n in range(3)]
+    enr = _make_enrichments(jobs, score=2)
+
+    def scorer(caller, prompt):
+        return _envelope({"reviews": _scorer_reviews(jobs, score=2, delta=0)})
+
+    def critic(caller, prompt):
+        return _envelope({"approve": True, "issues": []})
+
+    fake_cli.scorer_handler = scorer
+    fake_cli.critic_handler = critic
+
+    out = job_enrich.reanalyze_scoring_ai(
+        jobs, enr, resume_text="r", prefs_text="p",
+        batch_size=10, workers=1, critic_rounds=2,
+        model="opus", critic_model="sonnet",
+    )
+
+    assert len(out) == 3
+    assert fake_cli.scorer_models() == {"opus"}
+    assert fake_cli.critic_models() == {"sonnet"}
+
+
+def test_default_audit_knobs_are_sonnet_and_two_rounds():
+    """defaults.py wires the post-send audit to the cheaper models +
+    fewer rounds. Locks the Tier-1 cost knobs so a future edit can't
+    silently bump the audit back onto Opus."""
+    import defaults  # noqa: PLC0415
+
+    d = defaults.DEFAULTS
+    assert d["ai_scoring_audit_model"] == "sonnet"
+    assert d["ai_scoring_audit_critic_model"] == "sonnet"
+    assert d["ai_scoring_audit_critic_rounds"] == 2

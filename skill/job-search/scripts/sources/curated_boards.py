@@ -108,7 +108,7 @@ def _parse_jobs_json(text: str) -> list[dict[str, Any]]:
     return [j for j in jobs if isinstance(j, dict)]
 
 
-def _scrape_one(board_key: str, url: str, filters: dict) -> list[Job]:
+def _scrape_one(board_key: str, url: str, filters: dict, *, db=None) -> list[Job]:
     timeout_s = int(filters.get("ai_scrape_timeout_s") or 180)
     cap = int(filters.get("max_per_source") or 10)
 
@@ -154,6 +154,30 @@ def _scrape_one(board_key: str, url: str, filters: dict) -> list[Job]:
                 posted_at=str(r.get("posted_at") or ""),
                 snippet=fix_mojibake(str(r.get("snippet") or ""))[:400],
             ))
+
+        # Tier 4: feed the adaptive source-cooldown FSM PER SUB-BOARD. Each
+        # board (remocate / wantapply / remoterocketship) records under its
+        # OWN source key, so `should_run_source` can demote a chronically
+        # quiet board independently of its siblings. jobs_new counts how many
+        # of this fetch's postings aren't yet in the `jobs` table, keyed on
+        # the real Job.job_id (sha1 of source+external_id) that `upsert_job`
+        # stores — recorded before the downstream upsert, so a repeat posting
+        # reads as "not new". These boards don't paginate, so we use a single
+        # fixed (query=board_key, page=1, location="") cell. Best-effort: a DB
+        # error never breaks the scrape.
+        if db is not None:
+            try:
+                seen_ids = [j.job_id for j in out]
+                existing = db.count_existing_jobs(seen_ids) if seen_ids else 0
+                db.record_fetch(
+                    board_key, board_key, 1, "",
+                    jobs_seen=len(seen_ids),
+                    jobs_new=max(0, len(seen_ids) - existing),
+                )
+            except Exception:
+                log.debug("%s: db.record_fetch raised; continuing",
+                          board_key, exc_info=True)
+
         fctx.set_output({
             "raw_count": len(raw),
             "kept": len(out),
@@ -163,8 +187,17 @@ def _scrape_one(board_key: str, url: str, filters: dict) -> list[Job]:
         return out
 
 
-def fetch(filters: dict) -> list[Job]:
-    """Aggregate AI-scraped postings from the enabled curated boards."""
+def fetch(filters: dict, *, db=None) -> list[Job]:
+    """Aggregate AI-scraped postings from the enabled curated boards.
+
+    A board is scraped when it is enabled in ``filters["sources"]``. The
+    caller (`search_jobs.fetch_all`) already applies the per-sub-board
+    adaptive-cooldown gate (`should_run_source`) and drops a board's toggle
+    for the OFF half of its alternation, so a sub-board the FSM has demoted
+    simply isn't enabled here this cycle. ``db`` is forwarded to
+    ``_scrape_one`` so each board records its own ``search_fetches`` novelty
+    row (Tier 4). When ``db`` is None (dry-run preview) recording is skipped.
+    """
     srcs = filters.get("sources") or {}
     all_jobs: list[Job] = []
     enabled_keys = [k for k in BOARDS if srcs.get(k, False)]
@@ -172,7 +205,7 @@ def fetch(filters: dict) -> list[Job]:
         if not srcs.get(key, False):
             continue
         try:
-            all_jobs.extend(_scrape_one(key, url, filters))
+            all_jobs.extend(_scrape_one(key, url, filters, db=db))
         except Exception as e:
             log.exception("%s: AI scrape failed: %s", key, e)
     forensic.log_step(

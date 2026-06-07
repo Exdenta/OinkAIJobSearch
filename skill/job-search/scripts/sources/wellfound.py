@@ -49,6 +49,20 @@ Until one of those is wired up, this adapter is a polite no-op so that
 `sources/__init__.py` can register `wellfound` as a known module key
 without breaking the orchestrator.
 
+Chrome-agent fallback (opt-in, default OFF)
+-------------------------------------------
+
+Option (a) above — drive a REAL browser that has already solved the
+DataDome JS challenge — is now wired through the shared
+``chrome_agent_fetch`` helper. When the operator enables
+``chrome_agent_fallback_enabled`` in ``defaults.py`` the adapter asks the
+operator's desktop Chrome (via ``claude -p --chrome`` + the
+``claude-in-chrome`` MCP) to load ``/remote`` and extract the listing
+cards. With the flag OFF (the DEFAULT) the helper returns ``[]`` WITHOUT
+spawning anything, so this adapter's observable behavior is byte-for-byte
+identical to the historic DataDome stub — it still probes, logs the block
+reason, and returns ``[]``. Zero regression.
+
 Module key: wellfound  (default OFF — do not enable in filters.yaml)
 """
 from __future__ import annotations
@@ -123,18 +137,99 @@ def _probe_block_reason() -> tuple[str, dict[str, Any]]:
     return "all_probes_failed", debug
 
 
+def _coerce_str(value: Any) -> str:
+    """Best-effort str coercion for an extracted listing field; never raises."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    try:
+        return str(value).strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _try_chrome_fallback(*, max_items: int) -> list[Job]:
+    """Best-effort agentic-Chrome recovery of Wellfound's DataDome-walled
+    ``/remote`` listing page.
+
+    Returns a list of mapped :class:`Job` rows, or ``[]`` when the
+    ``chrome_agent_fallback_enabled`` flag is OFF (the DEFAULT — the helper
+    returns ``[]`` with no subprocess spawned), the browser is unavailable,
+    the page is still blocked, or nothing parseable came back. NEVER raises:
+    any import / mapping problem degrades to ``[]`` so the adapter's contract
+    (return an empty list) is preserved exactly.
+    """
+    url = "https://wellfound.com/remote"
+    try:
+        from chrome_agent_fetch import fetch_listings_via_chrome
+        rows = fetch_listings_via_chrome(
+            url=url,
+            instruction=(
+                "remote tech and startup job listings: role title, company, "
+                "location, posting URL, short description"
+            ),
+            max_items=max_items,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.debug("wellfound: chrome fallback raised (%s); returning []", e)
+        return []
+
+    if not rows:
+        # Disabled / blocked / empty — identical to the historic stub.
+        log.debug("wellfound: chrome fallback returned no listings")
+        return []
+
+    jobs: list[Job] = []
+    for item in rows:
+        try:
+            job_url = _coerce_str(item.get("url")) or url
+            jobs.append(
+                Job(
+                    source="wellfound",
+                    external_id=job_url,
+                    title=_coerce_str(item.get("title")),
+                    company=_coerce_str(item.get("company")),
+                    location=_coerce_str(item.get("location")),
+                    url=job_url,
+                    posted_at=_coerce_str(item.get("posted_at")),
+                    snippet=_coerce_str(item.get("snippet")),
+                )
+            )
+        except Exception as e:  # noqa: BLE001
+            log.debug("wellfound: skipped unmappable listing (%s)", e)
+            continue
+
+    if jobs:
+        log.info("wellfound: chrome fallback recovered %d listing(s)", len(jobs))
+    return jobs
+
+
 def fetch(filters: dict) -> list[Job]:
     """Top-level adapter entry point.
 
-    Always returns an empty list. Performs one cheap probe so the forensic
-    log records the block reason for the day's run; this is the *only*
-    side effect.
+    Default behavior is an empty list: Wellfound is DataDome-walled, so the
+    plain-``requests`` path cannot reach listings. When the operator has
+    enabled ``chrome_agent_fallback_enabled`` the adapter first tries to
+    recover listings through the operator's desktop Chrome; on success it
+    returns the mapped :class:`Job` rows. On ANY failure — including the
+    default-OFF flag, which makes the helper return ``[]`` with no
+    subprocess — it falls through to the historic stub: one cheap probe so
+    the forensic log records the day's block reason, then ``[]``.
 
     `filters` keys consulted:
-      * max_per_source (int, default 12) — accepted for API parity, ignored
-        because this adapter never produces jobs.
+      * max_per_source (int, default 12) — caps both the chrome extraction
+        and (for API parity) the probe log.
     """
     cap = int(filters.get("max_per_source") or 12)
+
+    # Opt-in agentic-Chrome recovery. With the flag OFF (default) this
+    # returns [] WITHOUT spawning anything, so the behavior below is
+    # identical to the historic DataDome stub.
+    jobs = _try_chrome_fallback(max_items=int(filters.get("max_per_source") or 36))
+    if jobs:
+        return jobs
+
     reason, debug = _probe_block_reason()
 
     _log_forensic({

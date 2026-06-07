@@ -1,52 +1,49 @@
 """UN Careers (United Nations Inspira) source adapter.
 
-Slug: ``un_careers``. Landing page: https://careers.un.org/home?language=en
+Slug: ``un_careers``. Public portal: https://careers.un.org/jobSearch?language=en
 
-Why we delegate to the Claude CLI
----------------------------------
-UN Careers is a JS-only single-page app served by Oracle's Inspira HR system.
-The public landing page is a 50-line HTML shell that loads its own bundle and
-populates listings client-side from XHR endpoints that are not announced
-publicly:
+Design: direct HTTP-JSON first, Chrome-agent fallback
+-----------------------------------------------------
+UN Careers is a JS-only single-page app served by Oracle's Inspira HR system,
+but the SPA is backed by a **public JSON API** that needs no cookies and no
+auth — only a browser-like set of request headers. We talk to that API
+directly instead of delegating to a WebFetch sub-agent:
 
-  * Direct probes of plausible REST paths (``/api/public/jobsearch``,
-    ``/api/public/v2/jobs``, ``/api/jobs/search``, ``/RestService/...``,
-    ``/jobs.rss``, ``/sitemap.xml``) all return either the SPA shell catch-all
-    (HTTP 200, identical 116 KB body for every path) or a CloudFront 403 when
-    the User-Agent is recognized as a bot.
-  * The HTML carries no inline ``__INITIAL_STATE__`` / ``window.__APP_STATE__``
-    blob — listings are populated only after the JS bundle runs.
-  * No public RSS / sitemap is exposed.
+  POST https://careers.un.org/api/public/opening/jo/list/filteredV2/en
+    body  {"filterConfig":{}, "pagination":{"page":N, "itemPerPage":25,
+           "sortBy":"startDate","sortDirection":-1}}
+    -> {"status":1, "data":{"list":[ITEMS], "count":TOTAL}}
 
-Maintaining a custom DOM scraper for a target like this is not worth it: the
-underlying Inspira UI changes shape with every quarterly release, and the
-front-end is built specifically to make scraping painful. Instead we follow
-the same Claude-CLI delegation pattern as ``sources/devex.py`` and
-``sources/ub_doctoral.py``: shell out to the ``claude`` CLI with a strict
-JSON-only prompt AND an explicit ``--allowed-tools WebFetch`` grant, let it
-use its own ``WebFetch`` tool to render the page through a real browser-like
-fetcher, and parse whatever JSON comes back into ``Job`` objects.
+An empty ``filterConfig`` means "all current openings, newest first", which is
+exactly what we want from this GLOBAL source — the per-user scorer filters
+downstream. We paginate ``page=0,1,2,…`` until the returned list is empty or we
+hit ``max_per_source``.
 
-The ``--allowed-tools`` grant is load-bearing: without it the CLI prompts the
-user interactively for tool permission, and in a non-interactive subprocess
-that prompt becomes the textual response ("I need permission to use
-WebFetch…") instead of the JSON envelope the adapter expects. That was the
-fix in 2026-05 — until then this adapter quietly returned ``[]`` on every
-run while the model asked for permissions nobody could grant.
+Header note (load-bearing): a generic User-Agent with no ``Origin``/``Referer``
+gets a CloudFront 403; the desktop-Chrome UA plus ``Origin``/``Referer`` below
+returns 200. We send the POST through ``safe_url.safe_request`` so the outbound
+fetch goes through the project's SSRF guard like every other scraped-URL fetch.
 
-This keeps the adapter robust to layout drift (the prompt describes the
-*shape* of what we want, not which CSS selector to read) and isolates the
-maintenance burden to a single prompt rewrite if the UN ever rebuilds the
-portal entirely.
+Fallback: if the API path raises OR yields zero jobs, we ask the shared
+``chrome_agent_fetch.fetch_listings_via_chrome`` helper to drive the operator's
+real desktop Chrome past any anti-bot wall and extract the listing grid. That
+helper is GATED behind ``DEFAULTS["chrome_agent_fallback_enabled"]`` (default
+False), so with the flag OFF — the default — the fallback returns ``[]`` and
+this adapter is effectively API-only, with behavior identical to a plain HTTP
+adapter (zero new side effects).
 
 Failure modes (all return ``[]`` and never raise out of ``fetch``):
-  * ``claude`` CLI missing or login expired         -> warning, ``[]``
-  * Network failure / WebFetch blocked              -> warning, ``[]``
-  * CLI returned non-JSON / unparseable response    -> warning, ``[]``
-  * CLI returned ``{"jobs": []}`` (legitimate zero) -> info,    ``[]``
+  * API POST raised / SSRF-blocked / non-2xx  -> try chrome fallback, else []
+  * API returned a non-JSON / unexpected body -> try chrome fallback, else []
+  * API returned zero openings                -> try chrome fallback, else []
+  * chrome fallback disabled (the DEFAULT)    -> []
 
-DISABLED BY DEFAULT in filters.yaml. Enable after a ``--dry-run`` sanity check;
-the wiring toggle is owned by ``defaults.py`` (don't edit here).
+``db`` (Tier 4): when supplied, the adapter records one ``search_fetches`` row
+per fetch so the adaptive source-cooldown FSM
+(``search_jobs.should_run_source``) gets a novelty signal for ``un_careers``.
+
+DISABLED BY DEFAULT in filters.yaml. The wiring toggle is owned by
+``defaults.py`` (don't edit here).
 """
 from __future__ import annotations
 
@@ -54,27 +51,48 @@ import logging
 from contextlib import contextmanager
 from typing import Any, Iterator
 
-from claude_cli import (
-    TOOLS_DENY_SHELL_FS,
-    TOOLS_WEB_FETCH_ONLY,
-    extract_assistant_text,
-    parse_json_block,
-    run_p_with_tools,
-)
+import requests
+
+import safe_url
 from dedupe import Job
-from text_utils import fix_mojibake
+from text_utils import fix_mojibake, strip_html
+from chrome_agent_fetch import fetch_listings_via_chrome
 
 log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Optional integrations: forensic + instrumented Claude CLI wrapper.
-#
-# These live in the broader project (per-step JSONL forensic logs and a
-# Claude-cost-tracking wrapper). When they're available we use them; when they
-# aren't (older checkouts, isolated test environments) we degrade silently to
-# plain ``run_p_with_tools`` + a no-op forensic context. The adapter must keep
-# working in both worlds — that's why every reference is guarded.
+# UN Careers public API constants. The header set is verified-working: a
+# generic UA without Origin/Referer returns 403; with these it returns 200.
+# These are transport invariants (User-Agent / required browser headers),
+# not scoring heuristics — the allowed kind of hardcoding per CLAUDE.md.
+# ---------------------------------------------------------------------------
+
+API_URL = "https://careers.un.org/api/public/opening/jo/list/filteredV2/en"
+SEARCH_URL = "https://careers.un.org/jobSearch?language=en"
+
+_API_HEADERS = {
+    "Accept": "application/json, text/plain, */*",
+    "Content-Type": "application/json",
+    "Origin": "https://careers.un.org",
+    "Referer": "https://careers.un.org/jobSearch?language=en",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+}
+
+_ITEMS_PER_PAGE = 25
+# Belt-and-suspenders page ceiling so a misbehaving API (e.g. one that keeps
+# returning a non-empty list) can never spin us forever. cap/itemsPerPage + 2.
+_MAX_PAGES = 8
+
+
+# ---------------------------------------------------------------------------
+# Optional integration: per-step JSONL forensic logs. Present in the broader
+# project; absent in isolated test environments. Guarded so the adapter works
+# in both worlds.
 # ---------------------------------------------------------------------------
 
 try:  # forensic.step / forensic.log_step
@@ -83,29 +101,6 @@ try:  # forensic.step / forensic.log_step
 except Exception:  # ImportError or transitive failure
     _forensic = None  # type: ignore[assignment]
     _HAS_FORENSIC = False
-
-try:  # wrapped_run_p_with_tools (claude_calls + forensic prompt-head capture)
-    from instrumentation.wrappers import wrapped_run_p_with_tools as _wrapped_run_p_with_tools  # type: ignore
-    _HAS_WRAPPED = True
-except Exception:
-    _wrapped_run_p_with_tools = None  # type: ignore[assignment]
-    _HAS_WRAPPED = False
-
-
-# Tool grants for the UN Careers sub-agent. The Inspira SPA serves listings
-# only after a real browser-like fetch, so WebFetch is REQUIRED — without an
-# explicit ``--allowed-tools`` grant the CLI prompts interactively, and in a
-# non-interactive subprocess that prompt becomes a textual response ("I need
-# permission to use WebFetch…") instead of the JSON envelope the adapter
-# expects. See devex.py / web_search.py / ub_doctoral.py for the same fix.
-#
-# We do NOT grant WebSearch: the prompt only ever asks Claude to WebFetch the
-# landing page (and at most one in-portal pagination link). Keeping the allow
-# list minimal narrows the attack surface and the cost ceiling.
-_ALLOWED_TOOLS = TOOLS_WEB_FETCH_ONLY
-# Belt-and-suspenders: forbid filesystem/shell so a successful prompt-injection
-# in a fetched UN page can't escalate.
-_DISALLOWED_TOOLS = TOOLS_DENY_SHELL_FS
 
 
 class _NoopStepCtx:
@@ -130,179 +125,228 @@ def _step(op: str, *, input: Any | None = None) -> Iterator[Any]:
         yield _NoopStepCtx()
 
 
-def _run_claude(prompt: str, *, timeout_s: int) -> str | None:
-    """Use the instrumented wrapper when available, else plain run_p_with_tools.
+# ---------------------------------------------------------------------------
+# API helpers
+# ---------------------------------------------------------------------------
 
-    UN Careers requires an explicit ``WebFetch`` grant — the Inspira SPA only
-    surfaces postings after a browser-like fetch, so without
-    ``--allowed-tools WebFetch`` the CLI prompts interactively and the model
-    responds with a textual "I need permission…" string instead of JSON.
-    Mirrors the fix in ``sources/devex.py`` and ``sources/web_search.py``.
+def _detail_url(job_id: Any) -> str:
+    """Build the absolute job-detail URL from an item's ``jobId``."""
+    return f"https://careers.un.org/jobSearchDescription/{job_id}?language=en"
+
+
+def _post_page(page: int, *, timeout_s: float) -> list[dict]:
+    """POST one page of openings; return the raw ``data.list`` items.
+
+    Sends the body through ``safe_url.safe_request`` so the outbound fetch is
+    SSRF-guarded like every other scraped-URL fetch. Raises on transport
+    failure / non-2xx / unexpected body — the caller turns any exception into
+    the chrome fallback.
     """
-    # Pin to haiku (2026-05-25) — see same fix in devex/web_search.
-    from claude_cli import SMALLEST_MODEL as _MODEL
-    if _HAS_WRAPPED and _wrapped_run_p_with_tools is not None:
-        try:
-            return _wrapped_run_p_with_tools(  # type: ignore[misc]
-                None, "un_careers", prompt,
-                allowed_tools=_ALLOWED_TOOLS,
-                disallowed_tools=_DISALLOWED_TOOLS,
-                timeout_s=timeout_s,
-                model=_MODEL,
-            )
-        except Exception:
-            log.exception("un_careers: wrapped_run_p_with_tools failed; falling back to run_p_with_tools")
-    return run_p_with_tools(
-        prompt,
-        allowed_tools=_ALLOWED_TOOLS,
-        disallowed_tools=_DISALLOWED_TOOLS,
-        timeout_s=timeout_s,
-        model=_MODEL,
+    body = {
+        "filterConfig": {},
+        "pagination": {
+            "page": page,
+            "itemPerPage": _ITEMS_PER_PAGE,
+            "sortBy": "startDate",
+            "sortDirection": -1,
+        },
+    }
+    try:
+        resp = safe_url.safe_request(
+            "POST",
+            API_URL,
+            timeout=timeout_s,
+            headers=_API_HEADERS,
+            json=body,
+        )
+    except TypeError:
+        # The deployed ``safe_request`` predates JSON-body passthrough (its
+        # signature has no ``json``/``data`` kwarg). The UN API needs the body,
+        # so re-create the same SSRF guarantee inline: validate the URL via the
+        # module's own ``is_safe_url`` BEFORE connecting, then POST directly.
+        # API_URL is a fixed https constant, never attacker-controlled, so the
+        # per-hop redirect revalidation that ``safe_request`` adds is not needed
+        # here. When Foundation extends ``safe_request`` with a body, the call
+        # above just works and this branch goes cold.
+        ok, reason = safe_url.is_safe_url(API_URL)
+        if not ok:
+            raise RuntimeError(f"un_careers API SSRF-blocked ({reason})")
+        resp = requests.post(
+            API_URL, timeout=timeout_s, headers=_API_HEADERS, json=body,
+        )
+    if getattr(resp, "status_code", 0) >= 400:
+        raise RuntimeError(f"un_careers API status={resp.status_code}")
+    data = resp.json()
+    if not isinstance(data, dict):
+        raise RuntimeError("un_careers API returned non-object body")
+    payload = data.get("data") or {}
+    items = payload.get("list") if isinstance(payload, dict) else None
+    return items if isinstance(items, list) else []
+
+
+def _map_item(item: dict) -> Job | None:
+    """Map one API item to a ``Job`` (or None when it lacks a usable id)."""
+    if not isinstance(item, dict):
+        return None
+    job_id = item.get("jobId")
+    if job_id in (None, ""):
+        return None
+    url = _detail_url(job_id)
+
+    title = item.get("postingTitle") or item.get("jobTitle") or ""
+
+    company = "United Nations"
+    dept = item.get("dept")
+    if isinstance(dept, str) and dept.strip():
+        company = f"United Nations — {dept.strip()}"
+
+    location = ""
+    duty = item.get("dutyStation")
+    if isinstance(duty, list) and duty:
+        first = duty[0]
+        if isinstance(first, dict):
+            location = first.get("description") or ""
+
+    return Job(
+        source="un_careers",
+        external_id=url,
+        title=fix_mojibake(str(title))[:140],
+        company=fix_mojibake(str(company))[:80],
+        location=fix_mojibake(str(location))[:80],
+        url=url,
+        posted_at=str(item.get("startDate") or ""),
+        # jobDescription comes back as raw HTML — strip tags so the scorer
+        # sees readable prose, not ``<div class='jobPostingDetail'>`` noise.
+        snippet=fix_mojibake(strip_html(str(item.get("jobDescription") or "")))[:400],
     )
 
 
-# ---------------------------------------------------------------------------
-# Prompt
-#
-# Strict JSON only, no commentary, no markdown fences. We deliberately give
-# Claude permission to follow up to one "next page" / "see all jobs" link
-# because the landing page is a marketing splash on most days; the actual
-# listing grid lives one click in. The dotted "absolute https://..." note is
-# a hard requirement — the Job dedupe key is built from `external_id`/`url`,
-# and a relative link would silently collide across postings.
-# ---------------------------------------------------------------------------
+def _fetch_via_api(cap: int, *, timeout_s: float) -> list[Job]:
+    """Paginate the public API into a capped list of ``Job``.
 
-LANDING = "https://careers.un.org/home?language=en"
+    Raises on the first transport / parse failure so the caller can fall back
+    to the chrome tier. Stops at the first empty page or when ``cap`` is hit.
+    """
+    out: list[Job] = []
+    for page in range(_MAX_PAGES):
+        items = _post_page(page, timeout_s=timeout_s)
+        if not items:
+            break
+        for item in items:
+            job = _map_item(item)
+            if job is not None:
+                out.append(job)
+                if len(out) >= cap:
+                    return out
+    return out
 
-_PROMPT = """You are a job-scraping assistant. Use the WebFetch tool to load:
-{url}
 
-The page is the United Nations careers portal (Inspira). It is a JavaScript
-single-page app and the landing surface may be a marketing splash; if it does
-not surface job listings directly, follow up to ONE link that looks like
-"jobs", "vacancies", "search jobs", "all jobs", or a "next page"/pagination
-link to reach the listings grid.
+def _fetch_via_chrome(cap: int) -> list[Job]:
+    """Last-resort fallback: drive the operator's Chrome to read the grid.
 
-Return STRICT JSON (no commentary, no markdown fences, no prose before or
-after) with this shape:
-
-{{"jobs": [
-  {{"title": "...",
-    "company": "...",
-    "location": "...",
-    "url": "absolute https://... direct job-detail URL",
-    "posted_at": "",
-    "snippet": ""}}
-]}}
-
-Rules:
-- Cap at 15 results. Prefer the freshest postings (most recently posted).
-- ``url`` MUST be an absolute https URL pointing to the individual job
-  detail page (not the search results page). Skip postings whose detail URL
-  you can't recover.
-- ``company`` defaults to "United Nations" when the posting itself doesn't
-  name a specific UN agency / department; otherwise use the agency name.
-- Trim ``snippet`` to a one or two sentence summary of the role.
-- ``posted_at`` is best-effort — leave empty if the page doesn't surface a
-  visible date.
-- If the page fails to load, blocks WebFetch, or genuinely has no postings,
-  return {{"jobs": []}}.
-
-Output MUST be parseable by json.loads(). Do not include any text before or
-after the JSON object.
-""".strip()
+    Returns ``[]`` when the chrome tier is disabled (the default) — so this
+    path is a no-op unless an operator opts in. Never raises.
+    """
+    dicts = fetch_listings_via_chrome(
+        url=SEARCH_URL,
+        instruction=(
+            "every current UN job opening, newest first: title, department, "
+            "duty station, posting URL"
+        ),
+        max_items=cap,
+    )
+    out: list[Job] = []
+    for r in dicts:
+        url = (r.get("url") or "").strip()
+        if not url:
+            continue
+        out.append(Job(
+            source="un_careers",
+            external_id=url,
+            title=fix_mojibake(str(r.get("title") or ""))[:140],
+            company=fix_mojibake(str(r.get("company") or "United Nations"))[:80],
+            location=fix_mojibake(str(r.get("location") or ""))[:80],
+            url=url,
+            posted_at=str(r.get("posted_at") or ""),
+            snippet=fix_mojibake(str(r.get("snippet") or ""))[:400],
+        ))
+        if len(out) >= cap:
+            break
+    return out
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-def fetch(filters: dict) -> list[Job]:
-    """Aggregate UN Careers postings via the Claude CLI delegation pattern.
+def fetch(filters: dict, *, db=None) -> list[Job]:
+    """Aggregate UN Careers postings via the public JSON API.
 
     Parameters mirrored from filters.yaml:
-      * ``max_per_source`` — hard cap on returned jobs (default 10).
-      * ``ai_scrape_timeout_s`` — subprocess timeout for the CLI invocation
-        (default 180s; UN portals can be slow under load).
+      * ``max_per_source`` — hard cap on returned jobs (default 36).
+      * ``ai_scrape_timeout_s`` — per-request HTTP timeout (default 30s).
 
-    Returns a (possibly empty) list of ``Job`` instances. Never raises:
-    every failure path logs and returns ``[]`` so the orchestrator can move
-    on to the next source.
+    Primary path: paginate the public ``filteredV2`` API (newest first).
+    Fallback: if the API raises OR yields zero jobs, ask the shared
+    chrome-agent helper to drive the operator's desktop Chrome. With the
+    ``chrome_agent_fallback_enabled`` flag OFF (the default) that helper
+    returns ``[]``, so this adapter is effectively API-only.
+
+    ``db`` (Tier 4): when supplied, records one ``search_fetches`` row per
+    fetch (single fixed cell query="un_careers", page=1, location="") so the
+    adaptive source-cooldown FSM gets a novelty signal. Best-effort: a DB
+    hiccup never breaks the fetch. When ``db`` is None we skip recording.
+
+    Returns a (possibly empty) list of ``Job``. Never raises: every failure
+    path logs and returns ``[]`` so the orchestrator moves on.
     """
-    timeout_s = int(filters.get("ai_scrape_timeout_s") or 180)
-    cap = int(filters.get("max_per_source") or 10)
+    timeout_s = float(filters.get("ai_scrape_timeout_s") or 30)
+    cap = int(filters.get("max_per_source") or 36)
 
     with _step(
         "un_careers.fetch",
-        input={"cap": cap, "timeout_s": timeout_s, "url": LANDING},
+        input={"cap": cap, "timeout_s": timeout_s, "url": API_URL},
     ) as fctx:
-        prompt = _PROMPT.format(url=LANDING)
-        try:
-            stdout = _run_claude(prompt, timeout_s=timeout_s)
-        except Exception as e:
-            log.exception("un_careers: CLI invocation failed: %s", e)
-            fctx.set_output({"raw_count": 0, "kept": 0, "reason": "cli_exception"})
-            return []
-
-        if stdout is None:
-            log.warning("un_careers: claude CLI missing or returned None")
-            fctx.set_output({"raw_count": 0, "kept": 0, "reason": "cli_missing_or_none"})
-            return []
-        if not stdout.strip():
-            log.warning("un_careers: claude CLI returned empty stdout")
-            fctx.set_output({"raw_count": 0, "kept": 0, "reason": "cli_empty"})
-            return []
-
-        body = extract_assistant_text(stdout)
-        data = parse_json_block(body)
-
-        if not isinstance(data, dict):
-            log.warning("un_careers: response was not a JSON object; head=%r", (body or "")[:300])
-            fctx.set_output({
-                "raw_count": 0,
-                "kept": 0,
-                "reason": "non_object_response",
-                "body_head": (body or "")[:300],
-            })
-            return []
-
-        raw = data.get("jobs") or []
-        if not isinstance(raw, list):
-            log.warning("un_careers: 'jobs' field was not a list (%s)", type(raw).__name__)
-            fctx.set_output({
-                "raw_count": 0,
-                "kept": 0,
-                "reason": "jobs_not_list",
-                "body_head": (body or "")[:300],
-            })
-            return []
-
-        log.info("un_careers (AI): %d raw postings", len(raw))
-
         out: list[Job] = []
-        for r in raw[:cap]:
-            if not isinstance(r, dict):
-                continue
-            url = (r.get("url") or "").strip()
-            if not url:
-                # No URL means we can't dedupe / link the user anywhere.
-                continue
-            out.append(Job(
-                source="un_careers",
-                external_id=url,
-                title=fix_mojibake(str(r.get("title") or ""))[:140],
-                company=fix_mojibake(str(r.get("company") or "United Nations"))[:80],
-                location=fix_mojibake(str(r.get("location") or ""))[:80],
-                url=url,
-                posted_at=str(r.get("posted_at") or ""),
-                snippet=fix_mojibake(str(r.get("snippet") or ""))[:400],
-            ))
+        path = "api"
+        try:
+            out = _fetch_via_api(cap, timeout_s=timeout_s)
+        except Exception as e:
+            log.warning("un_careers: API path failed (%s); trying chrome fallback", e)
+            out = []
+
+        if not out:
+            # API raised or returned zero — try the operator-Chrome tier. This
+            # is a no-op ([]) unless chrome_agent_fallback_enabled is True.
+            path = "chrome"
+            try:
+                out = _fetch_via_chrome(cap)
+            except Exception:
+                log.debug("un_careers: chrome fallback raised; continuing", exc_info=True)
+                out = []
+
+        log.info("un_careers (%s): %d postings", path, len(out))
+
+        # Tier 4: feed the adaptive source-cooldown FSM. jobs_new counts how
+        # many of THIS fetch's postings are not yet in the `jobs` table, keyed
+        # on the real Job.job_id (sha1 of source+external_id). Recorded before
+        # the downstream upsert. Best-effort: a DB error never breaks the fetch.
+        if db is not None:
+            try:
+                seen_ids = [j.job_id for j in out]
+                existing = db.count_existing_jobs(seen_ids) if seen_ids else 0
+                db.record_fetch(
+                    "un_careers", "un_careers", 1, "",
+                    jobs_seen=len(seen_ids),
+                    jobs_new=max(0, len(seen_ids) - existing),
+                )
+            except Exception:
+                log.debug("un_careers: db.record_fetch raised; continuing",
+                          exc_info=True)
 
         fctx.set_output({
-            "raw_count": len(raw),
+            "path": path,
             "kept": len(out),
             "sample_titles": [j.title[:80] for j in out[:5]],
-            # Only keep the body head when we got nothing — for diagnostics.
-            "body_head": (body or "")[:300] if not out else None,
         })
         return out

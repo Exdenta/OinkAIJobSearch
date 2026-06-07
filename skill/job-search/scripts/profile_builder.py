@@ -101,8 +101,14 @@ _MAX_LINKEDIN_QUERIES = 10
 _MAX_SEED_PHRASES = 12
 
 # Location of the external prompt files.
-#   profile_builder.txt — v3 schema (full structured profile, legacy mode)
-#   profile_seeds.txt   — v4 schema (search seeds only — algorithm v2)
+#   profile_builder.txt — v3 schema (full structured profile). THE LIVE
+#       PROMPT: rendered by build_profile_sync, which is the production
+#       default for ProfileBuilderQueue and rebuild_profile. Carries the
+#       language-awareness rules (18a / 21 / 22) for native-language queries.
+#   profile_seeds.txt   — v4 schema (search seeds only — algorithm v2).
+#       NOT PRESENT ON DISK. build_search_seeds_sync renders it; selecting
+#       that builder without first creating the template short-circuits every
+#       build to status='exception'. Kept for a future seeds-only rollout.
 _PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "profile_builder.txt"
 _SEEDS_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "profile_seeds.txt"
 
@@ -775,10 +781,16 @@ class ProfileBuilderQueue:
         debounce_s: float = DEFAULT_DEBOUNCE_S,
         timeout_s: int = DEFAULT_TIMEOUT_S,
         model: str = DEFAULT_MODEL,
-        # Algorithm v2: queue defaults to seeds-only builder. Operators
-        # can swap back to the structured profile builder by passing
-        # `sync_builder=build_profile_sync`. Tests still inject mocks here.
-        sync_builder: Callable = build_search_seeds_sync,
+        # Production default = `build_profile_sync`, which renders
+        # `prompts/profile_builder.txt` (the v3 structured-profile prompt that
+        # carries the language-awareness rules 18a/21/22). The seeds-only
+        # `build_search_seeds_sync` renders `prompts/profile_seeds.txt`, which
+        # has never existed on disk — selecting it short-circuits every rebuild
+        # to status='exception' (seeds prompt template missing) and the
+        # language-aware prompt never runs. Operators can still opt into the
+        # seeds-only builder explicitly via `sync_builder=build_search_seeds_sync`
+        # once a profile_seeds.txt template exists. Tests inject mocks here.
+        sync_builder: Callable = build_profile_sync,
         on_done: Callable[[int, BuildResult], None] | None = None,
     ) -> None:
         self.db = db
@@ -1048,7 +1060,11 @@ def rebuild_profile(
     db: Any,
     chat_id: int,
     *,
-    sync_builder: Callable = build_search_seeds_sync,
+    # Default = `build_profile_sync` (renders the language-aware
+    # prompts/profile_builder.txt). `build_search_seeds_sync` renders the
+    # absent prompts/profile_seeds.txt and would short-circuit every
+    # auto-rebuild to an exception — see ProfileBuilderQueue.__init__ note.
+    sync_builder: Callable = build_profile_sync,
     timeout_s: int = DEFAULT_TIMEOUT_S,
     model: str = DEFAULT_MODEL,
 ) -> BuildResult:

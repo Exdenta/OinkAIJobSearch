@@ -271,7 +271,93 @@ DERIVATION RULES
 17. `drop_if_salary_unknown` — TRUE only if user_description explicitly
     says "must list salary" or similar.
 
-18. `language` — working language if named. Empty string otherwise.
+18. `language` — primary working language if named. Empty string otherwise.
+
+18a. WORKING-LANGUAGE DETECTION (drives native-language query variants in
+    rules 21 and 22). Do this analysis BEFORE writing any search seeds:
+
+    STEP 1 — parse the candidate's languages + proficiency. Scan BOTH the
+    resume and the user_description for language proficiency signals:
+      - CEFR levels: A1, A2, B1, B2, C1, C2 (e.g. "Spanish C2", "English C1",
+        "español: nativo", "inglés B2").
+      - Plain-English/native words: "native", "fluent", "mother tongue",
+        "bilingual", "working proficiency", "conversational", "basic",
+        and their equivalents in any language ("nativo", "fluido", "courant",
+        "muttersprache", etc.).
+      - Map fuzzy words to CEFR-equivalent: native/mother-tongue/bilingual
+        ≈ C2; fluent/full-professional ≈ C1; working/professional ≈ B2;
+        conversational/intermediate ≈ B1; basic/elementary ≈ A1-A2.
+
+    STEP 2 — decide which languages the candidate can ACTUALLY WORK IN. A
+    language is WORKABLE only if the candidate is at roughly B2 or higher
+    in it. A1/A2/basic/conversational do NOT count — the candidate cannot
+    hold a role that requires that language, and the downstream scorer
+    penalizes such mismatches anyway, so native-language queries in a
+    language they don't have would only surface jobs they'd be rejected
+    for. English is workable for essentially every candidate in this
+    pipeline (assume >= B2 unless the resume clearly says otherwise).
+
+    STEP 3 — infer the DOMINANT working language(s) of each target market
+    (the geos you will use in rule 21, derived from onsite_locations /
+    remote_regions / home country). Use your own knowledge of which
+    language postings are written in for that market. A non-exhaustive
+    illustration of the kind of inference expected (NOT a closed list —
+    apply the same reasoning to any country): Spain → Spanish; France →
+    French; Germany/Austria → German; Italy → Italian; Portugal/Brazil →
+    Portuguese; most of LATAM → Spanish; Netherlands/Nordics → roles are
+    very often posted in English; pan-EU / "European Union" geo and remote
+    roles → English. English is dominant-enough everywhere to always keep.
+
+    STEP 4 — the set of EMIT LANGUAGES for native-language query/seed
+    variants = { English }
+       ∪ { every WORKABLE language (step 2) that is ALSO dominant in at
+           least one target market (step 3) }            ← GEO-DOMINANT branch
+       ∪ { every WORKABLE language (step 2) that the candidate's resume
+           or user_description EXPLICITLY names as a desired working
+           language / environment / community }          ← PREFERRED-COMMUNITY branch
+
+    The PREFERRED-COMMUNITY branch is the key extension: a candidate may be
+    fluent (>= B2 / native) in a language whose relevant jobs are a REMOTE,
+    relocated, or remote-first COMMUNITY rather than a geographic market — so
+    the language is NOT geo-dominant anywhere in their target markets, yet
+    they explicitly want to work in it. Emit it. "Explicitly names" means the
+    candidate said something like "open to roles in <language>", "happy in
+    <language>-speaking environments / teams", "I want to work in <language>",
+    or listed it as a working/preferred language for roles — NOT merely that
+    they happen to speak it. Mere proficiency without an expressed desire does
+    NOT trigger this branch (that path is the GEO-DOMINANT branch only).
+
+    TRIGGER DISCIPLINE (do not over-fire):
+      - A WORKABLE language that is NEITHER geo-dominant in a target market
+        NOR explicitly named as desired → STILL DROPPED.
+      - A sub-B2 language → STILL DROPPED even if explicitly named (they
+        cannot actually hold the role; see step 2).
+
+    Worked examples:
+      - Spanish-C2 candidate targeting Spain / EU → emit BOTH English AND
+        Spanish variants (GEO-DOMINANT: Spanish dominates Spain).
+      - Spanish-A2 candidate targeting Spain → English only (A2 is below
+        B2; drop Spanish entirely — neither branch can rescue a sub-B2
+        language).
+      - French-C1 candidate who is only targeting the UK / US, prefs say
+        nothing about wanting French → English only (French is workable but
+        neither dominant in those markets NOR explicitly desired). If that
+        SAME candidate's prefs said "open to French-speaking remote teams",
+        French WOULD be emitted via the PREFERRED-COMMUNITY branch, paired
+        with their remote geo (NOT France) — see rule 21.
+      - Russian-NATIVE candidate, target market = Spain + EU-remote (e.g.
+        Bilbao-based), prefs say "...in English- or Russian-speaking
+        environments" → emit BOTH English AND Russian variants. Russian is
+        NOT dominant in Spain/EU (GEO-DOMINANT branch would drop it) but is
+        explicitly named (PREFERRED-COMMUNITY branch keeps it). Per rule 21
+        the Russian `q` values are paired with the candidate's REMOTE geo
+        ("European Union" / their remote_regions), NEVER "Russia" — the
+        candidate wants REMOTE work, not relocation to the language's home
+        country.
+    Record the chosen language string in field 18 (`language`) as the
+    candidate's strongest working language relevant to their markets. A
+    PREFERRED-COMMUNITY language may be recorded here when it is the
+    candidate's strongest expressed working language.
 
 19. `max_age_hours` — if user_description says a recency window, convert
     ("last week" = 168, "last 3 days" = 72, "this week" = 168). Else 0.
@@ -291,6 +377,43 @@ DERIVATION RULES
     stack, niche role family), emit fewer rather than padding with
     weak queries — a 6-query profile of tight queries beats a 12-query
     profile half of which are stretch matches.
+
+    LANGUAGE DISTRIBUTION (apply rule 18a FIRST). If the EMIT LANGUAGES
+    set from rule 18a step 4 contains a non-English language, you MUST
+    spend part of the query budget on NATIVE-LANGUAGE variants written in
+    that language, paired with the geo where that language dominates:
+      - Translate the role NOUNS and stack/specialty terms into the native
+        language using IDIOMATIC job-title phrasing recruiters in that
+        market actually write — NOT a word-for-word gloss. Example
+        (Spanish): "investigador/a de migraciones", "técnico/a de
+        proyectos", "responsable de programa", "analista de políticas".
+        Example (German): "wissenschaftliche/r mitarbeiter/in",
+        "projektkoordinator/in". Keep stack tokens (react, python, vue) as
+        they appear in the native market — these usually stay English.
+      - GEO PAIRING depends on WHY the language was emitted (rule 18a step 4):
+          * GEO-DOMINANT language (dominant in a target market): pair each
+            native-language `q` with the geo whose dominant language it
+            matches (Spanish q → "Spain"; German q → "Germany"/"Austria";
+            French q → "France"). Do NOT pair such a q with the "European
+            Union" / pan-EU geo or a remote-global geo — those skew English;
+            use the country geo so the native query lands on the country page.
+          * PREFERRED-COMMUNITY language (workable + explicitly desired, but
+            NOT geo-dominant in any target market): pair each native-language
+            `q` with the candidate's REMOTE geo(s) — "European Union" or their
+            remote_regions — NEVER the language's HOME COUNTRY. The candidate
+            wants REMOTE / remote-first / relocated-community work in that
+            language, not relocation to where it is spoken onsite. Example:
+            Russian-native, Bilbao-based, EU-remote target, prefs name
+            "Russian-speaking environments" → emit idiomatic Russian role
+            queries paired with geo "European Union" (or their remote_regions),
+            NEVER "Russia". Sending a Bilbao-based candidate Russia-onsite
+            roles would be wrong — they explicitly want remote.
+      - Rough split when one extra language is in play: keep ~60% of the
+        budget English (covers pan-EU + remote + home-country English
+        postings) and spend ~40% on native-language country-specific
+        variants. Stay within the 8-12 target and the hard cap of 10.
+      - English-only candidates (rule 18a yields { English }) — ignore
+        this block entirely; emit English queries exactly as before.
 
     DIVERSIFICATION RECIPE — fill the 8-12 slots with this mix:
 
@@ -390,6 +513,45 @@ DERIVATION RULES
             {{"q":"researcher peace conflict remote","geo":"European Union","f_TPR":"r86400"}}
           ]
 
+      - Research/academic, SPANISH-C2 candidate targeting Spain + EU
+        (rule 18a → EMIT LANGUAGES = {{English, Spanish}}; ~60% English
+        on EU/remote geos, ~40% Spanish on the Spain geo):
+          [
+            {{"q":"investigador migraciones","geo":"Spain","f_TPR":"r86400"}},
+            {{"q":"técnico de proyectos cooperación","geo":"Spain","f_TPR":"r86400"}},
+            {{"q":"analista de políticas migración","geo":"Spain","f_TPR":"r86400"}},
+            {{"q":"researcher migration","geo":"European Union","f_TPR":"r86400"}},
+            {{"q":"research officer migration","geo":"European Union","f_TPR":"r86400"}},
+            {{"q":"policy analyst peace conflict","geo":"European Union","f_TPR":"r86400"}},
+            {{"q":"programme officer migration","geo":"Belgium","f_TPR":"r86400"}},
+            {{"q":"M&E specialist humanitarian","geo":"European Union","f_TPR":"r86400"}},
+            {{"q":"researcher migration remote","geo":"European Union","f_TPR":"r86400"}}
+          ]
+        Note: Spanish-language `q` values are paired ONLY with "Spain";
+        English `q` values carry the pan-EU / remote geos.
+
+      - Frontend dev, RUSSIAN-NATIVE, Bilbao-based, target = Spain + EU-remote,
+        prefs say "...in English- or Russian-speaking environments"
+        (rule 18a → EMIT LANGUAGES = {{English, Russian}} via the
+        PREFERRED-COMMUNITY branch: Russian is workable + explicitly desired
+        but NOT geo-dominant in Spain/EU; Spanish is NOT named and — if only
+        A2 — stays dropped). Russian `q` values are paired with the REMOTE geo
+        "European Union", NEVER "Russia":
+          [
+            {{"q":"frontend developer react","geo":"European Union","f_TPR":"r86400"}},
+            {{"q":"react engineer","geo":"European Union","f_TPR":"r86400"}},
+            {{"q":"vue developer remote","geo":"European Union","f_TPR":"r86400"}},
+            {{"q":"typescript frontend","geo":"Spain","f_TPR":"r86400"}},
+            {{"q":"фронтенд разработчик react","geo":"European Union","f_TPR":"r86400"}},
+            {{"q":"фронтенд разработчик удалённо","geo":"European Union","f_TPR":"r86400"}},
+            {{"q":"react разработчик","geo":"European Union","f_TPR":"r86400"}}
+          ]
+        Note: the Russian `q` values carry geo "European Union" (the remote
+        target), NEVER "Russia" — a Bilbao-based candidate who wants remote
+        work must not be sent Russia-onsite roles. Contrast with the Spanish
+        example above, where Spanish IS geo-dominant so its `q` pairs with the
+        country geo "Spain".
+
       - NGO/policy/development — operational role + thematic + geo:
           [
             {{"q":"programme officer migration","geo":"Belgium","f_TPR":"r86400"}},
@@ -408,15 +570,30 @@ DERIVATION RULES
     only get the new 8-12 set the next time `/rebuildprofile` (or
     resume-upload / prefs-change) triggers a rebuild.
 
-22. `search_seeds.web_search.seed_phrases` — 5-8 items. Each is a short
+22. `search_seeds.web_search.seed_phrases` — 8-12 items. Each is a short
     search-engine query (lowercase, no boolean operators needed; the
-    WebSearch agent handles those). Mix:
-      - 2 generic: "<role variant> <top stack/specialty> <region or remote>"
-      - 2 specialty variations widening the role NAME (use synonyms a
+    WebSearch agent handles those). The web_search agent forms up to 6
+    searches per run from this pool, so a wider pool (8-12) gives it more
+    angles to pick the freshest from. Mix:
+      - 3 generic: "<role variant> <top stack/specialty> <region or remote>"
+      - 3 specialty variations widening the role NAME (use synonyms a
         recruiter would use — see role-family table in rule 7)
-      - 2-4 `site:<ats>` targeted — use ATS domains from the allowlist
+      - 3-5 `site:<ats>` targeted — use ATS domains from the allowlist
         AND that are actually popular in the candidate's region (e.g.
         personio.de for Germany/EU, greenhouse.io/lever.co for US + EU).
+
+    NATIVE-LANGUAGE SEEDS (apply rule 18a). If EMIT LANGUAGES contains a
+    non-English language, replace 1-2 of the generic/specialty slots above
+    with native-language phrases using idiomatic job-title wording for that
+    market (e.g. Spanish: "investigador migraciones españa", "técnico de
+    proyectos ong"; German: "wissenschaftlicher mitarbeiter migration").
+    Mirror rule 21's geo logic in the phrase REGION token: a GEO-DOMINANT
+    language anchors on its country ("...españa"); a PREFERRED-COMMUNITY
+    language (workable + explicitly desired, not geo-dominant) anchors on
+    REMOTE / the candidate's remote region, NEVER the language's home country
+    (e.g. Russian preferred-community → "...remote eu" / "...remoto", NOT
+    "...россия"/"...russia"). Stay within the 12-phrase cap. English-only
+    candidates skip this.
 
     Tech example (Vue frontend mid, Bilbao):
       [
@@ -679,6 +856,79 @@ Output:
     }}
   }},
   "free_text": "Mid-level researcher in NGO, academic, or policy contexts. Migration, peace, conflict, sustainability themes. Open to programme officer, field officer, M&E, postdoc, lecturer, consultant titles. EU/EMEA, remote OK. Prefer English-language roles."
+}}
+
+Example D — qualitative researcher mid, Bilbao, NATIVE SPANISH (language-aware):
+
+Input resume mentions: 5 years, MA Anthropology, fieldwork on migration and
+qualitative research at Spanish universities and an NGO. Bilbao-based.
+Languages: "Español: nativo (C2). English: C1. Français: A2." User
+description: "Investigadora / técnica de proyectos en ONG, universidad o
+sector público. Migración, cooperación, derechos humanos. España, remoto en
+la UE también. Abierta a roles en español o inglés."
+
+Note rule 18a: Spanish ≈ C2 → workable AND dominant in Spain (a target
+market) → emit Spanish variants (GEO-DOMINANT branch). English C1 →
+workable, always emit. French A2 → below B2 → DROP, no French queries
+(sub-B2 stays dropped even if it were named). Here no language is emitted
+via the PREFERRED-COMMUNITY branch (Spanish already qualifies geographically;
+nothing else workable is explicitly desired). EMIT LANGUAGES =
+{{English, Spanish}}.
+
+Output:
+{{
+  "schema_version": 3,
+  "ideal_fit_paragraph": "Mid-level qualitative researcher role in an NGO, university, or public-sector organisation working on migration, cooperation, and human-rights themes. Open to investigador, técnico de proyectos, programme officer, and M&E titles in Spain or EU-timezone remote, working in Spanish or English.",
+  "primary_role": "qualitative researcher",
+  "target_levels": ["mid", "middle"],
+  "years_experience": 5,
+  "stack_primary": ["qualitative research", "ethnography", "interviews", "fieldwork", "migration studies", "mixed methods"],
+  "stack_secondary": ["participatory research", "policy analysis", "monitoring and evaluation", "needs assessment", "academic writing"],
+  "stack_adjacent": ["report writing", "stakeholder engagement", "focus groups", "thematic analysis"],
+  "stack_antipatterns": ["quantitative finance", "ux research", "user research", "market research"],
+  "title_must_match": ["researcher", "research", "research officer", "research analyst", "policy analyst", "programme officer", "project officer", "field officer", "consultant", "m&e specialist", "investigador", "investigadora", "técnico de proyectos", "responsable de programa", "analista"],
+  "title_exclude": ["director", "head", "vp", "chief", "ux researcher", "user researcher", "market researcher", "quantitative researcher", "quant", "data engineer", "software engineer", "developer", "sales", "marketing"],
+  "exclude_keywords": ["quantitative finance", "market research", "ux research", "user research", "bootcamp", "unpaid"],
+  "exclude_companies": [],
+  "onsite_locations": ["bilbao", "basque", "euskadi"],
+  "remote_regions": ["spain", "europe", "eu", "emea"],
+  "locations": ["bilbao", "basque", "euskadi", "spain", "europe", "eu", "emea"],
+  "remote": "any",
+  "time_zone_band": "UTC-1..UTC+3",
+  "salary_min_usd": 0,
+  "drop_if_salary_unknown": false,
+  "language": "spanish",
+  "max_age_hours": 0,
+  "min_match_score": 1,
+  "search_seeds": {{
+    "linkedin": {{
+      "queries": [
+        {{"q": "investigador migraciones", "geo": "Spain", "f_TPR": "r86400"}},
+        {{"q": "técnico de proyectos cooperación", "geo": "Spain", "f_TPR": "r86400"}},
+        {{"q": "analista de políticas migración", "geo": "Spain", "f_TPR": "r86400"}},
+        {{"q": "responsable de programa ong", "geo": "Spain", "f_TPR": "r86400"}},
+        {{"q": "researcher migration", "geo": "European Union", "f_TPR": "r86400"}},
+        {{"q": "research officer migration", "geo": "European Union", "f_TPR": "r86400"}},
+        {{"q": "policy analyst migration", "geo": "European Union", "f_TPR": "r86400"}},
+        {{"q": "programme officer migration", "geo": "Belgium", "f_TPR": "r86400"}},
+        {{"q": "researcher migration remote", "geo": "European Union", "f_TPR": "r86400"}}
+      ]
+    }},
+    "web_search": {{
+      "seed_phrases": [
+        "investigador migraciones españa",
+        "técnico de proyectos ong cooperación",
+        "qualitative researcher migration europe",
+        "research officer migration ngo eu",
+        "policy analyst migration remote europe",
+        "site:workable.com research officer migration",
+        "site:teamtailor.com programme officer ngo europe"
+      ],
+      "ats_domains": ["greenhouse.io", "lever.co", "workable.com", "teamtailor.com", "smartrecruiters.com"],
+      "focus_notes": "Prefer NGO, university, and public-sector research roles in Spain and EU-timezone remote, touching migration, cooperation, or human rights. Spanish-language and English-language postings both welcome. De-prioritize UX/user/market research and quantitative finance."
+    }}
+  }},
+  "free_text": "Investigadora / técnica de proyectos en ONG, universidad o sector público. Migración, cooperación, derechos humanos. España, remoto en la UE también. Abierta a roles en español o inglés."
 }}
 
 END OF INSTRUCTIONS. Produce the JSON output now.

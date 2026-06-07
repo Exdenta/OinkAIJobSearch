@@ -103,6 +103,97 @@ def _safe_result_chars(stdout: str | None) -> int:
     return len(result_text or "")
 
 
+def _safe_usage_from_envelope(stdout: str | None) -> dict[str, Any]:
+    """Pull the real usage/cost numbers out of the CLI's JSON envelope.
+
+    `claude -p --output-format json` returns the TRUTH alongside the
+    `result` text:
+
+        {"result": "...",
+         "total_cost_usd": 0.0123,
+         "num_turns": 1,
+         "usage": {"input_tokens": 1200, "output_tokens": 340,
+                   "cache_creation_input_tokens": 0,
+                   "cache_read_input_tokens": 980}}
+
+    We turn that into the kwargs `record_claude_call` expects. Every field
+    is optional and defaults to None — the wrappers' `--output-format json`
+    default means the envelope is normally present, but a caller that asked
+    for `--output-format text`, an older CLI, or a corrupt line must
+    degrade to None (the surrogate then remains the only cost signal).
+
+    `total_cost_usd` is dollars → converted to int micro-USD to match the
+    `cost_estimate_us` unit. Token counts pass through as ints. Anything
+    non-numeric / missing → None, never an exception. Telemetry is never
+    load-bearing for the user-facing call.
+
+    Returns a dict with keys:
+        cost_actual_us, input_tokens, output_tokens,
+        cache_read_tokens, cache_creation_tokens, num_turns
+    """
+    out: dict[str, Any] = {
+        "cost_actual_us": None,
+        "input_tokens": None,
+        "output_tokens": None,
+        "cache_read_tokens": None,
+        "cache_creation_tokens": None,
+        "num_turns": None,
+    }
+    if not stdout:
+        return out
+    try:
+        import json
+
+        s = stdout.strip()
+        if not s or s[0] not in "{[":
+            # Not a JSON envelope (e.g. --output-format text). No usage to
+            # lift; skip the parse entirely.
+            return out
+        envelope = json.loads(s)
+        if not isinstance(envelope, dict):
+            return out
+
+        def _opt_int(v: Any) -> int | None:
+            # Accept int / float / numeric-str; reject bool (a stray True
+            # would otherwise coerce to 1) and anything non-numeric.
+            if v is None or isinstance(v, bool):
+                return None
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return None
+
+        cost_usd = envelope.get("total_cost_usd")
+        if isinstance(cost_usd, (int, float)) and not isinstance(cost_usd, bool):
+            # dollars → micro-USD (same unit as cost_estimate_us).
+            out["cost_actual_us"] = int(round(float(cost_usd) * 1_000_000))
+
+        out["num_turns"] = _opt_int(envelope.get("num_turns"))
+
+        usage = envelope.get("usage")
+        if isinstance(usage, dict):
+            out["input_tokens"] = _opt_int(usage.get("input_tokens"))
+            out["output_tokens"] = _opt_int(usage.get("output_tokens"))
+            # The CLI names the cache fields *_input_tokens; we store them
+            # under the shorter column names.
+            out["cache_read_tokens"] = _opt_int(
+                usage.get("cache_read_input_tokens")
+            )
+            out["cache_creation_tokens"] = _opt_int(
+                usage.get("cache_creation_input_tokens")
+            )
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception(
+            "wrappers: failed to parse usage/cost from envelope — "
+            "recording surrogate only",
+        )
+        # Reset to all-None so a half-parsed envelope never persists a
+        # mix of real and bogus numbers.
+        return {k: None for k in out}
+    return out
+
+
 def _infer_status(stdout: str | None, output_chars: int, result_chars: int) -> str:
     """Bucket a Claude CLI invocation into a status enum.
 
@@ -211,6 +302,10 @@ def wrapped_run_p(
     output_chars = len(stdout or "")
     result_chars = _safe_result_chars(stdout)
     status = _infer_status(stdout, output_chars, result_chars)
+    # Real token counts + actual cost from the CLI envelope when present;
+    # all-None on a text/empty/corrupt envelope (surrogate stays the
+    # fallback). Never raises.
+    usage = _safe_usage_from_envelope(stdout)
 
     resolved = _resolve_store(store)
     if resolved is not None:
@@ -228,6 +323,7 @@ def wrapped_run_p(
                 status=status,
                 started_at=started_at,
                 finished_at=finished_at,
+                **usage,
             )
         except Exception:
             import logging
@@ -269,6 +365,7 @@ def wrapped_run_p_with_tools(
     output_chars = len(stdout or "")
     result_chars = _safe_result_chars(stdout)
     status = _infer_status(stdout, output_chars, result_chars)
+    usage = _safe_usage_from_envelope(stdout)
 
     resolved = _resolve_store(store)
     if resolved is not None:
@@ -286,6 +383,7 @@ def wrapped_run_p_with_tools(
                 status=status,
                 started_at=started_at,
                 finished_at=finished_at,
+                **usage,
             )
         except Exception:
             import logging

@@ -171,6 +171,152 @@ class MonitorStore:
             )
             return int(cur.lastrowid or 0)
 
+    # ---------- query_runs (M2 per-query funnel telemetry) ----------
+
+    @staticmethod
+    def normalize_query(q: str) -> str:
+        """Canonical key for a query string: lowercased, whitespace-collapsed.
+
+        The same seed phrasing ("React Developer" vs "react  developer")
+        must roll up to ONE reward bucket across runs, otherwise the
+        optimiser sees two half-strength arms instead of one. This is a
+        transport-layer normalisation (closed-set facts about casing /
+        spacing), NOT a fit heuristic — it never decides whether a query
+        is good, only that two spellings are the SAME query.
+        """
+        return " ".join(str(q or "").split()).lower()
+
+    def record_query_run(
+        self,
+        chat_id: int,
+        source_key: str,
+        query: str,
+        *,
+        pipeline_run_id: Optional[int] = None,
+        fetched: int = 0,
+        scored: int = 0,
+        matched_ge4: int = 0,
+        queued: int = 0,
+        sent: int = 0,
+        started_at: float,
+        finished_at: float,
+    ) -> int:
+        """Append one per-query funnel row. Returns the new row id.
+
+        `query` is stored both normalised (for roll-up) and raw (for
+        display). All five funnel counters default to 0 so a caller that
+        only knows the fetched count can still record an attribution row
+        (the rest are backfilled on the same run via a single insert with
+        the full funnel — see search_jobs' run-end roll-up).
+        """
+        norm = self.normalize_query(query)
+        with self._db._conn() as c:
+            cur = c.execute(
+                """
+                INSERT INTO query_runs
+                  (pipeline_run_id, chat_id, source_key, query, query_raw,
+                   fetched, scored, matched_ge4, queued, sent,
+                   started_at, finished_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    pipeline_run_id, int(chat_id), source_key, norm,
+                    (query or "")[:300],
+                    int(fetched), int(scored), int(matched_ge4),
+                    int(queued), int(sent),
+                    float(started_at), float(finished_at),
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    def query_yield_window(
+        self,
+        chat_id: int,
+        *,
+        since_ts: float,
+        half_life_s: float = 7 * 86400.0,
+        now: Optional[float] = None,
+    ) -> list[dict]:
+        """Per-query reward aggregation over a recent, time-decayed window.
+
+        Reward = the funnel counts summed across every `query_runs` row for
+        this user with `finished_at >= since_ts`, where each row is weighted
+        by an EXPONENTIAL DECAY on its age: ``weight = 0.5 ** (age / half_life)``.
+        A run from one half-life ago counts half as much as a run from now,
+        so a query that was productive last month but dead this week sinks
+        in the ranking without ever being hard-cut.
+
+        Returns one dict PER (source_key, normalised query), sorted by the
+        decayed `sent` then `matched_ge4` then `scored` descending (the
+        productivity order the optimiser reads):
+
+            [
+              {source_key, query, query_raw, runs,
+               fetched, scored, matched_ge4, queued, sent,   # decayed floats
+               raw_sent, raw_matched_ge4, raw_scored,        # undecayed ints
+               last_finished_at},
+              ...
+            ]
+
+        The decayed counters are floats (a sum of weighted integers); the
+        `raw_*` mirrors are the plain integer sums so the optimiser prompt
+        can show "0 sent over N runs" cold-start signal honestly. `runs` is
+        the undecayed row count for this query.
+        """
+        if now is None:
+            now = time.time()
+        hl = float(half_life_s) if half_life_s and half_life_s > 0 else 0.0
+        with self._db._conn() as c:
+            rows = list(c.execute(
+                """
+                SELECT source_key, query, query_raw,
+                       fetched, scored, matched_ge4, queued, sent,
+                       finished_at
+                FROM query_runs
+                WHERE chat_id = ? AND finished_at >= ?
+                """,
+                (int(chat_id), float(since_ts)),
+            ))
+
+        # Bucket by (source_key, normalised query) and accumulate both the
+        # decayed (float) and raw (int) funnel sums.
+        agg: dict[Tuple[str, str], dict] = {}
+        for r in rows:
+            key = (r["source_key"], r["query"])
+            slot = agg.get(key)
+            if slot is None:
+                slot = {
+                    "source_key": r["source_key"],
+                    "query": r["query"],
+                    "query_raw": r["query_raw"] or r["query"],
+                    "runs": 0,
+                    "fetched": 0.0, "scored": 0.0, "matched_ge4": 0.0,
+                    "queued": 0.0, "sent": 0.0,
+                    "raw_sent": 0, "raw_matched_ge4": 0, "raw_scored": 0,
+                    "raw_fetched": 0,
+                    "last_finished_at": 0.0,
+                }
+                agg[key] = slot
+            age = max(0.0, float(now) - float(r["finished_at"] or now))
+            weight = (0.5 ** (age / hl)) if hl > 0 else 1.0
+            slot["runs"] += 1
+            for col in ("fetched", "scored", "matched_ge4", "queued", "sent"):
+                slot[col] += weight * int(r[col] or 0)
+            slot["raw_fetched"] += int(r["fetched"] or 0)
+            slot["raw_scored"] += int(r["scored"] or 0)
+            slot["raw_matched_ge4"] += int(r["matched_ge4"] or 0)
+            slot["raw_sent"] += int(r["sent"] or 0)
+            slot["last_finished_at"] = max(
+                slot["last_finished_at"], float(r["finished_at"] or 0.0)
+            )
+
+        out = list(agg.values())
+        out.sort(
+            key=lambda d: (d["sent"], d["matched_ge4"], d["scored"]),
+            reverse=True,
+        )
+        return out
+
     # ---------- claude_calls ----------
 
     def record_claude_call(
@@ -188,11 +334,25 @@ class MonitorStore:
         started_at: float,
         finished_at: float,
         result_chars: int = 0,
+        cost_actual_us: Optional[int] = None,
+        input_tokens: Optional[int] = None,
+        output_tokens: Optional[int] = None,
+        cache_read_tokens: Optional[int] = None,
+        cache_creation_tokens: Optional[int] = None,
+        num_turns: Optional[int] = None,
     ) -> int:
-        """Append a claude_calls row with computed cost surrogate.
+        """Append a claude_calls row with both cost signals.
 
-        Cost is calculated from `model + prompt_chars + output_chars`
-        via `cost.estimate_cost_us` and stored in micro-USD.
+        `cost_estimate_us` is always computed from
+        `model + prompt_chars + output_chars` via `cost.estimate_cost_us`
+        and stored as the char-count SURROGATE fallback (micro-USD).
+
+        When the CLI's `--output-format json` envelope is available, the
+        wrappers pass the TRUE numbers it carries: `cost_actual_us`
+        (from `total_cost_usd`), the token counts (from `usage.*`), and
+        `num_turns`. Any of these left as None stays NULL in the row —
+        older / text-format outputs simply don't carry them. Read paths
+        prefer `cost_actual_us` and COALESCE to the surrogate.
 
         `output_chars` is the wire-level subprocess stdout length (the
         full JSON envelope when `--output-format json` is used).
@@ -204,19 +364,37 @@ class MonitorStore:
         meaning as historical rows pre-migration (no signal available).
         """
         cost_us = estimate_cost_us(model, prompt_chars, output_chars)
+
+        def _opt_int(v: Optional[int]) -> Optional[int]:
+            # Preserve NULL (no envelope signal) while coercing real
+            # numbers to int. A defensive cast — the wrappers already
+            # validate, but a stray float/str must not blow up the INSERT.
+            if v is None:
+                return None
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return None
+
         with self._db._conn() as c:
             cur = c.execute(
                 """
                 INSERT INTO claude_calls
                   (pipeline_run_id, chat_id, caller, model, prompt_chars,
                    output_chars, result_chars, elapsed_ms, exit_code, status,
-                   cost_estimate_us, started_at, finished_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   cost_estimate_us, cost_actual_us, input_tokens, output_tokens,
+                   cache_read_tokens, cache_creation_tokens, num_turns,
+                   started_at, finished_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     pipeline_run_id, chat_id, caller, model,
                     int(prompt_chars), int(output_chars), int(result_chars),
                     int(elapsed_ms), exit_code, status, int(cost_us),
+                    _opt_int(cost_actual_us),
+                    _opt_int(input_tokens), _opt_int(output_tokens),
+                    _opt_int(cache_read_tokens), _opt_int(cache_creation_tokens),
+                    _opt_int(num_turns),
                     float(started_at), float(finished_at),
                 ),
             )
@@ -311,7 +489,9 @@ class MonitorStore:
         Returns:
             {
               'count':         total calls,
-              'cost_us':       summed micro-USD,
+              'cost_us':       summed micro-USD (real cost_actual_us per row
+                               when present, else the cost_estimate_us
+                               surrogate — COALESCE'd per row),
               'prompt_chars':  summed,
               'output_chars':  summed (wire-level subprocess stdout),
               'result_chars':  summed (model's parsed `result` field),
@@ -326,10 +506,14 @@ class MonitorStore:
         model produced none.
         """
         with self._db._conn() as c:
+            # Cost prefers the real per-call number (cost_actual_us, lifted
+            # from the CLI envelope's total_cost_usd) and falls back to the
+            # char-count surrogate (cost_estimate_us) per row, so a window
+            # that mixes enveloped and legacy/text rows sums coherently.
             tot = c.execute(
                 """
                 SELECT COUNT(*) AS n,
-                       COALESCE(SUM(cost_estimate_us), 0) AS cost_us,
+                       COALESCE(SUM(COALESCE(cost_actual_us, cost_estimate_us)), 0) AS cost_us,
                        COALESCE(SUM(prompt_chars), 0)     AS prompt_chars,
                        COALESCE(SUM(output_chars), 0)     AS output_chars,
                        COALESCE(SUM(result_chars), 0)     AS result_chars
@@ -403,11 +587,14 @@ class MonitorStore:
         operators can see per-caller silent-empty rates.
         """
         with self._db._conn() as c:
+            # Per-row COALESCE(actual, surrogate) — same preference order as
+            # claude_call_window_summary so the per-caller breakdown agrees
+            # with the window total.
             rows = c.execute(
                 """
                 SELECT caller,
                        COUNT(*)                            AS n,
-                       COALESCE(SUM(cost_estimate_us), 0)  AS cost_us,
+                       COALESCE(SUM(COALESCE(cost_actual_us, cost_estimate_us)), 0) AS cost_us,
                        COALESCE(SUM(prompt_chars), 0)      AS prompt_chars,
                        COALESCE(SUM(output_chars), 0)      AS output_chars,
                        COALESCE(SUM(result_chars), 0)      AS result_chars,

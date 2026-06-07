@@ -339,7 +339,7 @@ after the JSON object.
 # Public API
 # ---------------------------------------------------------------------------
 
-def fetch(filters: dict) -> list[Job]:
+def fetch(filters: dict, *, db=None) -> list[Job]:
     """Aggregate DevEx postings via the Claude CLI delegation pattern.
 
     Parameters mirrored from filters / defaults:
@@ -350,6 +350,16 @@ def fetch(filters: dict) -> list[Job]:
     Returns a (possibly empty) list of ``Job`` instances. Never raises:
     every failure path logs and returns ``[]`` so the orchestrator can move
     on to the next source.
+
+    ``db`` (Tier 4): when supplied, the adapter records one
+    ``search_fetches`` row per fetch so the adaptive source-cooldown FSM
+    (`search_jobs.should_run_source`) gets a novelty signal for ``devex``.
+    DevEx does not paginate the way LinkedIn/justjoinit do, so we key the
+    row on a single fixed (query="devex", page=1, location="") cell — same
+    shape ``web_search`` uses for its one-cell-per-fetch cursor. Recording
+    is best-effort: a DB hiccup never breaks the fetch (see web_search.py /
+    justjoinit.py for the same guard). When ``db`` is None (dry-run preview)
+    we skip recording entirely.
 
     Caveats (see module docstring for the full picture):
       * DevEx is DataDome-walled; we discover URLs via Google site-search,
@@ -490,6 +500,83 @@ def fetch(filters: dict) -> list[Job]:
                 "",                              # salary (DevEx rarely surfaces this)
             ))
 
+        # Chrome-agent fallback (last resort). The WebSearch/WebFetch
+        # delegation above is the WORKING primary path — when it surfaces
+        # postings we keep them untouched. But DevEx is DataDome-walled, and
+        # on a bad run (the bot wall blocks even Google site-search reliably,
+        # or the snippets carry no recoverable URLs) the primary path returns
+        # ZERO jobs. ONLY in that case do we ask the operator's real desktop
+        # Chrome — already past DataDome with the operator's warmed-up session
+        # — to render https://www.devex.com/jobs/search and extract listings.
+        #
+        # This tier is OFF by default (chrome_agent_fallback_enabled): when
+        # disabled, fetch_listings_via_chrome returns [] immediately with NO
+        # subprocess spawned, so the observable behavior here is IDENTICAL to
+        # today (zero regression). It NEVER raises; any failure → [].
+        if not out:
+            try:
+                from chrome_agent_fetch import fetch_listings_via_chrome
+                recovered = fetch_listings_via_chrome(
+                    url=LANDING,
+                    instruction=(
+                        "international development job listings: title, "
+                        "organization, location, posting URL, summary"
+                    ),
+                    max_items=int(filters.get("max_per_source") or 36),
+                )
+            except Exception:
+                log.debug("devex: chrome-agent fallback raised; continuing",
+                          exc_info=True)
+                recovered = []
+
+            if recovered:
+                seen_urls_fb: set[str] = set()
+                for r in recovered:
+                    if len(out) >= cap:
+                        break
+                    if not isinstance(r, dict):
+                        continue
+                    url = (r.get("url") or "").strip()
+                    if not url or not url.startswith("https://www.devex.com/jobs/"):
+                        continue
+                    if url in seen_urls_fb:
+                        continue
+                    seen_urls_fb.add(url)
+
+                    title = fix_mojibake(str(r.get("title") or "")).strip()
+                    for suffix in (" | Devex", " | DevEx", " - Devex", " - DevEx"):
+                        if title.endswith(suffix):
+                            title = title[: -len(suffix)].strip()
+                    if not title:
+                        continue
+
+                    external_id = url.rstrip("/").rsplit("-", 1)[-1]
+                    if not external_id.isdigit():
+                        external_id = url
+
+                    company = fix_mojibake(str(r.get("company") or "")).strip()
+                    if (
+                        not company
+                        or company.lower().startswith("devex (")
+                        or company.lower() == "devex"
+                        or "employer not specified" in company.lower()
+                    ):
+                        company = _extract_employer_from_url(url) or "Unknown employer"
+
+                    out.append(Job(
+                        "devex",                         # source
+                        external_id,                     # external_id
+                        title[:140],                     # title
+                        company[:120],                   # company
+                        fix_mojibake(str(r.get("location") or "")).strip()[:120],
+                        url,                             # url
+                        str(r.get("posted_at") or ""),   # posted_at
+                        fix_mojibake(str(r.get("snippet") or "")).strip()[:400],
+                        "",                              # salary
+                    ))
+                if out:
+                    log.info("devex: chrome-agent fallback recovered %d postings", len(out))
+
         # Algorithm v2.2 — Option 4: DevEx Google-search snippets stop
         # at ~150 chars and routinely omit the "Required qualifications"
         # block, which is exactly the signal Sonnet needs to rule out
@@ -521,6 +608,26 @@ def fetch(filters: dict) -> list[Job]:
                 log.exception("devex: detail-page fetch raised; continuing")
 
         sample_titles = [j.title[:80] for j in out[:5]]
+
+        # Tier 4: feed the adaptive source-cooldown FSM. jobs_new counts how
+        # many of THIS fetch's postings are not yet in the `jobs` table —
+        # computed via the real Job.job_id (sha1 of source+external_id), which
+        # is exactly the key `upsert_job` stores, so `count_existing_jobs`
+        # actually finds prior rows. Done before the upsert step downstream,
+        # so a posting we've seen before reads as "not new". Best-effort: a
+        # DB error must never break the fetch.
+        if db is not None:
+            try:
+                seen_ids = [j.job_id for j in out]
+                existing = db.count_existing_jobs(seen_ids) if seen_ids else 0
+                db.record_fetch(
+                    "devex", "devex", 1, "",
+                    jobs_seen=len(seen_ids),
+                    jobs_new=max(0, len(seen_ids) - existing),
+                )
+            except Exception:
+                log.debug("devex: db.record_fetch raised; continuing",
+                          exc_info=True)
 
         fctx.set_output({
             "raw_count": len(raw),
