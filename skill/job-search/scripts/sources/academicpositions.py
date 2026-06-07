@@ -330,6 +330,70 @@ def _parse_listing_html(html: str, *, cap: int) -> list[Job]:
     return jobs
 
 
+# Canonical "all positions, newest first" listing URL for the chrome-agent
+# last-resort fallback. AcademicPositions sits behind Cloudflare Bot-Fight-Mode,
+# so the plain `requests` RSS + HTML paths above 403; the operator's real
+# desktop Chrome is already past that gate.
+_CHROME_LISTING_URL = (
+    "https://academicpositions.com/jobs/position/all/all/all?sort=newest"
+)
+_CHROME_INSTRUCTION = (
+    "academic and research job positions: title, institution, location, "
+    "posting URL, field"
+)
+
+
+def _try_chrome(*, cap: int) -> list[Job]:
+    """Last-resort recovery via the operator's desktop Chrome.
+
+    Fires only when the requests-based RSS + HTML paths returned nothing (the
+    Cloudflare-blocked steady state). When ``chrome_agent_fallback_enabled`` is
+    False (the default) the helper returns ``[]`` with no subprocess spawned, so
+    this adapter's observable behavior is identical to today. NEVER raises — any
+    failure degrades to ``[]`` and the adapter's normal empty result.
+    """
+    try:
+        from chrome_agent_fetch import fetch_listings_via_chrome
+    except Exception as e:  # noqa: BLE001 - module optional / import-time issues
+        log.debug("academicpositions: chrome fallback unavailable (%s)", e)
+        return []
+
+    try:
+        raw = fetch_listings_via_chrome(
+            url=_CHROME_LISTING_URL,
+            instruction=_CHROME_INSTRUCTION,
+            max_items=cap,
+        )
+    except Exception as e:  # noqa: BLE001 - helper contract is no-raise, belt+suspenders
+        log.debug("academicpositions: chrome fallback raised (%s)", e)
+        return []
+
+    jobs: list[Job] = []
+    seen_ids: set[str] = set()
+    for item in raw or []:
+        if len(jobs) >= cap:
+            break
+        url = (item.get("url") or "").strip()
+        title = fix_mojibake(item.get("title") or "").strip()
+        if not (url and title):
+            continue
+        ext_id = _extract_id(url)
+        if not ext_id or ext_id in seen_ids:
+            continue
+        seen_ids.add(ext_id)
+        jobs.append(Job(
+            source="academicpositions",
+            external_id=ext_id,
+            title=title[:140],
+            company=fix_mojibake(item.get("company") or "")[:120],
+            location=(fix_mojibake(item.get("location") or "") or "EU")[:120],
+            url=url,
+            posted_at=(item.get("posted_at") or "").strip(),
+            snippet=clean_snippet(item.get("snippet") or "", max_chars=400),
+        ))
+    return jobs
+
+
 def _try_html(*, search: str, countries: tuple[str, ...], cap: int) -> tuple[int, str, list[Job]]:
     """Walk a small set of HTML listing URLs (root + per-country) until cap or all 403."""
     jobs: list[Job] = []
@@ -401,6 +465,7 @@ def fetch(filters: dict) -> list[Job]:
     rss_body_head = ""
     html_status = 0
     html_body_head = ""
+    chrome_count = 0
     jobs: list[Job] = []
 
     try:
@@ -418,6 +483,15 @@ def fetch(filters: dict) -> list[Job]:
                     jobs.append(j)
                     if len(jobs) >= cap:
                         break
+
+        # Last-resort: when the Cloudflare-blocked requests paths yielded
+        # nothing, drive the operator's real desktop Chrome. Gated OFF by
+        # default, so this is a no-op (no subprocess) unless explicitly enabled
+        # — adapter behavior is then identical to today.
+        if not jobs:
+            chrome_jobs = _try_chrome(cap=cap)
+            jobs.extend(chrome_jobs)
+            chrome_count = len(chrome_jobs)
     except Exception as e:  # noqa: BLE001
         # Belt-and-suspenders: never let a parser bug poison the digest run.
         log.exception("academicpositions: unexpected failure: %s", e)
@@ -434,6 +508,7 @@ def fetch(filters: dict) -> list[Job]:
         output={
             "rss_status": rss_status,
             "html_status": html_status,
+            "chrome_count": chrome_count,
             "count": len(jobs),
             "sample_titles": [j.title for j in jobs[:5]],
             **({"rss_body_head": rss_body_head} if rss_body_head and not jobs else {}),

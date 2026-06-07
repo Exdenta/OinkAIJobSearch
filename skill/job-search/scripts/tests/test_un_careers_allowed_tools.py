@@ -1,31 +1,27 @@
 #!/usr/bin/env python3
-"""Tests for the 2026-05 fix to ``sources/un_careers.py``.
+"""Tests for the 2026-05 ``--allowed-tools`` fix to the WebFetch adapters.
 
-Root cause we're guarding against
----------------------------------
-Before the fix, ``un_careers._run_claude`` called the plain ``run_p`` (via
+NOTE: ``sources/un_careers.py`` was rewritten in 2026-06 from the WebFetch
+Claude-delegation approach to a direct HTTP-JSON adapter against the UN
+careers public API (see ``test_un_careers_api.py``). The old un_careers
+tests that asserted the WebFetch-tool wiring were removed with that rewrite;
+only the ``curated_boards`` case (same original root-cause class) remains
+here.
+
+Root cause this guards against
+------------------------------
+Before the fix, an adapter's ``_run_claude`` called the plain ``run_p`` (via
 ``wrapped_run_p``) which does not pass ``--allowed-tools`` to the ``claude``
 CLI. The CLI therefore prompted the user interactively for WebFetch
 permission, and in a non-interactive subprocess that prompt became a
-textual response ("I need permission to use WebFetch to scrape the UN
-careers portal…") instead of the JSON envelope the adapter expected. Every
-iter logged a ``response was not a JSON object`` warning, recorded an
-``ok``-status row in ``claude_calls``, and returned zero postings.
+textual response ("I need permission to use WebFetch…") instead of the JSON
+envelope the adapter expected.
 
 What this test asserts
 ----------------------
-1.  The adapter routes through the tool-aware wrapper
-    (``wrapped_run_p_with_tools`` when available, ``run_p_with_tools``
-    otherwise) — NOT the plain ``run_p``/``wrapped_run_p`` path that
-    omits the tool flags.
-2.  The kwargs passed include ``allowed_tools="WebFetch"`` and
-    ``disallowed_tools="Bash,Edit,Write,Read"`` so the CLI grants the
-    fetch tool non-interactively while keeping the attack surface narrow.
-3.  ``curated_boards`` (which had the same bug) routes through
-    ``wrapped_run_p_with_tools`` with the same allow/deny strings.
-4.  The model pin (``haiku`` via ``SMALLEST_MODEL``) survives the
-    migration — without an explicit ``--model`` the CLI defaults to Opus
-    and the call blows past the bot's 180s timeout (commit 1a18422).
+``curated_boards`` routes through ``wrapped_run_p_with_tools`` with
+``allowed_tools="WebFetch"`` and ``disallowed_tools="Bash,Edit,Write,Read"``
+and the ``haiku`` model pin.
 
 Invoke either directly or via pytest:
 
@@ -70,99 +66,6 @@ def _capture_factory(calls: list[dict[str, Any]]) -> Any:
         })
         return _FAKE_CLI_STDOUT
     return _stub
-
-
-# ---------------------------------------------------------------------------
-# un_careers
-# ---------------------------------------------------------------------------
-
-def test_un_careers_routes_through_wrapped_with_tools() -> None:
-    """The adapter must call ``wrapped_run_p_with_tools`` — never the plain
-    wrapper — so the CLI receives ``--allowed-tools`` and stops prompting
-    interactively for WebFetch permission."""
-    from sources import un_careers
-
-    calls: list[dict[str, Any]] = []
-    stub = _capture_factory(calls)
-
-    # The adapter looks up _wrapped_run_p_with_tools at module scope; patch
-    # the module attribute directly. _HAS_WRAPPED guards the branch — flip
-    # it on too so we don't silently fall through to run_p_with_tools.
-    original_fn = un_careers._wrapped_run_p_with_tools
-    original_flag = un_careers._HAS_WRAPPED
-    un_careers._wrapped_run_p_with_tools = stub
-    un_careers._HAS_WRAPPED = True
-    try:
-        jobs = un_careers.fetch({"max_per_source": 5, "ai_scrape_timeout_s": 90})
-    finally:
-        un_careers._wrapped_run_p_with_tools = original_fn
-        un_careers._HAS_WRAPPED = original_flag
-
-    assert len(calls) == 1, f"expected one CLI invocation, got {len(calls)}"
-    call = calls[0]
-    assert call["caller"] == "un_careers", call["caller"]
-
-    kw = call["kwargs"]
-    # The load-bearing assertion: WebFetch must be granted, otherwise the
-    # CLI prompts interactively and we're right back at the 2026-05 bug.
-    assert kw.get("allowed_tools") == "WebFetch", (
-        f"allowed_tools must be 'WebFetch', got {kw.get('allowed_tools')!r}"
-    )
-    assert kw.get("disallowed_tools") == "Bash,Edit,Write,Read", (
-        f"disallowed_tools mismatch: {kw.get('disallowed_tools')!r}"
-    )
-    # Model pin must survive — without it the CLI defaults to Opus and
-    # times out the bot's 180s window (see devex/web_search comments).
-    assert kw.get("model") == "haiku", f"expected model='haiku', got {kw.get('model')!r}"
-    # Timeout flows through from the filters dict.
-    assert kw.get("timeout_s") == 90, f"timeout_s mismatch: {kw.get('timeout_s')!r}"
-
-    # And the canned JSON parsed into one Job, proving the JSON envelope
-    # path still works end-to-end.
-    assert len(jobs) == 1, f"expected 1 parsed job, got {len(jobs)}"
-    assert jobs[0].source == "un_careers"
-    assert jobs[0].url == "https://careers.un.org/jobs/12345"
-
-
-def test_un_careers_fallback_uses_run_p_with_tools() -> None:
-    """When the wrapper is unavailable (lean checkout / isolated env), the
-    adapter must STILL pass ``allowed_tools`` to the underlying CLI helper.
-    This guards against a regression where someone might restore plain
-    ``run_p`` in the fallback path."""
-    from sources import un_careers
-    import claude_cli
-
-    calls: list[dict[str, Any]] = []
-
-    def _stub(prompt, **kwargs):  # noqa: ANN001 — stub
-        calls.append({
-            "prompt_head": (prompt or "")[:200],
-            "kwargs": kwargs,
-        })
-        return _FAKE_CLI_STDOUT
-
-    original_fn = claude_cli.run_p_with_tools
-    original_flag = un_careers._HAS_WRAPPED
-    claude_cli.run_p_with_tools = _stub  # type: ignore[assignment]
-    # Also patch the binding imported into un_careers.
-    original_import = un_careers.run_p_with_tools
-    un_careers.run_p_with_tools = _stub  # type: ignore[assignment]
-    un_careers._HAS_WRAPPED = False
-    try:
-        jobs = un_careers.fetch({"max_per_source": 5, "ai_scrape_timeout_s": 90})
-    finally:
-        claude_cli.run_p_with_tools = original_fn
-        un_careers.run_p_with_tools = original_import
-        un_careers._HAS_WRAPPED = original_flag
-
-    assert len(calls) == 1, f"expected one CLI invocation, got {len(calls)}"
-    kw = calls[0]["kwargs"]
-    assert kw.get("allowed_tools") == "WebFetch", (
-        f"fallback path must still grant WebFetch; got {kw.get('allowed_tools')!r}"
-    )
-    assert kw.get("disallowed_tools") == "Bash,Edit,Write,Read"
-    assert kw.get("model") == "haiku"
-    assert len(jobs) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -211,8 +114,6 @@ def test_curated_boards_routes_through_wrapped_with_tools() -> None:
 
 def _run() -> int:
     tests = [
-        test_un_careers_routes_through_wrapped_with_tools,
-        test_un_careers_fallback_uses_run_p_with_tools,
         test_curated_boards_routes_through_wrapped_with_tools,
     ]
     failed: list[str] = []

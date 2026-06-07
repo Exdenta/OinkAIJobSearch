@@ -282,6 +282,20 @@ CREATE TABLE IF NOT EXISTS source_cooldowns (
     consecutive_low_novelty_cycles    INTEGER NOT NULL DEFAULT 0
 );
 
+-- Web magic-link tokens. Plaintext token NEVER stored; the column is
+-- sha256(token) hex so a DB read can't be replayed as a valid link.
+-- expires_at = unix seconds; rows past that point are inert. used_at is
+-- NULL while the token is unredeemed and set to the consumption time on
+-- first verify (single-use). Rows are garbage-collected opportunistically
+-- on each insert (see `delete_expired_magic_tokens`).
+CREATE TABLE IF NOT EXISTS magic_tokens (
+    token_hash  TEXT PRIMARY KEY,           -- sha256(token), hex
+    email       TEXT NOT NULL,              -- lowercased
+    expires_at  INTEGER NOT NULL,           -- unix seconds
+    used_at     INTEGER                     -- unix seconds, NULL while unused
+);
+CREATE INDEX IF NOT EXISTS idx_magic_tokens_email ON magic_tokens(email);
+
 CREATE INDEX IF NOT EXISTS idx_app_status ON applications(chat_id, status);
 CREATE INDEX IF NOT EXISTS idx_sent_job ON sent_messages(chat_id, job_id);
 CREATE INDEX IF NOT EXISTS idx_profile_builds_chat ON profile_builds(chat_id, built_at DESC);
@@ -588,6 +602,77 @@ class DB:
             ).fetchone()
             n = int(row["n"] or 0) if row else 0
             return -1 - n
+
+    # ---------- web login: magic-link tokens ----------
+    #
+    # The web's `/api/auth/magic` flow stashes one row per requested email.
+    # `token_hash` is sha256(plaintext_token).hex — the plaintext is mailed
+    # to the user and never persisted, so a DB compromise can't be replayed
+    # against `/api/auth/verify`. Rows are single-use (set `used_at` on the
+    # first successful verify) and time-boxed (`expires_at`). GC happens
+    # opportunistically on each insert; no separate cron.
+    def insert_magic_token(
+        self,
+        token_hash: str,
+        email: str,
+        expires_at: int,
+    ) -> None:
+        """Persist one magic-link token. `token_hash` must already be the
+        sha256 hex of the plaintext token — the plaintext is never accepted
+        here. `email` is lowercased by the caller; we store verbatim.
+        """
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT INTO magic_tokens (token_hash, email, expires_at, used_at)
+                VALUES (?, ?, ?, NULL)
+                """,
+                (str(token_hash), str(email), int(expires_at)),
+            )
+
+    def consume_magic_token(self, token_hash: str, now: int) -> str | None:
+        """Atomically redeem a token. Returns the bound email on success;
+        None when the token is unknown, already consumed, or expired.
+
+        The UPDATE's `WHERE used_at IS NULL` clause is the atomic single-use
+        check: only one concurrent caller's UPDATE matches a row, so
+        `cursor.rowcount == 0` on the loser. The preceding SELECT only
+        fetches the email so we know what to return; it is not the gate.
+        """
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT email FROM magic_tokens "
+                "WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?",
+                (str(token_hash), int(now)),
+            ).fetchone()
+            if row is None:
+                return None
+            cur = c.execute(
+                "UPDATE magic_tokens SET used_at = ? "
+                "WHERE token_hash = ? AND used_at IS NULL",
+                (int(now), str(token_hash)),
+            )
+            if (cur.rowcount or 0) == 0:
+                # Another concurrent verify claimed it between our SELECT and UPDATE.
+                return None
+            return row["email"]
+
+    def delete_expired_magic_tokens(self, now: int) -> int:
+        """Garbage-collect tokens whose expiry passed >= 7 days ago AND
+        already-consumed rows in the same window. Returns rows deleted.
+
+        Called opportunistically on each insert (best-effort); no cron.
+        The 7-day grace window keeps an audit trail readable for a week
+        in case operators need to debug a verify failure.
+        """
+        cutoff = int(now) - 7 * 24 * 60 * 60
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM magic_tokens "
+                "WHERE expires_at < ? OR (used_at IS NOT NULL AND used_at < ?)",
+                (cutoff, cutoff),
+            )
+            return int(cur.rowcount or 0)
 
     # ---------- prefs free-text (raw input for the profile builder) ----------
 

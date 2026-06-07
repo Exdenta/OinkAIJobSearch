@@ -53,6 +53,82 @@ _DOCTYPE_RE = re.compile(r"<!DOCTYPE[^>]*>", re.IGNORECASE)
 
 log = logging.getLogger(__name__)
 
+# HTTP status codes that indicate an anti-bot block rather than a genuine
+# "page gone" — these are the cases a headless browser can recover (it
+# executes the JS/TLS challenge that plain `requests` fails). 404/410 etc.
+# are NOT here: a real browser wouldn't recover a deleted page, so we don't
+# waste a launch on them.
+_ANTIBOT_STATUSES = frozenset({403, 429, 503})
+
+
+def _browser_fallback_config() -> tuple[bool, float]:
+    """Read the (enabled, timeout_s) fallback config from defaults, lazily.
+
+    Lazy + defensive so this module never gains a hard import dependency on
+    defaults' shape: any import/lookup problem → fallback disabled, which is
+    exactly today's behavior.
+    """
+    try:
+        from defaults import DEFAULTS
+        enabled = bool(DEFAULTS.get("browser_fetch_fallback_enabled", False))
+        timeout_s = float(DEFAULTS.get("browser_fetch_timeout_s", 30) or 30)
+        return enabled, timeout_s
+    except Exception:
+        return False, 30.0
+
+
+def _try_browser_fallback(url: str, *, max_chars: int) -> str:
+    """Best-effort headless-browser retry for an anti-bot-blocked URL.
+
+    Returns the rendered+cleaned body text, or "" if the fallback is
+    disabled, playwright is unavailable, the URL is SSRF-blocked, or the
+    render produced nothing. NEVER raises — a failure here must degrade to
+    today's "" result.
+    """
+    enabled, timeout_s = _browser_fallback_config()
+    if not enabled:
+        return ""
+    try:
+        from browser_fetch import fetch_rendered
+        rendered = fetch_rendered(url, timeout_s=timeout_s, max_chars=max_chars)
+    except Exception as e:
+        log.debug("detail_fetch: browser fallback raised for %s (%s)", url, e)
+        return ""
+    if rendered:
+        log.debug("detail_fetch: browser fallback recovered %s (%d chars)",
+                  url, len(rendered))
+        return rendered
+    return ""
+
+
+def _try_chrome_agent_fallback(url: str) -> str:
+    """Last-resort recovery via the OPERATOR's real desktop Chrome.
+
+    Tier 3: when the headless Playwright fallback ALSO came back empty on an
+    anti-bot status, hand the URL to ``chrome_agent_fetch.fetch_page_text_via_
+    chrome``, which drives the operator's logged-in desktop Chrome (via
+    ``claude -p --chrome`` + the claude-in-chrome MCP). That browser carries
+    real cookies / a real fingerprint and can clear challenges that a fresh
+    headless chromium cannot.
+
+    Returns the recovered cleaned body text, or "" when the chrome-agent
+    fallback is disabled (the DEFAULT — ``chrome_agent_fallback_enabled`` is
+    False, so NO subprocess is spawned and behavior is identical to today),
+    the URL is SSRF-blocked, or nothing came back. NEVER raises — any failure
+    here degrades to today's "" result.
+    """
+    try:
+        from chrome_agent_fetch import fetch_page_text_via_chrome
+        recovered = fetch_page_text_via_chrome(url=url)
+    except Exception as e:
+        log.debug("detail_fetch: chrome-agent fallback raised for %s (%s)", url, e)
+        return ""
+    if recovered:
+        log.info("detail_fetch: chrome-agent fallback recovered %s (%d chars)",
+                 url, len(recovered))
+        return recovered
+    return ""
+
 
 DEFAULT_HEADERS = {
     "User-Agent": (
@@ -101,6 +177,25 @@ def fetch_body_text(
         return ""
     if resp.status_code >= 400:
         log.debug("detail_fetch: GET %s → %s", url, resp.status_code)
+        # Anti-bot block (403/429/503): the page likely exists but `requests`
+        # was fingerprinted. If the operator enabled the headless-browser
+        # fallback AND playwright is installed, retry ONCE through a real
+        # browser. Any failure there → fall back to today's behavior ("").
+        if resp.status_code in _ANTIBOT_STATUSES:
+            rendered = _try_browser_fallback(url, max_chars=max_chars)
+            if rendered:
+                _BODY_CACHE[url] = rendered
+                return rendered
+            # Tier 3: headless Playwright also came back empty (still blocked).
+            # As a last resort, drive the operator's real desktop Chrome. This
+            # is gated OFF by default (chrome_agent_fallback_enabled), so when
+            # disabled it returns "" with no subprocess and behavior is exactly
+            # today's. max_chars is NOT enforced here — the chrome helper owns
+            # its own cleaning/contract.
+            recovered = _try_chrome_agent_fallback(url)
+            if recovered:
+                _BODY_CACHE[url] = recovered
+                return recovered
         _BODY_CACHE[url] = ""
         return ""
 

@@ -32,6 +32,7 @@ import datetime
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -366,6 +367,76 @@ def _score_histogram(enrichments_by_job_id: dict[str, dict]) -> dict[str, int]:
     return hist
 
 
+def _record_query_funnel(
+    store,
+    *,
+    pipeline_run_id: int | None,
+    chat_id: int,
+    attribution: dict[str, str],
+    enrichments_by_job_id: dict[str, dict],
+    match_floor: int,
+    queued_job_ids: set[str],
+    sent_job_ids: set[str],
+    started_at: float,
+    finished_at: float,
+) -> None:
+    """Roll the per-job query attribution up into `query_runs` funnel rows
+    (M2 component 1).
+
+    For each originating query string in `attribution`, count the jobs that
+    flowed through each funnel stage:
+
+      fetched     all jobs the adapter attributed to this query
+      scored      of those, jobs the AI scorer produced a verdict for
+      matched_ge4 of those, jobs whose score >= `match_floor`
+      queued      of those, jobs that entered the quality buffer this run
+      sent        of those, jobs actually delivered this run
+
+    One `query_runs` row is written per distinct query for this
+    (pipeline_run, chat_id). Source key is inferred from the query string
+    shape: web_search keys are prefixed ``web_search:`` (see
+    `web_search._web_search_query_key`); everything else is a LinkedIn
+    query. Best-effort: a failure logs and returns — telemetry must never
+    break a search run.
+    """
+    if store is None or not attribution:
+        return
+    try:
+        per_query: dict[str, dict] = {}
+        for job_id, query in attribution.items():
+            src = "web_search" if str(query).startswith("web_search:") else "linkedin"
+            slot = per_query.setdefault(
+                query,
+                {"source_key": src, "fetched": 0, "scored": 0,
+                 "matched_ge4": 0, "queued": 0, "sent": 0},
+            )
+            slot["fetched"] += 1
+            enr = enrichments_by_job_id.get(job_id)
+            if enr is not None:
+                slot["scored"] += 1
+                try:
+                    score = int((enr or {}).get("match_score") or 0)
+                except (TypeError, ValueError):
+                    score = 0
+                if score >= match_floor:
+                    slot["matched_ge4"] += 1
+            if job_id in queued_job_ids:
+                slot["queued"] += 1
+            if job_id in sent_job_ids:
+                slot["sent"] += 1
+        for query, slot in per_query.items():
+            store.record_query_run(
+                chat_id, slot["source_key"], query,
+                pipeline_run_id=pipeline_run_id,
+                fetched=slot["fetched"], scored=slot["scored"],
+                matched_ge4=slot["matched_ge4"], queued=slot["queued"],
+                sent=slot["sent"],
+                started_at=started_at, finished_at=finished_at,
+            )
+    except Exception:
+        log.debug("_record_query_funnel failed; continuing", exc_info=True)
+
+
 # ---------- post-filters ----------
 
 def seniority_matches(job: Job, wanted: str) -> bool:
@@ -418,18 +489,46 @@ def post_filter(jobs: list[Job], filters: dict) -> list[Job]:
 # code path.
 _CURSOR_AWARE_SOURCES = frozenset({"justjoinit", "nofluffjobs", "builtin"})
 
-# The FULL set of P2 adapters that write to `search_fetches` (via
-# `record_fetch`). `_CURSOR_AWARE_SOURCES` is a strict subset — it's
-# the global-pass cursor adapters. `linkedin` and `web_search` ALSO
-# instrument `search_fetches`, but through per-user dispatch (their
-# `fetch_per_user` entry points), so they don't appear in the
-# cursor-aware set above. Both lists exist because the bug fix
-# (P6-T1) needs the COMPLETE set of instrumented sources to know
-# which cooldown rows are legitimately FSM-driven versus stuck due to
-# the original "no signal == 0% novelty" coercion bug.
+# The FULL set of adapters that write novelty to `search_fetches` (via
+# `record_fetch`). `_CURSOR_AWARE_SOURCES` is a strict subset — it's the
+# global-pass cursor adapters. `linkedin` and `web_search` ALSO instrument
+# `search_fetches`, but through per-user dispatch (their `fetch_per_user`
+# entry points), so they don't appear in the cursor-aware set above.
+#
+# Tier 4 adds the three Claude-CLI delegation adapters that never paginate
+# (`devex`, `un_careers`, and the curated_boards module). The curated module
+# records under PER-SUB-BOARD keys (`remocate` / `wantapply` /
+# `remoterocketship`) — not under `curated_boards` — because the dispatcher
+# gates each sub-board's cooldown independently (see `_curated_subboards_to_run`
+# / `fetch_all`). So the instrumented set lists the three sub-board keys, not
+# the module name. `devex` / `un_careers` are single-key modules and use
+# their own name as the source key.
+#
+# This list must stay COMPLETE: the P6-T1 migration
+# (`reset_uninstrumented_source_cooldowns`) uses it to tell which cooldown
+# rows are legitimately FSM-driven versus stuck due to the original
+# "no signal == 0% novelty" coercion bug. A key that records novelty but is
+# missing here would be wrongly reset to 'normal' on every run.
 _P2_INSTRUMENTED_SOURCES = frozenset({
     "linkedin", "justjoinit", "nofluffjobs", "builtin", "web_search",
+    # Tier 4 — Claude-CLI delegation adapters (no native pagination).
+    "devex", "un_careers",
+    # curated_boards sub-boards — each records + cools down on its own key.
+    "remocate", "wantapply", "remoterocketship",
 })
+
+# The curated_boards sub-board source keys, in dispatch order. The module is
+# registered in SOURCES under the single key `curated_boards`, but each board
+# is toggled (and now cooled down) independently. Keep this in sync with
+# `sources.curated_boards.BOARDS`.
+_CURATED_SUBBOARDS = ("remocate", "wantapply", "remoterocketship")
+
+# Adapters whose `fetch(filters)` accepts a `db=` kwarg for Tier-4
+# novelty recording but DON'T take the cursor (`min_revisit_age_s=`) kwarg
+# that `_CURSOR_AWARE_SOURCES` adapters do. These are the Claude-CLI
+# delegation sources: they record one fixed-cell `search_fetches` row per
+# fetch so the cooldown FSM gets a novelty signal, without any page cursor.
+_DB_ONLY_SOURCES = frozenset({"devex", "un_careers", "curated_boards"})
 
 
 # Adaptive source cooldown (algorithm v2.8 / P4 pipeline overhaul).
@@ -516,6 +615,55 @@ def _maybe_auto_rebuild_profile(
                 "auto-rebuild: counter reset failed for chat=%s", chat_id,
             )
         return True
+    return False
+
+
+def _maybe_optimize_queries(
+    db,
+    store,
+    chat_id: int,
+    filters: dict,
+    *,
+    _optimize=None,    # injected in tests
+) -> bool:
+    """Fire the M2 closed-loop query optimiser on its own cadence.
+
+    COMPLEMENTS `_maybe_auto_rebuild_profile`: the skip-rebuild path needs
+    SENT jobs and rewrites the whole profile; this path reads the per-query
+    funnel yield (`query_runs`) and mutates only the search queries, so a
+    0-send user whose skip counter never fires still gets tuned from the
+    scored/matched signal.
+
+    Gated behind `filters['query_optimizer_enabled']` (default OFF) — the
+    optimiser itself re-checks the flag, but we short-circuit here to avoid
+    importing the module and building a reward window when disabled.
+
+    Best-effort: returns True iff an optimisation actually mutated the
+    profile (status == 'ok'); any failure logs and returns False. Never
+    raises into the search loop.
+    """
+    if not bool(filters.get("query_optimizer_enabled", False)):
+        return False
+    if _optimize is None:
+        from query_optimizer import optimize_queries as _optimize  # noqa: WPS433
+    try:
+        result = _optimize(db, store, chat_id, filters)
+    except Exception:
+        log.exception(
+            "_maybe_optimize_queries: optimiser raised for chat=%s", chat_id,
+        )
+        return False
+    status = getattr(result, "status", "error")
+    if status == "ok":
+        log.info(
+            "query-optimiser: chat=%d kept=%d pruned=%d added=%d",
+            chat_id, len(getattr(result, "kept", []) or []),
+            len(getattr(result, "pruned", []) or []),
+            len(getattr(result, "added", []) or []),
+        )
+        return True
+    log.debug("query-optimiser: chat=%d status=%s (%s)",
+              chat_id, status, getattr(result, "reason", ""))
     return False
 
 
@@ -668,8 +816,10 @@ def _fetch_one_source(
     collects errors and surfaces them via the legacy `errors` list.
 
     `db` is forwarded to cursor-aware adapters (`_CURSOR_AWARE_SOURCES`)
-    so they can advance their `search_fetches` cursor; the other adapters
-    keep their legacy `fetch(filters)` signature untouched.
+    so they can advance their `search_fetches` cursor, and to the Tier-4
+    `_DB_ONLY_SOURCES` (devex / un_careers / curated_boards) so they can
+    record fetch novelty (no page cursor). All other adapters keep their
+    legacy `fetch(filters)` signature untouched.
     """
     min_revisit_age_s = int(filters.get("source_min_revisit_age_s") or 21600)
 
@@ -680,6 +830,9 @@ def _fetch_one_source(
                 db=db,
                 min_revisit_age_s=min_revisit_age_s,
             ) or []
+        if db is not None and key in _DB_ONLY_SOURCES:
+            # Tier 4: novelty recording only, no cursor kwarg.
+            return mod.fetch(filters, db=db) or []
         return mod.fetch(filters) or []
 
     try:
@@ -708,6 +861,42 @@ def _fetch_one_source(
     except Exception as e:
         log.exception("%s fetch raised: %s", key, e)
         return key, [], f"{type(e).__name__}: {str(e)[:200]}"
+
+
+def _curated_subboards_to_run(
+    db,
+    enabled: dict,
+    *,
+    cycle_index: int,
+    low_novelty_threshold: float,
+) -> tuple[list[str], list[str]]:
+    """Split the ENABLED curated sub-boards into (run-this-cycle, cooled-off).
+
+    The curated_boards module is one entry in ``SOURCES``, but its three
+    sub-boards (remocate / wantapply / remoterocketship) each record their
+    own ``search_fetches`` novelty (Tier 4) and so each gets its OWN
+    adaptive-cooldown decision — a chronically quiet board can be demoted
+    to half-frequency without dragging its siblings down.
+
+    Returns ``(to_run, cooled)`` where both are sub-board source keys drawn
+    from the enabled set. ``db is None`` (dry-run preview) bypasses the gate
+    entirely: every enabled board runs and ``cooled`` is empty, matching the
+    rest of `fetch_all`'s "preview reflects the full source set" contract.
+    """
+    enabled_boards = [k for k in _CURATED_SUBBOARDS if enabled.get(k, False)]
+    if db is None:
+        return enabled_boards, []
+    to_run: list[str] = []
+    cooled: list[str] = []
+    for board in enabled_boards:
+        if should_run_source(
+            db, board, cycle_index=cycle_index,
+            low_novelty_threshold=low_novelty_threshold,
+        ):
+            to_run.append(board)
+        else:
+            cooled.append(board)
+    return to_run, cooled
 
 
 def fetch_all(
@@ -775,15 +964,46 @@ def fetch_all(
                 "fetch_all: cursor reset failed at cycle=%d: %s",
                 cycle_index, type(e).__name__,
             )
-    tasks: list[tuple[str, object]] = []
+    # Each task is (source_key, module, filters_override). The override is
+    # None for the normal case (use the shared `filters`); curated_boards
+    # supplies a narrowed `sources` map so only the sub-boards that survived
+    # their per-board cooldown get scraped this cycle.
+    tasks: list[tuple[str, object, dict | None]] = []
     cooldown_skipped: list[str] = []
     for key, mod in SOURCES.items():
         if key == "remote_boards":
             if not any(enabled.get(k, True) for k in ("remoteok", "remotive", "weworkremotely")):
                 continue
         elif key == "curated_boards":
-            if not any(enabled.get(k, False) for k in ("remocate", "wantapply", "remoterocketship")):
+            # Per-sub-board adaptive cooldown (Tier 4). Each enabled board
+            # gets its own `should_run_source` decision; the module runs
+            # only the survivors. If every enabled board is on the OFF half
+            # of its alternation this cycle, the whole module is skipped.
+            if not any(enabled.get(k, False) for k in _CURATED_SUBBOARDS):
                 continue
+            to_run, cooled = _curated_subboards_to_run(
+                db, enabled,
+                cycle_index=cycle_index,
+                low_novelty_threshold=low_thresh,
+            )
+            cooldown_skipped.extend(cooled)
+            if not to_run:
+                continue
+            # Narrow the sources map to the surviving sub-boards so demoted
+            # boards aren't scraped. Other filter keys are shared by
+            # reference (read-only in the adapters), only `sources` is
+            # replaced — and only the curated keys are toggled, so a board
+            # the FSM left alone keeps its original enabled flag.
+            override = None
+            if db is not None and set(to_run) != set(
+                k for k in _CURATED_SUBBOARDS if enabled.get(k, False)
+            ):
+                new_sources = dict(enabled)
+                for board in _CURATED_SUBBOARDS:
+                    new_sources[board] = board in to_run
+                override = {**filters, "sources": new_sources}
+            tasks.append((key, mod, override))
+            continue
         elif not enabled.get(key, True):
             continue
         # Adaptive source cooldown (P4): skip when a source's 24h
@@ -797,7 +1017,7 @@ def fetch_all(
         ):
             cooldown_skipped.append(key)
             continue
-        tasks.append((key, mod))
+        tasks.append((key, mod, None))
 
     if cooldown_skipped:
         log.info(
@@ -812,9 +1032,9 @@ def fetch_all(
     all_jobs: list[Job] = []
     errors: list[str] = []
     if workers <= 1 or len(tasks) <= 1:
-        for key, mod in tasks:
+        for key, mod, override in tasks:
             _k, fetched, err = _fetch_one_source(
-                key, mod, filters,
+                key, mod, override or filters,
                 store=store, pipeline_run_id=pipeline_run_id, db=db,
             )
             all_jobs.extend(fetched)
@@ -825,10 +1045,10 @@ def fetch_all(
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [
             pool.submit(
-                _fetch_one_source, key, mod, filters,
+                _fetch_one_source, key, mod, override or filters,
                 store=store, pipeline_run_id=pipeline_run_id, db=db,
             )
-            for key, mod in tasks
+            for key, mod, override in tasks
         ]
         for fut in as_completed(futures):
             try:
@@ -1030,6 +1250,7 @@ def run(
             for u in users:
                 chat_id = int(u["chat_id"])
                 stats["users_total"] += 1
+                user_started_at = time.time()
 
                 # Algorithm v2: profile JSON is now a thin envelope
                 # (search_seeds + bookkeeping). Scoring inputs come from the
@@ -1040,6 +1261,14 @@ def run(
                 resume_text = user_files.read_resume(chat_id)
                 prefs_text = user_files.read_prefs(chat_id)
                 free_text = prefs_text  # legacy alias for downstream callers
+
+                # M2 per-query telemetry: side-channel map { job_id ->
+                # originating query string } populated by the per-user
+                # source adapters (linkedin / web_search). Rolled up into
+                # the `query_runs` funnel table at the end of this user's
+                # block (see `_record_query_funnel`). Best-effort — a
+                # failure here never blocks the search run.
+                query_attribution: dict[str, str] = {}
 
                 effective = effective_filters(filters, profile)
                 log.info(
@@ -1094,6 +1323,7 @@ def run(
                                     min_revisit_age_s=int(
                                         effective.get("source_min_revisit_age_s") or 21600
                                     ),
+                                    attribution=query_attribution,
                                 ) or []
                                 li_sctx.set_count(len(extra_li))
                             fctx.set_output({
@@ -1147,6 +1377,7 @@ def run(
                                     # so the exploration rounds don't bleed
                                     # across users.
                                     cursor_key=str(chat_id),
+                                    attribution=query_attribution,
                                 ) or []
                                 ws_sctx.set_count(len(extra))
                             fctx.set_output({
@@ -1371,6 +1602,13 @@ def run(
                 # the buffer so an operator dry-run never mutates the
                 # queue. They get the per-run alive_floor printed
                 # verbatim instead.
+                # M2 funnel: the alive-floor set is exactly what gets
+                # enqueued into the quality buffer this run, so its ids are
+                # the "queued" stage for query attribution. "sent" is
+                # filled later from `_sent_jobs_this_run`.
+                queued_ids_this_run: set[str] = {j.job_id for j in alive_floor}
+                sent_ids_this_run: set[str] = set()
+
                 buffer_depth = 0
                 buffer_oldest_age = 0.0
                 if no_send:
@@ -1426,6 +1664,46 @@ def run(
                         except Exception:
                             log.exception(
                                 "User %s: auto-rebuild check raised on "
+                                "buffer-hold; continuing", chat_id,
+                            )
+                        # M2: record the per-query funnel even on a hold
+                        # iteration — the fetched/scored/matched stages are
+                        # the cold-start signal the optimiser needs, and a
+                        # 0-send user holds nearly every iteration. `sent`
+                        # is correctly 0 here (nothing shipped).
+                        _record_query_funnel(
+                            store,
+                            pipeline_run_id=pctx.run_id,
+                            chat_id=chat_id,
+                            attribution=query_attribution,
+                            enrichments_by_job_id=enrichments_by_job_id,
+                            match_floor=effective_min_score,
+                            queued_job_ids=queued_ids_this_run,
+                            sent_job_ids=set(),
+                            started_at=user_started_at,
+                            finished_at=time.time(),
+                        )
+                        # M2: the closed-loop query optimiser MUST fire on
+                        # the hold path too. Its entire raison d'être is the
+                        # quiet, ~0-send user (the skip-rebuild loop cannot
+                        # reach them) — and that user spends nearly every
+                        # iteration HERE, never crossing a buffer flush. If
+                        # we only optimised on the flush/send path, the
+                        # cold-start user would rarely or never get tuned,
+                        # defeating the feature. This mirrors the auto-
+                        # rebuild check above (fired on BOTH paths for the
+                        # same reason). The funnel row was just recorded, so
+                        # the optimiser reads the freshest reward window. It
+                        # is cheap on the hold path: the once-per-cadence
+                        # gate plus the disabled/no_reward/cadence_skip
+                        # short-circuits prevent redundant Opus calls.
+                        try:
+                            _maybe_optimize_queries(
+                                db, store, chat_id, filters,
+                            )
+                        except Exception:
+                            log.exception(
+                                "User %s: query-optimiser check raised on "
                                 "buffer-hold; continuing", chat_id,
                             )
                         continue
@@ -1585,6 +1863,7 @@ def run(
                             pre_filtered=True,
                         )
                         total_sent += sent
+                        sent_ids_this_run = set(_sent_jobs_this_run)
                         if _sent_jobs_this_run:
                             try:
                                 db.mark_digest_jobs_sent(
@@ -1653,7 +1932,7 @@ def run(
                                 filters.get("ai_scoring_audit_timeout_s") or enrich_timeout_s
                             )
                             audit_model = str(
-                                filters.get("ai_scoring_audit_model") or "opus"
+                                filters.get("ai_scoring_audit_model") or "sonnet"
                             )
                             audit_batch_size = int(
                                 filters.get("ai_scoring_audit_batch_size") or 10
@@ -1662,10 +1941,10 @@ def run(
                                 filters.get("ai_scoring_audit_workers") or 4
                             )
                             audit_critic_rounds = int(
-                                filters.get("ai_scoring_audit_critic_rounds") or 3
+                                filters.get("ai_scoring_audit_critic_rounds") or 2
                             )
                             audit_critic_model = str(
-                                filters.get("ai_scoring_audit_critic_model") or "opus"
+                                filters.get("ai_scoring_audit_critic_model") or "sonnet"
                             )
                             reviews = reanalyze_scoring_ai(
                                 audit_jobs, ext_enr, resume_text, prefs_text,
@@ -1733,6 +2012,36 @@ def run(
                 except Exception:
                     log.exception(
                         "User %s: auto-rebuild check raised; continuing",
+                        chat_id,
+                    )
+
+                # M2: roll the per-query attribution up into `query_runs`
+                # on the FLUSH/send path (the hold path recorded its own
+                # row before `continue`). `sent_ids_this_run` is populated
+                # by the send block above (empty on a no-send/dry preview).
+                _record_query_funnel(
+                    store,
+                    pipeline_run_id=pctx.run_id,
+                    chat_id=chat_id,
+                    attribution=query_attribution,
+                    enrichments_by_job_id=enrichments_by_job_id,
+                    match_floor=effective_min_score,
+                    queued_job_ids=queued_ids_this_run,
+                    sent_job_ids=sent_ids_this_run,
+                    started_at=user_started_at,
+                    finished_at=time.time(),
+                )
+
+                # M2: closed-loop query optimiser (config-gated, default
+                # OFF in defaults.py). Runs on its OWN cadence — independent
+                # of the skip-rebuild loop — so a 0-send user whose skip
+                # counter never fires still gets tuned from the funnel's
+                # scored/matched signal. Best-effort: never blocks the run.
+                try:
+                    _maybe_optimize_queries(db, store, chat_id, filters)
+                except Exception:
+                    log.exception(
+                        "User %s: query-optimiser check raised; continuing",
                         chat_id,
                     )
 

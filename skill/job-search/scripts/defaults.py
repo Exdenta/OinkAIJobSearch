@@ -33,7 +33,7 @@ DEFAULTS: dict = {
         # Humanitarian + research/academic sources (added 2026-04-30).
         "reliefweb":        True,    # public API — humanitarian sector
         "euraxess":         True,    # EU researcher mobility portal — public API
-        "un_careers":       True,    # SPA — Claude CLI delegation
+        "un_careers":       True,    # public JSON API (filteredV2) + chrome fallback
         "math_ku_phd":      True,    # KU employment RSS — math department
         "ub_doctoral":      True,    # Univ Barcelona — Claude CLI
         # Wave 2 sources (added 2026-05-01). 10 live + 3 blocked-stubs.
@@ -204,36 +204,53 @@ DEFAULTS: dict = {
     "cursor_reset_every_n_cycles": 4,
 
     # v2.5 scoring-audit stage. AFTER the digest cards ship, re-grade
-    # the score-≥1 verdicts with a second-opinion model (Opus). Catches
+    # the score-≥1 verdicts with a second-opinion model. Catches
     # scoring drift without blocking the user-facing send. Output lands
     # in forensic as `scoring_audit.review` lines — operators can grep
     # disagreements for patterns. ai_scoring_audit_model can be
     # overridden to sonnet/haiku for cost trade-offs.
+    #
+    # Model = SONNET (downgraded from opus 2026-05-29). This pass run
+    # AFTER user already got their cards — it not user-facing, it just
+    # post-send QA so ops can grep scoring drift in logs. So a strong
+    # cheaper judge fine here. Opus on this audit was ~34% of spend (Opus
+    # on BOTH scorer + critic, looping up to 3 rounds). Sonnet still a
+    # strong judge for the score-delta + grounding checks; user digest
+    # path untouched. This trade-off is cost/quota, NOT quality of the
+    # match the user sees.
     "ai_scoring_audit":          True,
-    "ai_scoring_audit_model":    "opus",
+    "ai_scoring_audit_model":    "sonnet",
     "ai_scoring_audit_timeout_s": 480,
     # v2.6 batched-audit-with-critic. Split the audit pool into
     # small batches dispatched in parallel; each batch is paired with
-    # a runtime Opus "critic" that re-verifies the scorer's output
+    # a runtime "critic" that re-verifies the scorer's output
     # for FORMAT + INTERNAL CONSISTENCY (score in [0,5], verdict
     # matches the score delta, exactly one review per id, etc.).
     # Scorer + critic loop until the critic approves OR the round
     # cap fires — never blocks the audit on a stalemate.
-    #   batch_size:    items per scorer call. 10 keeps Opus prompts
+    #   batch_size:    items per scorer call. 10 keeps prompts
     #                  comfortable and matches the existing
     #                  enrich_jobs_ai chunk size.
     #   workers:       parallel worker pool over batches. Mirrors
     #                  ai_enrich_workers.
     #   critic_rounds: max scorer↔critic rounds per batch before
     #                  falling back to the last scorer output.
-    #   critic_model:  may differ from the scorer model in future
-    #                  (e.g. critic on cheaper sonnet). Defaults to
-    #                  opus today so format checks share the scorer's
-    #                  judgement class.
+    #                  Dropped 3 → 2 (2026-05-29): post-send QA pass,
+    #                  shave a round of CLI calls to save cost/quota.
+    #                  Round 1 + one critic fix-up still catches the
+    #                  format/consistency drift; stalemate just keeps
+    #                  the last scorer output like before.
+    #   critic_model:  SONNET (downgraded from opus 2026-05-29). The
+    #                  critic only checks FORMAT + score-delta
+    #                  consistency, not match quality, and run after the
+    #                  user already got their cards — Sonnet plenty
+    #                  strong for that, and matching the cheaper scorer
+    #                  class keeps the whole post-send audit off Opus.
+    #                  Cost/quota trade-off, NOT a quality change.
     "ai_scoring_audit_batch_size":    10,
     "ai_scoring_audit_workers":       4,
-    "ai_scoring_audit_critic_rounds": 3,
-    "ai_scoring_audit_critic_model":  "opus",
+    "ai_scoring_audit_critic_rounds": 2,
+    "ai_scoring_audit_critic_model":  "sonnet",
 
     # Liveness verifier moved to send-time (telegram_client) in v2.1 —
     # only the postings that survived scoring + ⭐ floor get a Haiku
@@ -283,10 +300,52 @@ DEFAULTS: dict = {
     "night_mute_start_hour":     23,    # inclusive
     "night_mute_end_hour":       9,     # exclusive (09:00 = "back online")
 
+    # ---- Headless-browser fallback tier (TASK B) ---------------------
+    # Some org sites (migrationpolicy.org, undp.org, iom.int, devex.com)
+    # return HTTP 403/429/503 to plain `requests` even with a realistic UA
+    # — genuine anti-bot (TLS/JS fingerprinting). When this flag is True AND
+    # playwright + its chromium binary are installed on the host, a detail-
+    # body fetch that is anti-bot-blocked retries ONCE through a headless
+    # browser (`browser_fetch.fetch_rendered`) which executes the JS
+    # challenge and returns the rendered page.
+    #
+    # DEFAULT FALSE — a one-time deploy step is required first:
+    #     pip install playwright        # already in requirements.txt
+    #     playwright install chromium   # downloads the browser binary
+    # When OFF, or when playwright/chromium are absent, the pipeline behaves
+    # EXACTLY as today (the fallback is never attempted / returns None).
+    # `browser_fetch_timeout_s` caps total navigation time per rendered page.
+    # Enabled 2026-06-04: playwright + chromium installed on the host (WSL2);
+    # recovers moderately-protected anti-bot 403s (e.g. migrationpolicy.org).
+    # Heavily-protected sites (Akamai/Cloudflare, e.g. undp.org) still serve a
+    # block page — caught by browser_fetch._looks_like_block_page → treated as
+    # a miss, so the pipeline keeps the original snippet (no junk).
+    "browser_fetch_fallback_enabled": True,
+    "browser_fetch_timeout_s":        30,
+
+    # Chrome-agent fallback tier — a LAST resort beyond the headless-playwright
+    # tier above. When enabled, an adapter that is hard-blocked (Cloudflare /
+    # DataDome / paywall that even headless chromium can't clear) can drive the
+    # OPERATOR's real, logged-in desktop Chrome via `claude -p --chrome` plus
+    # the claude-in-chrome MCP. The agent navigates, waits for load, and
+    # extracts listings / page text from the rendered page. This commandeers
+    # the operator's desktop browser, so it is strictly opt-in and OFF by
+    # default — when OFF, every adapter behaves EXACTLY as today (the helper
+    # returns []/"" immediately, with NO subprocess spawned).
+    "chrome_agent_fallback_enabled": False,   # opt-in; drives the OPERATOR desktop Chrome via claude -p --chrome. OFF means every adapter behaves exactly as today.
+    "chrome_agent_device_id": "",             # pin a specific connected Chrome (deviceId from list_connected_browsers); "" means use the single/active browser.
+    "chrome_agent_timeout_s": 240,            # per-call cap for the agentic browser fetch.
+
     # Per-scrape timeout for Claude-CLI-backed adapters (curated_boards).
     "ai_scrape_timeout_s":     180,
     # Web-search agent runs multiple WebSearch+WebFetch calls — needs more.
-    "ai_web_search_timeout_s": 300,
+    # Bumped 300→360 (2026-06-07) alongside raising "up to 4"→"up to 6"
+    # searches per run (web_search.py): the extra two searches + their
+    # WebFetch drill-throughs add wall-time, and 300s was already
+    # occasionally timing out (logged as the cli_missing telemetry
+    # mislabel). 360s gives the wider sweep headroom without inviting
+    # indefinite hangs.
+    "ai_web_search_timeout_s": 360,
 
     "message": {
         "parse_mode":      "MarkdownV2",
@@ -342,4 +401,46 @@ DEFAULTS: dict = {
     # threshold. Reset to 0 only on a SUCCESSFUL rebuild so transient
     # CLI / parse failures don't silently consume K events.
     "auto_rebuild_skip_threshold": 5,
+
+    # ---- M2: closed-loop query optimiser ------------------------------
+    # A multi-armed-bandit-style tuner over the user's search_seeds queries.
+    # COMPLEMENTS the skip-rebuild loop above: where skip-rebuild needs SENT
+    # jobs and optimises PRECISION wholesale, this optimiser reads the
+    # per-query FUNNEL yield (fetched → scored → matched_ge4 → queued →
+    # sent, from the `query_runs` table) over a recent decayed window and
+    # asks an Opus call to KEEP productive queries, PRUNE dead ones, and
+    # PROPOSE new/mutated variants under an explore quota — so it tunes a
+    # 0-send user from the scored/matched signal alone (cold start).
+    #
+    # The per-query telemetry + reward aggregation record unconditionally
+    # (cheap, always-on); the LLM mutation step only fires when
+    # `query_optimizer_enabled` is True.
+    # ENABLED 2026-06-07: real query_runs funnel data has accrued (Alena
+    # 121 rows / 16 queries / 26 matched_ge4; Aksana 74 rows / 7 queries /
+    # 1 matched_ge4 over ~4.5d) — enough signal to keep productive arms and
+    # explore replacements for dead ones. Guardrails: refuses to wipe a
+    # user's query set (empty emitted → no_change), keeps >=30% explore
+    # quota so it can't collapse to a local optimum, fires at most once/day
+    # per user, and a query is only a prune CANDIDATE after >=3 runs with
+    # zero matched_ge4 (the LLM still arbitrates). Tunes both linkedin
+    # queries and web_search seed_phrases.
+    "query_optimizer_enabled": True,
+    # Cadence: fire the optimiser at most once per this many seconds per
+    # user (checked via the last `query_runs`-derived optimisation marker
+    # in ops_toggles). 86400 = once/day; independent of the skip counter.
+    "query_optimizer_min_interval_s": 86400,
+    # Reward window: how far back `query_yield_window` aggregates funnel
+    # rows, and the exponential half-life applied to each row's age.
+    "query_optimizer_window_s":    14 * 86400,
+    "query_optimizer_half_life_s":  7 * 86400,
+    # A query is a PRUNE candidate when it has had >= this many runs in the
+    # window AND zero matched_ge4 across all of them (dead even on the
+    # cold-start signal). The LLM still arbitrates — this just flags arms.
+    "query_optimizer_min_runs_before_prune": 3,
+    # Explore quota: the optimiser must keep at least this fraction of its
+    # output as NEW/mutated variants so it never collapses to the current
+    # local optimum. Passed into the prompt as guidance.
+    "query_optimizer_explore_quota": 0.3,
+    # Opus call timeout for the mutation step.
+    "query_optimizer_timeout_s":   180,
 }

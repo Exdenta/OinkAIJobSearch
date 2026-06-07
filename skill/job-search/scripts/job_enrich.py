@@ -65,6 +65,7 @@ from claude_cli import (
     extract_assistant_text, parse_json_block, SMALLEST_MODEL, MID_MODEL,
 )
 from instrumentation.wrappers import wrapped_run_p
+import sdk_scoring
 from dedupe import Job
 from text_utils import fix_mojibake
 
@@ -1432,6 +1433,88 @@ _MAX_RESUME_PROMPT_CHARS = 12000
 _MAX_PREFS_PROMPT_CHARS = 4000
 
 
+# Split point for the SDK prompt-caching path. `_PROMPT` is
+# `<rubric + resume + prefs scaffolding>` followed by the volatile
+# `=== JOBS (JSON array) ===\n{jobs_json}` tail. The rubric+profile prefix
+# is byte-stable across every batch in a pass (same resume/prefs); the
+# job briefs are the only per-batch variation. Splitting at the JOBS
+# marker lets the SDK path put a cache_control breakpoint on the stable
+# prefix and the per-batch briefs after it. Computed once at import.
+_JOBS_MARKER = "=== JOBS (JSON array) ===\n"
+_PROMPT_SPLIT_IDX = _PROMPT.rfind(_JOBS_MARKER) + len(_JOBS_MARKER)
+_PROMPT_PREFIX_TMPL = _PROMPT[:_PROMPT_SPLIT_IDX]   # contains {resume}, {prefs_text}
+_PROMPT_SUFFIX_TMPL = _PROMPT[_PROMPT_SPLIT_IDX:]   # contains {jobs_json}
+
+
+def _build_scoring_prompt(
+    resume_text: str, prefs_text: str, jobs_json: str
+) -> tuple[str, str]:
+    """Build the (stable_prefix, volatile_suffix) prompt pair for one batch.
+
+    INVARIANT: `stable_prefix + volatile_suffix` is byte-for-byte equal to
+    `_PROMPT.format(resume=..., prefs_text=..., jobs_json=...)`. The CLI
+    path concatenates the two and is therefore UNCHANGED from before this
+    split existed; the SDK path sends them as two content blocks with a
+    cache breakpoint between. Keeping the identity means quality cannot
+    move between transports.
+
+    `stable_prefix` is the rubric + resume + prefs (constant per user per
+    pass — the cacheable part). `volatile_suffix` is just this batch's
+    jobs JSON.
+    """
+    resume = (resume_text or "")[:_MAX_RESUME_PROMPT_CHARS]
+    prefs = (prefs_text or "")[:_MAX_PREFS_PROMPT_CHARS]
+    stable_prefix = _PROMPT_PREFIX_TMPL.format(resume=resume, prefs_text=prefs)
+    volatile_suffix = _PROMPT_SUFFIX_TMPL.format(jobs_json=jobs_json)
+    return stable_prefix, volatile_suffix
+
+
+def _run_scoring_batch(
+    caller: str,
+    stable_prefix: str,
+    volatile_suffix: str,
+    *,
+    timeout_s: int,
+    model: str,
+) -> str | None:
+    """Run one scoring batch, choosing the transport AT CALL TIME.
+
+    Selection (the no-key guarantee lives here):
+      * ANTHROPIC_API_KEY ABSENT (current production) -> `sdk_available()`
+        is False -> the existing `wrapped_run_p` CLI path runs, with the
+        prompt reassembled as the exact same single string as before. Zero
+        behavior change for the live bot.
+      * ANTHROPIC_API_KEY PRESENT -> route through the Anthropic SDK
+        (`sdk_scoring.score_batch`) with cache_control on the rubric+profile
+        prefix. On ANY SDK error the call returns None and we FALL BACK to
+        the CLI path — the cycle never crashes on the SDK.
+
+    Both transports return / are normalised to a CLI-style JSON envelope
+    string (or None), so the caller parses both identically. This function
+    encapsulates the only place the two paths diverge.
+    """
+    if sdk_scoring.sdk_available():
+        envelope = sdk_scoring.score_batch(
+            None, caller, stable_prefix, volatile_suffix,
+            model=model, timeout_s=timeout_s,
+        )
+        if envelope is not None:
+            return envelope
+        # SDK path failed (error/timeout/unknown-model) — degrade to the
+        # CLI path rather than dropping the batch. Logged inside
+        # sdk_scoring at WARNING.
+        log.info(
+            "enrich_jobs_ai: SDK scoring returned None for %s — "
+            "falling back to CLI path", caller,
+        )
+    # Default / fallback: the existing wrapped CLI path. Reassemble the
+    # single prompt string (byte-identical to the pre-split build).
+    return wrapped_run_p(
+        None, caller, stable_prefix + volatile_suffix,
+        timeout_s=timeout_s, model=model,
+    )
+
+
 def _enrich_one_chunk(
     chunk: list[Job],
     resume_text: str,
@@ -1474,27 +1557,35 @@ def _enrich_one_chunk(
     a systematic failure can't fan out forever.
     """
     briefs = [_job_to_brief(j) for j in chunk]
-    prompt = _PROMPT.format(
-        resume=(resume_text or "")[:_MAX_RESUME_PROMPT_CHARS],
-        prefs_text=(prefs_text or "")[:_MAX_PREFS_PROMPT_CHARS],
-        jobs_json=json.dumps(briefs, ensure_ascii=False),
+    # Split the prompt into the byte-stable rubric+profile prefix and the
+    # per-batch jobs suffix. The CLI path concatenates them (unchanged
+    # bytes); the SDK path caches the prefix. See `_build_scoring_prompt`.
+    stable_prefix, volatile_suffix = _build_scoring_prompt(
+        resume_text, prefs_text,
+        json.dumps(briefs, ensure_ascii=False),
     )
     # Two-pass scoring: Haiku triage by default, Sonnet for the re-score on
     # survivors. Caller threads `model` + `pass_label` so each batch's
     # forensic line carries the model used (handy when comparing pass
     # outcomes post-hoc).
     caller = f"job_enrich:{pass_label}"
-    # Measure wall time around the CLI call so we can distinguish a
-    # timeout (CLI returned None because subprocess.TimeoutExpired fired,
-    # elapsed ≈ timeout_s) from a true CLI absence / immediate crash
-    # (elapsed ≈ 0). The two need different recovery paths: split-retry
-    # is right for the "small chance the prompt confused the model"
+    # Measure wall time around the call so we can distinguish a timeout
+    # (transport returned None because the call was cut off, elapsed ≈
+    # timeout_s) from a true CLI absence / immediate crash / fast SDK
+    # error (elapsed ≈ 0). The two need different recovery paths: split-
+    # retry is right for the "small chance the prompt confused the model"
     # cases (empty/parse/missing-fast), but a slow-success cutoff just
     # means the model is taking too long on THIS payload and a smaller
     # batch is the only thing that'll help. See `_BATCH_TIMEOUT`.
+    # `_run_scoring_batch` selects SDK-vs-CLI transport (gated on
+    # ANTHROPIC_API_KEY) and normalises both to a CLI-style JSON envelope,
+    # so everything below parses identically regardless of path.
     import time as _time
     _started = _time.monotonic()
-    stdout = wrapped_run_p(None, caller, prompt, timeout_s=timeout_s, model=model)
+    stdout = _run_scoring_batch(
+        caller, stable_prefix, volatile_suffix,
+        timeout_s=timeout_s, model=model,
+    )
     _elapsed = _time.monotonic() - _started
 
     reason = _BATCH_OK
@@ -1663,15 +1754,16 @@ def reanalyze_scoring_ai(
     prefs_text: str,
     *,
     timeout_s: int = 240,
-    model: str = "opus",
+    model: str = "sonnet",
     batch_size: int = 10,
     workers: int = 4,
-    critic_rounds: int = 3,
-    critic_model: str = "opus",
+    critic_rounds: int = 2,
+    critic_model: str = "sonnet",
 ) -> list[dict]:
     """v2.6 audit stage: re-grade score-≥1 verdicts with a second-opinion
-    model (Opus), split into small batches dispatched in parallel, each
-    batch paired with a runtime Opus CRITIC that re-verifies the scorer's
+    model (Sonnet by default — `defaults.ai_scoring_audit_model`), split
+    into small batches dispatched in parallel, each batch paired with a
+    runtime CRITIC (same model class) that re-verifies the scorer's
     output until both agree OR a round cap fires.
 
     Runs AFTER `send_per_job_digest` finishes — it is a quality-control
@@ -1679,8 +1771,8 @@ def reanalyze_scoring_ai(
     manual top-up later if a big miss is detected.
 
     Flow per batch:
-      1. Scorer (Opus) emits reviews for the batch.
-      2. Critic (Opus) verifies FORMAT + INTERNAL CONSISTENCY of those
+      1. Scorer emits reviews for the batch.
+      2. Critic verifies FORMAT + INTERNAL CONSISTENCY of those
          reviews: score in [0,5] integer, verdict in {agree,raise,lower},
          the verdict matches the score delta direction (agree↔equal,
          raise↔higher, lower↔lower), comment ≤240 chars one sentence,

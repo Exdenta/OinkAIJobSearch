@@ -106,9 +106,13 @@ def _normalize_linkedin_geo(geo: str) -> str | None:
 # walk 4 pages per query (start=0/10/25/50), each returning ~25 fresh
 # cards after dedupe → ~75-100 unique results per query, 5 queries
 # total → max ~300-500 LinkedIn candidates per user per run (capped at
-# 60/query). LinkedIn anonymous rate limit handles this comfortably at
+# 72/query). LinkedIn anonymous rate limit handles this comfortably at
 # PACE_SECONDS=1.5 between requests.
-PER_QUERY_CAP = 60
+# 2026-06-07: bumped 60 → 72 (×1.2) to widen LinkedIn raw intake — it's
+# the volume workhorse for relevant supply (see source-yield audit). The
+# extra page-depth stays within LinkedIn's anonymous rate ceiling at the
+# 1.5s pacing; applies to ALL users (global knob).
+PER_QUERY_CAP = 72
 
 # How many additional pages to try per query when page 1 is short of
 # `PER_QUERY_CAP`. LinkedIn returns 25 cards per page; added start=50
@@ -405,6 +409,7 @@ def fetch_for_user(
     *,
     db=None,
     min_revisit_age_s: int = 21600,
+    attribution: dict | None = None,
 ) -> list[Job]:
     """Per-user LinkedIn fetch — dispatches a cross-product of queries × geos.
 
@@ -446,6 +451,16 @@ def fetch_for_user(
       * `_RateLimited` aborts the whole batch (returns what we have).
 
     If user_seeds is None / missing / has no usable queries → returns [].
+
+    `attribution` (M2 per-query telemetry): when a mutable dict is passed,
+    each returned Job's `job_id` is mapped to the originating query string
+    (``query["q"]``). The caller rolls these up into the `query_runs`
+    funnel table so the query optimiser can attribute downstream
+    score/match/send outcomes back to the seed that produced them. A job
+    that surfaces under multiple queries is attributed to the FIRST query
+    that produced it (the page-walk dedupes on URL, so this is the query
+    that actually fetched it). Best-effort and side-channel only — never
+    affects the returned Job list.
     """
     queries: list[dict] = _flatten_user_seeds(user_seeds)
 
@@ -527,6 +542,17 @@ def fetch_for_user(
                             q_idx + 1, len(queries), start)
                 return combined
             combined.extend(batch)
+            if attribution is not None:
+                # Map each freshly-fetched job to the query that produced
+                # it. setdefault → first-query-wins for jobs that a later
+                # query would re-surface (the URL-dedupe in `_one_search`
+                # already prevents true duplicates within a run, so in
+                # practice each job is attributed exactly once).
+                for _j in batch:
+                    try:
+                        attribution.setdefault(_j.job_id, query["q"])
+                    except Exception:
+                        pass
             per_query_total += len(batch)
             log.info(
                 "linkedin[user]: query %d/%d %r @ %r start=%d (page=%d) → %d jobs (q-total %d, run-total %d)",
