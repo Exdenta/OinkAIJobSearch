@@ -332,8 +332,8 @@ DEFAULTS: dict = {
     # the operator's desktop browser, so it is strictly opt-in and OFF by
     # default — when OFF, every adapter behaves EXACTLY as today (the helper
     # returns []/"" immediately, with NO subprocess spawned).
-    "chrome_agent_fallback_enabled": False,   # opt-in; drives the OPERATOR desktop Chrome via claude -p --chrome. OFF means every adapter behaves exactly as today.
-    "chrome_agent_device_id": "",             # pin a specific connected Chrome (deviceId from list_connected_browsers); "" means use the single/active browser.
+    "chrome_agent_fallback_enabled": True,    # ENABLED 2026-06-07. Drives the OPERATOR desktop Chrome via claude -p --chrome; fires only when a source's primary path returns 0 (blocked). Requires the pinned browser below to be running + extension-connected at run time, else degrades to []/"".
+    "chrome_agent_device_id": "3754ee86-8ead-4dd0-9d27-15464be31649",  # pinned to the Windows Chrome used for recon. REQUIRED here because 2 browsers are connected — with "" the agent can't disambiguate and the fallback no-ops. Change to the macOS deviceId (25b32046-d703-4515-911b-dabafb410967) if that one is the always-on machine.
     "chrome_agent_timeout_s": 240,            # per-call cap for the agentic browser fetch.
 
     # Per-scrape timeout for Claude-CLI-backed adapters (curated_boards).

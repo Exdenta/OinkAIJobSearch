@@ -174,13 +174,13 @@ def _run_chrome_agent(prompt: str, *, timeout_s: int) -> str | None:
             env=dict(os.environ),
         )
     except subprocess.TimeoutExpired:
-        log.debug("chrome_agent: timed out after %ds", timeout_s)
+        log.info("chrome_agent: timed out after %ds", timeout_s)
         return None
     except Exception as e:
-        log.debug("chrome_agent: failed to start: %s", e)
+        log.info("chrome_agent: failed to start: %s", e)
         return None
     if proc.returncode != 0:
-        log.debug(
+        log.info(
             "chrome_agent: exit=%s err=%s",
             proc.returncode, (proc.stderr or "")[:200],
         )
@@ -232,6 +232,7 @@ def fetch_listings_via_chrome(
     prompt = _build_listings_prompt(
         url=url, instruction=instruction, max_items=max_items, device_id=device,
     )
+    log.info("chrome_agent: attempting listings fetch %s (timeout %ds)", url, timeout)
     stdout = _run_chrome_agent(prompt, timeout_s=timeout)
     if not stdout:
         return []
@@ -247,7 +248,7 @@ def fetch_listings_via_chrome(
     if out:
         log.info("chrome_agent: recovered %d listings from %s", len(out), url)
     else:
-        log.debug("chrome_agent: %s returned no listings", url)
+        log.info("chrome_agent: %s returned no listings", url)
     return out
 
 
@@ -278,6 +279,7 @@ def fetch_page_text_via_chrome(
     timeout = int(timeout_s) if timeout_s is not None else cfg_timeout
 
     prompt = _build_page_text_prompt(url=url, device_id=device)
+    log.info("chrome_agent: attempting page-text fetch %s (timeout %ds)", url, timeout)
     stdout = _run_chrome_agent(prompt, timeout_s=timeout)
     if not stdout:
         return ""
@@ -286,5 +288,5 @@ def fetch_page_text_via_chrome(
     if text:
         log.info("chrome_agent: recovered page text from %s (%d chars)", url, len(text))
     else:
-        log.debug("chrome_agent: %s returned empty page text", url)
+        log.info("chrome_agent: %s returned empty page text", url)
     return text
