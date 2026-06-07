@@ -15,3 +15,22 @@ beautifulsoup4>=4.12
 python-dotenv>=1.0
 pdfplumber>=0.10
 python-docx>=1.0
+# Optional: only used by the prompt-caching SDK scoring path in
+# skill/job-search/scripts/sdk_scoring.py, which is GATED behind
+# ANTHROPIC_API_KEY. The live bot authenticates via the Claude Code
+# subscription (no API key) and never imports this at runtime, so a
+# missing `anthropic` here is harmless in production — sdk_scoring
+# degrades to the existing `claude -p` CLI path. Install it only when
+# you intend to run the SDK+caching path (ANTHROPIC_API_KEY set).
+anthropic>=0.40
+
+# Optional: headless-browser fallback tier for anti-bot-blocked job-detail
+# pages (skill/job-search/scripts/browser_fetch.py), GATED behind the
+# `browser_fetch_fallback_enabled` flag in defaults.py (default FALSE). When
+# the flag is off OR this package / its browser binary is absent, the
+# pipeline behaves exactly as before (the fallback returns None and the
+# detail fetch keeps its original "" result). Installing the package is NOT
+# enough — the chromium binary must also be downloaded ONCE on the host:
+#     pip install playwright
+#     playwright install chromium   # one-time, downloads the browser binary
+playwright>=1.40

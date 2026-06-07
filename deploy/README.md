@@ -223,9 +223,9 @@ two env vars, `systemctl enable --now hryu-digest.timer`, restart the bot.
 
 ## Limitations / known issues
 
-  token in the query string. Real SMTP delivery is Phase 3. Do not expose
-  the web frontend to untrusted users yet — anyone with a chat_id can sign
-  in as that user.
+  mints a real DB-backed token (sha256-hashed, 15-min expiry, single-use)
+  and prints the verify link to stdout — real SMTP delivery is a follow-up.
+  that existed during the mock phase is closed.
 - **Web profile builder is a stub.** The bot's full Opus profile pipeline
   for `HRYU_BUILD_DELAY` seconds and writes a placeholder profile.
 - **No HA or failover.** Single CX22, single SQLite file. Fine for the MVP;

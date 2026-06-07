@@ -135,6 +135,18 @@ fi
 chmod 600 "${ENV_FILE}"
 chown "${HRYU_USER}:${HRYU_USER}" "${ENV_FILE}"
 
+# without this. Idempotent: only fires when no non-empty value is set.
+    SESSION_SECRET="$(openssl rand -hex 32)"
+        # Empty-value line present — replace it in place.
+            "${ENV_FILE}"
+    else
+        # Line missing entirely — append it.
+    fi
+    unset SESSION_SECRET
+    chmod 600 "${ENV_FILE}"
+    chown "${HRYU_USER}:${HRYU_USER}" "${ENV_FILE}"
+fi
+
 # Ensure Caddy can write its access log dir.
 install -d -o caddy -g caddy -m 0755 /var/log/caddy 2>/dev/null \
     || install -d -m 0755 /var/log/caddy
