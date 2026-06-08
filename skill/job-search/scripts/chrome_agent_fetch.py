@@ -76,6 +76,7 @@ _CHROME_TOOLS = (
     "mcp__claude-in-chrome__select_browser",
     "mcp__claude-in-chrome__list_connected_browsers",
     "mcp__claude-in-chrome__find",
+    "mcp__claude-in-chrome__tabs_close_mcp",
 )
 ALLOWED = ",".join(_CHROME_TOOLS)
 
@@ -121,16 +122,24 @@ def _build_listings_prompt(
         "You are a headless extraction agent driving a real desktop Chrome via "
         "the claude-in-chrome MCP tools. Do exactly the following, then stop.\n"
         f"{_browser_selection_clause(device_id)}\n"
-        "Then create a new tab (tabs_create_mcp), navigate to the URL below, "
-        "and wait for the page to fully load.\n"
+        "Then create a new tab (tabs_create_mcp) and navigate to the URL below.\n"
         f"URL: {url}\n"
-        f"From the rendered page, extract up to {max_items} job postings that "
+        "IMPORTANT: this is a JavaScript app — the job listings render a few "
+        "seconds AFTER the page first loads. Do NOT read the page immediately. "
+        "Read it (get_page_text or javascript_tool); if you do not yet see job "
+        "cards/listings, wait ~3 seconds and read again, repeating up to 3 times "
+        "until listings are present.\n"
+        f"Once listings are present, extract up to {max_items} job postings that "
         f"match this instruction: {instruction}\n"
+        "When you have the data (or have concluded the page is blocked), close "
+        "the tab you created with tabs_close_mcp so tabs do not accumulate.\n"
         "Return STRICT JSON and nothing else (no prose, no code fences):\n"
         '{"jobs":[{"title":"","company":"","location":"","url":"",'
         '"posted_at":"","snippet":""}]}\n'
-        'If the page is blocked, gated, or has no matching postings, return '
-        '{"jobs":[]}. Every field must be a string; use "" when unknown.'
+        'Only return {"jobs":[]} if, after those retries, the page genuinely '
+        "shows a block/challenge/captcha or has no matching postings. A "
+        "non-blocking cookie banner is NOT a block — extract the listings behind "
+        'it. Every field must be a string; use "" when unknown.'
     )
 
 
@@ -139,12 +148,18 @@ def _build_page_text_prompt(*, url: str, device_id: str | None) -> str:
         "You are a headless extraction agent driving a real desktop Chrome via "
         "the claude-in-chrome MCP tools. Do exactly the following, then stop.\n"
         f"{_browser_selection_clause(device_id)}\n"
-        "Then create a new tab (tabs_create_mcp), navigate to the URL below, "
-        "and wait for the page to fully load.\n"
+        "Then create a new tab (tabs_create_mcp) and navigate to the URL below.\n"
         f"URL: {url}\n"
+        "IMPORTANT: many sites render their main content via JavaScript a few "
+        "seconds after the initial load. Do NOT read immediately — read the "
+        "page; if the body looks empty or like a loading state, wait ~3 seconds "
+        "and read again, up to 3 times, until the real content is present.\n"
+        "When you have read the content (or concluded it is blocked), close the "
+        "tab you created with tabs_close_mcp so tabs do not accumulate.\n"
         "Return ONLY the cleaned visible body text of the page as plain text "
         "(no HTML, no navigation chrome, no prose of your own, no code fences). "
-        "If the page is blocked or empty, return an empty response."
+        "Return an empty response only if the page genuinely shows a "
+        "block/challenge or has no content after those retries."
     )
 
 
