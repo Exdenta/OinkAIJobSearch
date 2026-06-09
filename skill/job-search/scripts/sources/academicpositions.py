@@ -330,16 +330,29 @@ def _parse_listing_html(html: str, *, cap: int) -> list[Job]:
     return jobs
 
 
-# Canonical "all positions, newest first" listing URL for the chrome-agent
-# last-resort fallback. AcademicPositions sits behind Cloudflare Bot-Fight-Mode,
-# so the plain `requests` RSS + HTML paths above 403; the operator's real
-# desktop Chrome is already past that gate.
-_CHROME_LISTING_URL = (
-    "https://academicpositions.com/jobs/position/all/all/all?sort=newest"
-)
+# Canonical listing URL for the chrome-agent last-resort fallback.
+# AcademicPositions sits behind Cloudflare Bot-Fight-Mode, so the plain
+# `requests` RSS + HTML paths above 403; the operator's real desktop Chrome
+# is already past that gate. NOTE (2026-06-09): the old guessed path
+# `/jobs/position/all/all/all?sort=newest` is a 404 (renders "Page not
+# found"), which is why the fallback returned 0 every run. The real listings
+# page is `/find-jobs` (verified: "1217 JOBS", redirects to ?page=1).
+_CHROME_LISTING_URL = "https://academicpositions.com/find-jobs"
 _CHROME_INSTRUCTION = (
-    "academic and research job positions: title, institution, location, "
-    "posting URL, field"
+    "academic and research job positions (title, institution, location, "
+    "posting URL, field/discipline). CRITICAL FIRST STEP: this page opens with "
+    "a 'Choose your region' modal that HIDES all listings until a region is "
+    "selected, and the listings will NOT appear in the DOM until you dismiss "
+    "it. You MUST do this before extracting: use the javascript_tool to run "
+    "exactly — "
+    "[...document.querySelectorAll('a,button,li,div')]"
+    ".find(e=>(e.innerText||'').trim()==='International')?.click() — "
+    "then WAIT ~3 seconds for the listings to load. After that, the job "
+    "postings are links to /ad/<slug> with academic titles (e.g. 'Assistant "
+    "Professor in Computing Science', 'Faculty Position in Political Science'); "
+    "read them with the javascript_tool and extract each title, institution, "
+    "location, and the /ad/ URL. Only return an empty result if, AFTER "
+    "clicking a region and waiting, there are genuinely no /ad/ job links."
 )
 
 
