@@ -268,14 +268,21 @@ def test_chat_id_passed_to_search_callable() -> None:
 
 
 def test_ctor_rejects_invalid_args() -> None:
-    section("6. constructor rejects non-positive chat_id / interval")
-    for bad_chat in (0, -1):
-        try:
-            ContinuousSearcher(db=None, chat_id=bad_chat, interval_seconds=10)
-        except ValueError:
-            _assert(True, f"chat_id={bad_chat} → ValueError")
-        else:
-            _assert(False, f"chat_id={bad_chat} should have raised ValueError")
+    section("6. constructor rejects chat_id=0 / non-positive interval")
+    # 0 is meaningless; NEGATIVE ids are valid — they're web-only accounts
+    # (the pipeline skips Telegram delivery for them).
+    try:
+        ContinuousSearcher(db=None, chat_id=0, interval_seconds=10)
+    except ValueError:
+        _assert(True, "chat_id=0 → ValueError")
+    else:
+        _assert(False, "chat_id=0 should have raised ValueError")
+
+    web = ContinuousSearcher(
+        db=None, chat_id=-1, interval_seconds=10,
+        search_run_callable=lambda **kw: 0, min_sleep_seconds=1,
+    )
+    _assert(web.chat_id == -1, "negative (web-only) chat_id constructs")
 
     for bad_interval in (0, -5):
         try:
