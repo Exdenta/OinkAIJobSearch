@@ -78,8 +78,11 @@ class ContinuousSearcher:
         clock: Optional[Callable[[], float]] = None,
         min_sleep_seconds: Optional[int] = None,
     ) -> None:
-        if chat_id <= 0:
-            raise ValueError(f"chat_id must be positive, got {chat_id!r}")
+        # Positive = Telegram chat, negative = web-only account (the
+        # search pipeline skips Telegram delivery for those and serves
+        # the web feed instead). Only 0 is meaningless.
+        if chat_id == 0:
+            raise ValueError(f"chat_id must be non-zero, got {chat_id!r}")
         if interval_seconds <= 0:
             raise ValueError(
                 f"interval_seconds must be positive, got {interval_seconds!r}",

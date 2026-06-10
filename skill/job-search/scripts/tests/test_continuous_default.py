@@ -393,9 +393,106 @@ def main() -> int:
     test_live_spawn_env_pinned_exclude_and_include()
     test_live_spawn_idempotent_for_already_running()
     test_continuous_mode_enabled_truthy_values()
+    test_web_users_negative_chat_ids_are_searchable()
+    test_continuous_searcher_ctor_accepts_negative()
+    test_reconciler_spawns_missing_users()
     print("\nAll continuous-default tests passed.")
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def test_web_users_negative_chat_ids_are_searchable() -> None:
+    section("11. negative (web-only) chat_ids flow through enumerate + spawn")
+    _fresh_registry()
+    db = _make_tmpdb()
+    # Telegram user and a web-only user, both fully onboarded.
+    _seed_user(db, 100, completed=True, profile='{"x":1}')
+    _seed_user(db, -3, completed=True, profile='{"x":1}')
+
+    ids = db.onboarded_chat_ids()
+    _assert(ids == [-3, 100], f"web user should enumerate; got {ids!r}")
+
+    class _StubSearcher:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def run_forever(self):
+            import asyncio as _aio
+            await _aio.sleep(60)
+
+    import continuous_searcher
+    orig = continuous_searcher.ContinuousSearcher
+    continuous_searcher.ContinuousSearcher = _StubSearcher  # type: ignore[assignment]
+    try:
+        t = bot._spawn_continuous_searcher_thread(db, -3, startup_delay=0)
+        _assert(t is not None, "spawn accepts a negative chat_id")
+        _assert(-3 in bot._CONTINUOUS_REGISTRY, "registry holds the web user")
+        t0 = bot._spawn_continuous_searcher_thread(db, 0, startup_delay=0)
+        _assert(t0 is None, "chat_id=0 is still refused")
+    finally:
+        continuous_searcher.ContinuousSearcher = orig  # type: ignore[assignment]
+        _fresh_registry()
+
+
+def test_continuous_searcher_ctor_accepts_negative() -> None:
+    section("12. ContinuousSearcher accepts negative chat_id, refuses 0")
+    from continuous_searcher import ContinuousSearcher
+
+    s = ContinuousSearcher(
+        db=None, chat_id=-7, interval_seconds=10,
+        search_run_callable=lambda **kw: 0, min_sleep_seconds=1,
+    )
+    _assert(s.chat_id == -7, "negative chat_id constructs")
+    try:
+        ContinuousSearcher(
+            db=None, chat_id=0, interval_seconds=10,
+            search_run_callable=lambda **kw: 0, min_sleep_seconds=1,
+        )
+        _assert(False, "chat_id=0 should raise ValueError")
+    except ValueError:
+        _assert(True, "chat_id=0 raises ValueError")
+
+
+def test_reconciler_spawns_missing_users() -> None:
+    section("13. reconcile pass spawns users missing from the registry")
+    _fresh_registry()
+    db = _make_tmpdb()
+    _seed_user(db, 100, completed=True, profile='{"x":1}')
+    _seed_user(db, -4, completed=True, profile='{"x":1}')
+
+    calls: list[int] = []
+
+    def _fake_spawn(_db, cid, _delay, **_kw):
+        calls.append(cid)
+        t = threading.Thread(target=lambda: time.sleep(30), daemon=True)
+        with bot._CONTINUOUS_REGISTRY_LOCK:
+            bot._CONTINUOUS_REGISTRY[cid] = t
+        t.start()
+        return t
+
+    orig = bot._spawn_continuous_searcher_thread
+    bot._spawn_continuous_searcher_thread = _fake_spawn  # type: ignore[assignment]
+    try:
+        with _EnvVar("HRYU_CONTINUOUS_CHAT_ID", None):
+            spawned = bot._reconcile_continuous_once(db)
+            _assert(sorted(calls) == [-4, 100],
+                    f"first pass spawns both users; got {calls!r}")
+            _assert(len(spawned) == 2, "returns the new threads")
+
+            calls.clear()
+            spawned = bot._reconcile_continuous_once(db)
+            _assert(calls == [], "second pass is a no-op (registry full)")
+            _assert(spawned == [], "no threads on a no-op pass")
+
+        # Env pin restricts the reconciler exactly like startup.
+        _fresh_registry()
+        calls.clear()
+        with _EnvVar("HRYU_CONTINUOUS_CHAT_ID", "100"):
+            bot._reconcile_continuous_once(db)
+            _assert(calls == [100], f"pin honored; got {calls!r}")
+    finally:
+        bot._spawn_continuous_searcher_thread = orig  # type: ignore[assignment]
+        _fresh_registry()

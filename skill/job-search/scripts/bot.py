@@ -701,6 +701,7 @@ def _handle_filter_button(
                 min_score=new_floor,
                 run_id=run_id,
                 skip_header=True,
+                db=db,
             )
         except Exception:
             log.exception("flt:lwr replay failed")
@@ -3021,8 +3022,11 @@ def _spawn_continuous_searcher_thread(
 
     Returns the (new or existing) Thread, or None when chat_id is invalid.
     """
-    if chat_id <= 0:
-        log.warning("spawn_continuous_searcher: refusing non-positive chat_id=%r", chat_id)
+    # Negative chat_ids are web-only accounts — they get searched like
+    # everyone else (the pipeline skips Telegram delivery for them; the
+    # web feed reads digest_run_jobs). Only 0 is invalid.
+    if chat_id == 0:
+        log.warning("spawn_continuous_searcher: refusing chat_id=0")
         return None
 
     if interval is None or min_sleep is None:
@@ -3202,6 +3206,80 @@ def start_continuous_searcher_for(db: DB, chat_id: int) -> threading.Thread | No
     return _spawn_continuous_searcher_thread(db, chat_id, delay)
 
 
+# How often the reconciler re-reads the DB for newly-onboarded users.
+_CONTINUOUS_RECONCILE_DEFAULT_S = 600
+
+
+def _start_continuous_reconciler(db: DB) -> threading.Thread | None:
+    """Daemon thread that periodically reconciles the searcher registry
+    against the DB's onboarded users.
+
+    Why: users can finish onboarding in the WEB process (negative
+    chat_ids minted by the FastAPI backend) — the bot only learns about
+    them by re-reading the DB. Telegram onboarding live-spawns in-process
+    and doesn't need this; the reconciler is the cross-process analogue.
+    It also resurrects searcher threads that died, since spawn is
+    idempotent per chat_id and replaces dead registry entries.
+
+    Resolution honors the same rules as startup: when
+    HRYU_CONTINUOUS_CHAT_ID pins a list, only those ids ever spawn.
+    Disable with HRYU_CONTINUOUS_RECONCILE_S=0.
+    """
+    if not _continuous_mode_enabled():
+        return None
+    try:
+        period = int(
+            os.environ.get("HRYU_CONTINUOUS_RECONCILE_S")
+            or _CONTINUOUS_RECONCILE_DEFAULT_S
+        )
+    except ValueError:
+        period = _CONTINUOUS_RECONCILE_DEFAULT_S
+    if period <= 0:
+        log.info("continuous_reconciler disabled (HRYU_CONTINUOUS_RECONCILE_S<=0)")
+        return None
+
+    import time as _time
+
+    def _loop() -> None:
+        while True:
+            _time.sleep(period)
+            try:
+                _reconcile_continuous_once(db)
+            except Exception:
+                log.exception("continuous_reconciler: pass failed; continuing")
+
+    t = threading.Thread(target=_loop, daemon=True, name="continuous_reconciler")
+    t.start()
+    log.info("continuous_reconciler started (period=%ds)", period)
+    return t
+
+
+def _reconcile_continuous_once(db: DB) -> list[threading.Thread]:
+    """One reconcile pass: spawn searchers for resolved users missing
+    from the registry (or whose thread died). Returns newly-spawned
+    threads. Extracted from the loop for testability."""
+    chat_ids = _resolve_continuous_chat_ids(db)
+    interval, min_sleep = _continuous_interval_and_floor()
+    fresh: list[int] = []
+    with _CONTINUOUS_REGISTRY_LOCK:
+        for cid in chat_ids:
+            existing = _CONTINUOUS_REGISTRY.get(cid)
+            if existing is None or not existing.is_alive():
+                fresh.append(cid)
+    spawned: list[threading.Thread] = []
+    for idx, cid in enumerate(fresh):
+        log.info("continuous_reconciler: spawning searcher for chat_id=%d", cid)
+        # Mini-stagger so a batch of new users doesn't fire its first
+        # iteration at the same instant.
+        t = _spawn_continuous_searcher_thread(
+            db, cid, _LIVE_SPAWN_DELAY_MIN + idx * 60,
+            interval=interval, min_sleep=min_sleep,
+        )
+        if t is not None:
+            spawned.append(t)
+    return spawned
+
+
 # ---------- main loop ----------
 
 def main() -> int:
@@ -3236,6 +3314,10 @@ def main() -> int:
         _maybe_start_continuous_searcher(db)
     except Exception:
         log.exception("continuous_searcher: failed to start; continuing without it")
+    try:
+        _start_continuous_reconciler(db)
+    except Exception:
+        log.exception("continuous_reconciler: failed to start; continuing without it")
 
     log.info("Bot started. Polling for updates…")
     running = True

@@ -1252,6 +1252,14 @@ def run(
                 stats["users_total"] += 1
                 user_started_at = time.time()
 
+                # Negative chat_ids are web-only accounts (allocated by the
+                # web backend's magic-link flow) — there is no Telegram chat
+                # to deliver to. Their delivery surface is `digest_run_jobs`
+                # (recorded below, read by GET /api/feed) plus an optional
+                # rate-limited email ping. Everything send-shaped downstream
+                # keys off this flag, exactly like an operator --no-send.
+                user_no_send = no_send or chat_id < 0
+
                 # Algorithm v2: profile JSON is now a thin envelope
                 # (search_seeds + bookkeeping). Scoring inputs come from the
                 # per-user files state/users/<chat_id>/{resume.txt,prefs.txt}.
@@ -1611,7 +1619,7 @@ def run(
 
                 buffer_depth = 0
                 buffer_oldest_age = 0.0
-                if no_send:
+                if user_no_send:
                     user_jobs = alive_floor
                 else:
                     user_profile_hash = _profile_hash(resume_text, prefs_text)
@@ -1823,28 +1831,47 @@ def run(
                 # reflects the actual count the user will see, not the
                 # pre-gate score-floor count.
 
-                if no_send:
-                    # Preview path: print what would be sent, skip Telegram
-                    # delivery + sent_messages persistence + the post-send
-                    # scoring_audit pass.
-                    print(
-                        f"\n=== NO-SEND PREVIEW · chat={chat_id} · "
-                        f"{len(user_jobs)} jobs would be sent "
-                        f"(min_score={min_score}) ===\n"
-                    )
-                    scored = []
-                    for j in user_jobs:
-                        enr = enrichments_by_job_id.get(j.job_id) or {}
-                        score = int(enr.get("match_score") or 0)
-                        scored.append((score, j, enr))
-                    scored.sort(key=lambda t: -t[0])
-                    for score, j, enr in scored:
-                        why = (enr.get("why_match") or "")[:120]
-                        print(f"  [{score}⭐] [{j.source}] {j.title} @ {j.company}")
-                        if why:
-                            print(f"        why: {why}")
-                        print(f"        {j.url}")
-                    print()
+                if user_no_send:
+                    if no_send:
+                        # Operator preview path: print what would be sent,
+                        # skip Telegram delivery + sent_messages persistence
+                        # + the post-send scoring_audit pass.
+                        print(
+                            f"\n=== NO-SEND PREVIEW · chat={chat_id} · "
+                            f"{len(user_jobs)} jobs would be sent "
+                            f"(min_score={min_score}) ===\n"
+                        )
+                        scored = []
+                        for j in user_jobs:
+                            enr = enrichments_by_job_id.get(j.job_id) or {}
+                            score = int(enr.get("match_score") or 0)
+                            scored.append((score, j, enr))
+                        scored.sort(key=lambda t: -t[0])
+                        for score, j, enr in scored:
+                            why = (enr.get("why_match") or "")[:120]
+                            print(f"  [{score}⭐] [{j.source}] {j.title} @ {j.company}")
+                            if why:
+                                print(f"        why: {why}")
+                            print(f"        {j.url}")
+                        print()
+                    else:
+                        # Web-only user in a live run: the feed rows are
+                        # already in digest_run_jobs; optionally ping them
+                        # by email (rate-limited inside the emailer).
+                        log.info(
+                            "User %s: web-only — %d alive-floor matches "
+                            "recorded for the feed, Telegram skipped",
+                            chat_id, len(user_jobs),
+                        )
+                        try:
+                            from emailer import maybe_send_web_digest_email
+                            maybe_send_web_digest_email(
+                                db, chat_id, user_jobs, enrichments_by_job_id,
+                            )
+                        except Exception:
+                            log.exception(
+                                "web digest email hook failed for %s", chat_id,
+                            )
                 else:
                     try:
                         _sent_jobs_this_run: list[str] = []
@@ -1861,6 +1888,7 @@ def run(
                             dropped_below_score=dropped_below_score,
                             lower_count_at_step=lower_count_at_step,
                             pre_filtered=True,
+                            db=db,
                         )
                         total_sent += sent
                         sent_ids_this_run = set(_sent_jobs_this_run)
@@ -1906,7 +1934,7 @@ def run(
                 # `scoring_audit.review` lines so we can grep for
                 # systematic misses post-hoc and decide whether a
                 # follow-up manual top-up is warranted.
-                if (not no_send) and filters.get("ai_scoring_audit", True) and enrichments_by_job_id:
+                if (not user_no_send) and filters.get("ai_scoring_audit", True) and enrichments_by_job_id:
                     try:
                         ext_to_job = {j.external_id: j for j in user_pool}
                         # Audit score-≥1 only — score-0s are firmly
