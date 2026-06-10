@@ -64,6 +64,7 @@ say "install Python deps + rebuild frontend"
 ssh "${SSH_TARGET}" 'bash -se' <<'REMOTE' || { echo "remote install failed" >&2; exit 4; }
 set -euo pipefail
 sudo -u hryu /home/hryu/venv/bin/pip install -r /home/hryu/app/requirements.txt
+# The dist/ output is what production serves; node_modules never ships.
 REMOTE
 
 # ----- 3. restart services + reload Caddy -------------------------------

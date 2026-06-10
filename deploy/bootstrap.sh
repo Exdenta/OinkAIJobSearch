@@ -161,7 +161,7 @@ run_as_hryu "'${VENV_DIR}/bin/pip' install -r '${APP_DIR}/requirements.txt'"
 
 # ----- 7. Frontend build ------------------------------------------------
 say "Step 7/10: Frontend build"
-fi
+# what Caddy serves; node_modules itself never ships to users.
 
 # ----- 8. systemd units -------------------------------------------------
 say "Step 8/10: systemd units"
