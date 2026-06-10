@@ -197,6 +197,21 @@ CREATE TABLE IF NOT EXISTS job_scores (
     scored_at     REAL    NOT NULL,
     PRIMARY KEY (chat_id, job_id, profile_hash)
 );
+-- Cache of hiring-contact lookups ("who to write to" on job cards).
+-- One row per job — not per user — because the right person to contact
+-- is a property of the opening, not of who receives it. status 'found'
+-- rows carry the normalized contact dict (name / title / profile_url /
+-- reason / confidence); 'not_found' rows cache the negative verdict so
+-- digest replays and multi-user sends don't re-burn web searches on
+-- the same posting. Transport errors are never written here — they
+-- retry on the next send attempt. See hiring_contact.py.
+CREATE TABLE IF NOT EXISTS hiring_contacts (
+    job_id       TEXT PRIMARY KEY,
+    status       TEXT NOT NULL,      -- found | not_found
+    contact_json TEXT,               -- serialized contact dict when found
+    updated_at   REAL NOT NULL
+);
+
 -- Per-(user, job) record of "View posting" link clicks. Populated by the
 -- in-process redirect server when a user taps the URL button on a job
 -- card. Multiple clicks for the same (chat, job) produce multiple rows
@@ -406,6 +421,18 @@ class DB:
             c.execute("ALTER TABLE users ADD COLUMN email TEXT")
         if "email_verified_at" not in have_cols:
             c.execute("ALTER TABLE users ADD COLUMN email_verified_at REAL")
+        # Web digest-notification opt-out. Default ON: a web-only user with
+        # no Telegram chat has no other push channel, so the product loop
+        # depends on this. Telegram users keep email = NULL and never get
+        # mail regardless of the flag. `last_email_notified_at` rate-limits
+        # the continuous searcher's 2h cadence down to ~daily mail.
+        if "notify_email" not in have_cols:
+            c.execute(
+                "ALTER TABLE users ADD COLUMN "
+                "notify_email INTEGER NOT NULL DEFAULT 1"
+            )
+        if "last_email_notified_at" not in have_cols:
+            c.execute("ALTER TABLE users ADD COLUMN last_email_notified_at REAL")
 
         # Auto-rebuild counter (algorithm v2.8, P4 pipeline overhaul).
         # Bumped on every `append_skip_note` call; the searcher checks
@@ -588,6 +615,40 @@ class DB:
                 "UPDATE users SET email = ?, email_verified_at = ? WHERE chat_id = ?",
                 (normalized, verified_at, chat_id),
             )
+
+    def set_notify_email(self, chat_id: int, enabled: bool) -> None:
+        with self._conn() as c:
+            c.execute(
+                "UPDATE users SET notify_email = ? WHERE chat_id = ?",
+                (1 if enabled else 0, chat_id),
+            )
+
+    def get_notify_email(self, chat_id: int) -> bool:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT notify_email FROM users WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchone()
+        if row is None:
+            return False
+        return bool(row["notify_email"])
+
+    def set_last_email_notified_at(self, chat_id: int, ts: float) -> None:
+        with self._conn() as c:
+            c.execute(
+                "UPDATE users SET last_email_notified_at = ? WHERE chat_id = ?",
+                (float(ts), chat_id),
+            )
+
+    def get_last_email_notified_at(self, chat_id: int) -> float | None:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT last_email_notified_at FROM users WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchone()
+        if row is None or row["last_email_notified_at"] is None:
+            return None
+        return float(row["last_email_notified_at"])
 
     def allocate_web_chat_id(self) -> int:
         """Reserve a negative chat_id for a web-only user (never seen on
@@ -2592,6 +2653,38 @@ class DB:
             if current_resume_sha1 is not None and row["resume_sha1"] != current_resume_sha1:
                 return None
             return row
+
+    def upsert_hiring_contact(
+        self,
+        job_id: str,
+        status: str,
+        contact_json: str | None,
+    ) -> None:
+        """Store a hiring-contact verdict for this job. `status` is
+        'found' (contact_json holds the dict) or 'not_found'
+        (contact_json is None). Overwrites any previous row."""
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT INTO hiring_contacts (job_id, status, contact_json, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(job_id) DO UPDATE SET
+                    status       = excluded.status,
+                    contact_json = excluded.contact_json,
+                    updated_at   = excluded.updated_at
+                """,
+                (job_id, status, contact_json, time.time()),
+            )
+
+    def get_hiring_contact(self, job_id: str) -> sqlite3.Row | None:
+        """Return the cached hiring-contact row for this job, or None when
+        no lookup has completed yet (errors are never cached, so None also
+        covers 'last attempt failed — try again')."""
+        with self._conn() as c:
+            return c.execute(
+                "SELECT * FROM hiring_contacts WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
 
     def delete_fit_analyses(self, chat_id: int) -> int:
         """Wipe every cached fit analysis for this user. Called by the
