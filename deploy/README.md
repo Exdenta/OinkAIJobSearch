@@ -3,6 +3,31 @@
 Turnkey deploy bundle. Target: a single Hetzner CX22 (or equivalent), Ubuntu
 24.04 LTS. Goes from a fresh server to a running production install with
 
+## Go-live checklist (~30 min once you have a domain)
+
+Everything code-side is done; these are the operator steps:
+
+1. **Domain + server**: buy/point a domain, create a CX22 (Ubuntu 24.04),
+   set DNS A/AAAA records, wait for `dig +short yourdomain.tld`.
+2. **Provision** (sections below): rsync/clone the repo to
+   `/home/hryu/app`, fill `/home/hryu/.env` from `deploy/env.example` —
+     → `https://yourdomain.tld`
+     login emails. Any relay works (Resend/Postmark/Mailgun/SES). Without
+   - `ANTHROPIC_API_KEY` — the real profile build + scoring.
+   Then `sudo bash /home/hryu/app/deploy/bootstrap.sh`.
+3. **Domain swap** in the Caddyfile (see "Domain swap" below).
+   daily: add `HRYU_CONTINUOUS_MODE=1` to `.env` (do NOT set
+   `HRYU_CONTINUOUS_CHAT_ID` — unset means every onboarded user, web
+   signups included, picked up within ~10 min by the reconciler), then
+   `systemctl disable --now hryu-digest.timer` and
+   `systemctl restart hryu-bot`.
+5. **CI deploys** (optional): repo variable `HETZNER_DEPLOY_ENABLED=true`
+   + secrets `HETZNER_HOST`, `HETZNER_SSH_KEY` (workflow already lives in
+   `.github/workflows/deploy.yml`; it skips silently until the variable
+   is set).
+6. **Smoke test**: `curl -fsS https://yourdomain.tld/healthz`, then sign
+   build (1–3 min) → "Run search now" → feed populates; check
+
 ## What this deploys
 
 ```
@@ -92,14 +117,11 @@ openssl rand -base64 24      # alternate format if base64 preferred
 
 ### Via CI (recommended)
 
-1. Move the workflow into place once:
-   ```bash
-   mkdir -p .github/workflows
-   git mv deploy/github-actions/deploy.yml .github/workflows/deploy.yml
-   git commit -m "ci: enable Hetzner deploy"
-   git push
-   ```
-2. Add repo secrets in Settings → Secrets and variables → Actions:
+The workflow already lives at `.github/workflows/deploy.yml` and skips
+silently until enabled. In Settings → Secrets and variables → Actions:
+
+1. Add repository **variable** `HETZNER_DEPLOY_ENABLED` = `true`.
+2. Add **secrets**:
    - `HETZNER_HOST` — `hryu.example.com` or raw IP.
    - `HETZNER_SSH_KEY` — private ED25519 key. Generate with
      `ssh-keygen -t ed25519 -C github-deploy -f hryu_deploy`. Public half
@@ -191,14 +213,20 @@ The bot can run its own search loop in-process instead of relying on the
 `hryu-digest.timer` cron. Quality is gated by the per-user buffer (P1)
 and pagination by the source-page cursors (P2), so each wake-up only
 flushes ≥4-scored matches and doesn't re-fetch the same source page
-within 6h. Single-user MVP — exactly one chat_id.
+within 6h.
+
+One searcher thread per onboarded user — Telegram (positive chat_ids)
+thread re-scans the DB every `HRYU_CONTINUOUS_RECONCILE_S` (default
+without a bot restart.
 
 Enable on the server:
 
-1. Add two lines to `/home/hryu/.env`:
+1. Add to `/home/hryu/.env`:
    ```bash
    HRYU_CONTINUOUS_MODE=1
-   HRYU_CONTINUOUS_CHAT_ID=433775883   # the operator's chat_id
+   # Optional operator pin — ONLY these ids get searchers. Leave unset
+   # in production so every onboarded user (web included) is searched.
+   # HRYU_CONTINUOUS_CHAT_ID=433775883
    ```
 2. Disable the cron-fired digest so the same search doesn't run twice:
    ```bash
@@ -210,8 +238,9 @@ Enable on the server:
    ```
 4. Verify the loop started:
    ```bash
-   journalctl -u hryu-bot -n 50 | grep continuous_searcher
-   # expect: continuous_searcher started: chat_id=433775883 interval=7200s
+   journalctl -u hryu-bot -n 50 | grep -E 'continuous_(searcher|reconciler)'
+   # expect: continuous_searcher started: chat_id=… interval=7200s
+   #         continuous_reconciler started (period=600s)
    ```
 
 Tuning lives in `skill/job-search/scripts/defaults.py` —
@@ -219,15 +248,16 @@ Tuning lives in `skill/job-search/scripts/defaults.py` —
 `continuous_min_sleep_seconds` (default 60s back-pressure floor).
 
 Disable continuous mode and roll back to cron with the inverse: unset the
-two env vars, `systemctl enable --now hryu-digest.timer`, restart the bot.
+env vars, `systemctl enable --now hryu-digest.timer`, restart the bot.
 
 ## Limitations / known issues
 
-  mints a real DB-backed token (sha256-hashed, 15-min expiry, single-use)
-  and prints the verify link to stdout — real SMTP delivery is a follow-up.
-  that existed during the mock phase is closed.
-- **Web profile builder is a stub.** The bot's full Opus profile pipeline
-  for `HRYU_BUILD_DELAY` seconds and writes a placeholder profile.
+  a DB-backed token (sha256-hashed, 15-min expiry, single-use) and emails
+  it via `HRYU_SMTP_*`. With SMTP unconfigured it falls back to printing
+  for real users, so set the creds before launch.
+- **Web "Run search now" is a full pipeline run.** Minutes of wall-clock
+  and real Claude spend per click; rate-limited per user by
+  (continuous mode / digest timer) are the primary supply.
 - **No HA or failover.** Single CX22, single SQLite file. Fine for the MVP;
   plan a managed Postgres + 2nd app box before you outgrow it.
 - **Redirect server is in-process inside `bot.py`.** If you restart only
@@ -247,4 +277,4 @@ two env vars, `systemctl enable --now hryu-digest.timer`, restart the bot.
 | `deploy/systemd/hryu-digest.service`          | Oneshot — daily digest                   |
 | `deploy/systemd/hryu-digest.timer`            | 08:00 Europe/Berlin trigger              |
 | `deploy/sudoers.d/hryu-deploy`                | NOPASSWD restart/reload for deploy group |
-| `deploy/github-actions/deploy.yml`            | GHA workflow — move to `.github/workflows/` to enable |
+| `.github/workflows/deploy.yml`                | GHA deploy — inert until repo var `HETZNER_DEPLOY_ENABLED=true` |

@@ -1,21 +1,20 @@
 # GitHub Actions workflow — Hetzner deploy.
 #
-# This file is intentionally placed under deploy/github-actions/ instead of
-# .github/workflows/ so that committing the deploy bundle does NOT trigger
-# CI. To enable:
+# Gated on the repository VARIABLE `HETZNER_DEPLOY_ENABLED` so the
+# workflow can live in the repo before a server exists: until you set the
+# variable, every run skips instantly (no red ✗ spam on pushes).
 #
-#   mkdir -p .github/workflows
-#   git mv deploy/github-actions/deploy.yml .github/workflows/deploy.yml
-#   git commit -m "ci: enable Hetzner deploy"
-#
-# Required repository secrets (Settings → Secrets and variables → Actions):
-#   HETZNER_HOST     Hostname or IP of the server (e.g. hryu.example.com)
-#   HETZNER_SSH_KEY  Private ED25519 key whose public half is in the
-#                    `deploy` user's ~/.ssh/authorized_keys on the server.
-#                    Generate locally with:
-#                      ssh-keygen -t ed25519 -C "github-deploy" -f hryu_deploy
-#                    Put hryu_deploy.pub on the server, paste hryu_deploy
-#                    into the GH secret. Never commit either.
+# To enable (Settings → Secrets and variables → Actions):
+#   Variables:
+#     HETZNER_DEPLOY_ENABLED  "true"
+#   Secrets:
+#     HETZNER_HOST     Hostname or IP of the server (e.g. hryu.example.com)
+#     HETZNER_SSH_KEY  Private ED25519 key whose public half is in the
+#                      `deploy` user's ~/.ssh/authorized_keys on the server.
+#                      Generate locally with:
+#                        ssh-keygen -t ed25519 -C "github-deploy" -f hryu_deploy
+#                      Put hryu_deploy.pub on the server, paste hryu_deploy
+#                      into the GH secret. Never commit either.
 
 name: Deploy to Hetzner
 
@@ -31,6 +30,7 @@ concurrency:
 
 jobs:
   deploy:
+    if: ${{ vars.HETZNER_DEPLOY_ENABLED == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
 
