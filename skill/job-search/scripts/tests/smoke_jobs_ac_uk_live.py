@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Live smoke test for the jobs.ac.uk source adapter.
 
-Hits the public per-category RSS feeds at
-https://www.jobs.ac.uk/jobs/<slug>/?format=rss. Asserts:
+Hits the public server-rendered search results at
+https://www.jobs.ac.uk/search/?keywords=<kw>&sortOrder=1 (the per-category
+RSS feeds were retired by the portal — see the adapter docstring). Asserts:
 
   * fetch({"max_per_source": 5}) returns >= 1 Job (or skips with a clear
     message if the network is unavailable / the portal is degraded)
@@ -41,14 +42,14 @@ def check(cond: bool, label: str) -> None:
         failures.append(label)
 
 
-print("jobs.ac.uk live smoke — fetching up to 5 jobs across research-leaning categories")
+print("jobs.ac.uk live smoke — fetching up to 5 jobs across research-leaning keyword queries")
 jobs = jobs_ac_uk.fetch({"max_per_source": 5})
 
 print(f"\n  Returned {len(jobs)} job(s).")
 
 if len(jobs) == 0:
     # Treat empty-yield as a graceful skip: the live portal could be down
-    # or the RSS routes could have shifted. Don't fail CI on transient
+    # or the search markup could have shifted. Don't fail CI on transient
     # network issues, but make it loud.
     print("\nSKIP  jobs.ac.uk returned 0 jobs — check forensic log for status codes.")
     sys.exit(0)

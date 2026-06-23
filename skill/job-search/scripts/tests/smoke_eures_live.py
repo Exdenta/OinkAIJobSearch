@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """Live smoke test for the EURES source adapter.
 
-EURES is gated behind EU Login (ECAS) for its JSON search API (see
-docstring in `sources/eures.py` for the full probe log). On an
-unauthenticated environment we EXPECT zero results and a skip reason
-of "EURES API requires EU Login..." — we exit 0 with a "skipped:"
-line in that case rather than failing CI.
+EURES is fetched via the public, unauthenticated Job-Vacancy-Search REST
+API (`/eures/api/jv-searchengine/public/jv-search/search`) — no EU Login
+required (the earlier ECAS-gated probe tested the wrong endpoint). We
+expect real rows back and assert the canonical Job fields.
 
-If `EURES_API_TOKEN` is in env (or `eures_api_token` in filters), we
-expect actual rows back, and we assert >= 1 Job + canonical fields.
+Network is required. A hard network error / portal outage degrades to a
+graceful SKIP (exit 0) rather than failing CI.
 
 Run from worktree root:
 
@@ -16,7 +15,6 @@ Run from worktree root:
 """
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
@@ -27,7 +25,6 @@ sys.path.insert(0, str(SCRIPTS))
 from sources import eures  # noqa: E402
 
 
-HAS_TOKEN = bool(os.environ.get("EURES_API_TOKEN", "").strip())
 failures: list[str] = []
 
 
@@ -39,27 +36,23 @@ def check(cond: bool, label: str) -> None:
         failures.append(label)
 
 
-print("EURES live smoke — fetching up to 5 jobs (Spain bias)")
-filters = {"max_per_source": 5, "eures_country_codes": ["ES"]}
-jobs = eures.fetch(filters)
+print("EURES live smoke — fetching up to 6 jobs via the public jv-search API")
+jobs = eures.fetch({
+    "max_per_source": 6,
+    "eures_keywords": ["software engineer", "frontend developer"],
+})
 
-print(f"\n  Returned {len(jobs)} job(s). HAS_TOKEN={HAS_TOKEN}")
+print(f"\n  Returned {len(jobs)} job(s).")
 
 if not jobs:
-    if HAS_TOKEN:
-        # With a token, zero rows is a real failure.
-        print("FAIL Got 0 rows despite EURES_API_TOKEN set.")
-        sys.exit(1)
-    # Expected path on public networks: API is gated.
-    print("skipped: EURES API gated by EU Login (ECAS); no public "
-          "anonymous access. Set EURES_API_TOKEN to test the success "
-          "path. Adapter returned [] cleanly without raising — this is "
-          "the intended fallback. See sources/eures.py docstring for "
-          "full probe log.")
+    # The public API is anonymous and normally returns rows; 0 means the
+    # portal is degraded or the network is unavailable. Don't fail CI on a
+    # transient outage, but make it loud.
+    print("\nSKIP  EURES returned 0 jobs — portal degraded or network "
+          "unavailable. Check forensic log for the per-keyword status codes.")
     sys.exit(0)
 
-# We did get rows — validate structure.
-check(len(jobs) <= 5, f"fetch respected cap (got {len(jobs)})")
+check(len(jobs) <= 6, f"fetch respected cap (got {len(jobs)})")
 for i, j in enumerate(jobs):
     print(f"\n  [{i}] title  = {j.title!r}")
     print(f"      company= {j.company!r}")
@@ -74,9 +67,18 @@ for i, j in enumerate(jobs):
     check(bool(j.external_id.strip()), f"job[{i}].external_id is non-empty")
     check(j.source == "eures", f"job[{i}].source == 'eures'")
     check(
-        "europa.eu" in j.url or j.url.startswith("https://"),
-        f"job[{i}].url is absolute (got {j.url!r})",
+        j.url.startswith("https://europa.eu/eures/portal/jv-se/jv-details/"),
+        f"job[{i}].url is a EURES jv-details URL (got {j.url!r})",
     )
+    # posted_at should be an ISO date (YYYY-MM-DD), never raw epoch ms.
+    check(
+        (not j.posted_at) or (len(j.posted_at) == 10 and j.posted_at[4] == "-"),
+        f"job[{i}].posted_at is ISO date or empty (got {j.posted_at!r})",
+    )
+
+# Dedup sanity: no two jobs share an id.
+ids = [j.external_id for j in jobs]
+check(len(set(ids)) == len(ids), "fetch deduplicates vacancy ids")
 
 print("\n  Sample titles:")
 for j in jobs:
