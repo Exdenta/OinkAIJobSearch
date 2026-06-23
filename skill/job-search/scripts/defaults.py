@@ -40,11 +40,11 @@ DEFAULTS: dict = {
         # All flipped ON 2026-05-01 per operator request — blocked stubs
         # return [] gracefully so they're cheap to keep enabled (forensic
         # logs surface their failure reason every run for visibility).
-        "eures":             True,   # BLOCKED: EU Login (stub returns [])
+        "eures":             True,   # EU vacancies via public jv-search REST API (no auth; fixed 2026-06-21). ToS: personal/link-back use only — see sources/eures.py
         "infojobs":          True,   # Spain HTML scrape
         "tecnoempleo":       True,   # Spain tech RSS
         "ai_jobs_net":       True,   # Curated AI/ML HTML scrape
-        "jobs_ac_uk":        True,   # UK/EU academic RSS (multi-category)
+        "jobs_ac_uk":        True,   # UK/EU academic — HTML search (RSS retired by portal 2026-06; keyword fan-in)
         "academicpositions": True,   # BLOCKED: Cloudflare BFM (stub returns [])
         "ikerbasque":        True,   # Basque research foundation
         "wellfound":         True,   # BLOCKED: DataDome (stub returns [])
