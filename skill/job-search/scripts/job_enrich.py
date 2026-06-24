@@ -762,6 +762,13 @@ Rules:
 - No newlines inside any string field.
 - Return one entry per input posting — do not drop postings from the
   response. Rejects are scored 0, not omitted.
+- CRITICAL: your ENTIRE response is the JSON object and nothing else — no
+  preamble, no markdown, no bullet lists, no closing summary. Even when
+  EVERY posting scores 0 (e.g. all fail the same location veto), you MUST
+  still return the full {{"results": [...]}} object with one entry per
+  posting. NEVER replace the JSON with prose explaining the scores —
+  put that reasoning inside each entry's "why_mismatch" field instead.
+  A response that starts with anything other than `{{` is a failure.
 
 === CANDIDATE RESUME (plain text, verbatim) ===
 {resume}
@@ -1710,15 +1717,21 @@ def _enrich_one_chunk(
         if len(out) >= len(chunk):
             reason = _BATCH_OK
 
-    # Targeted re-ask path for partial batches. Empirically (forensic logs
-    # 2026-05-02 cron run), Haiku consistently drops exactly 1 verdict
-    # when handed full 25-job batches — every user, every batch-of-25 with
-    # full payload. Splitting the whole chunk would re-spend tokens on the
-    # 24 jobs we already scored; instead we re-ask ONLY for the missing
-    # external_ids. Capped at 1 retry (allow_split_retry==True &&
+    # Targeted re-ask path for jobs still missing a verdict. Two cases:
+    #   * _BATCH_PARTIAL — empirically (forensic logs 2026-05-02), Haiku
+    #     drops exactly 1 verdict on full 25-job batches.
+    #   * _BATCH_PARSE_ERROR / _BATCH_EMPTY_RESULT that the split-retry
+    #     above couldn't recover — notably the model editorializing
+    #     ("All postings score 0 due to location…") instead of emitting
+    #     JSON, which splitting doesn't fix because it's content-driven,
+    #     not payload-size-driven. A fresh re-ask of ONLY the unscored
+    #     jobs (with the JSON-only prompt) is the recovery. (Added
+    #     2026-06-24 to stop ~2/day format failures dropping jobs.)
+    # Re-asking only the missing external_ids avoids re-spending tokens on
+    # jobs already scored. Capped at 1 retry (allow_split_retry==True &&
     # _retry_depth==0) so a deterministic poison pill can't fan out.
     if (
-        reason == _BATCH_PARTIAL
+        reason in (_BATCH_PARTIAL, _BATCH_PARSE_ERROR, _BATCH_EMPTY_RESULT)
         and allow_split_retry
         and _retry_depth == 0
         and len(out) < len(chunk)
@@ -1726,8 +1739,8 @@ def _enrich_one_chunk(
         missing_jobs = [j for j in chunk if j.external_id not in out]
         log.info(
             "enrich_jobs_ai: re-asking batch %d/%d for %d missing verdict(s) "
-            "(targeted retry, partial batch)",
-            batch_idx, total_batches, len(missing_jobs),
+            "(targeted retry, reason=%s)",
+            batch_idx, total_batches, len(missing_jobs), reason,
         )
         recovered, _ = _enrich_one_chunk(
             missing_jobs, resume_text, prefs_text, timeout_s,

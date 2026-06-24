@@ -101,7 +101,11 @@ DEFAULTS: dict = {
     # THAT also times out we log + drop the job (do not fall back to
     # the Haiku verdict — that would mix verdict provenance in
     # `job_scores`). One retry only; no recursive escalation.
-    "ai_sonnet_timeout_s":  300,
+    # Bumped 300→480 (2026-06-24): still seeing ~6 hard timeouts/3d at 300s
+    # (Opus/Sonnet latency has crept up across the board — same trend that
+    # forced the profile-build cap up). 480s absorbs the slow tail; a slow
+    # success on its own worker is cheaper than dropping the verdict.
+    "ai_sonnet_timeout_s":  480,
 
     # Two-pass scoring. Default ON as of 2026-05-19 — single-pass Sonnet
     # was 63% of monthly AI spend. Two-pass: Haiku triages every posting
@@ -337,15 +341,17 @@ DEFAULTS: dict = {
     "chrome_agent_timeout_s": 240,            # per-call cap for the agentic browser fetch.
 
     # Per-scrape timeout for Claude-CLI-backed adapters (curated_boards).
-    "ai_scrape_timeout_s":     180,
+    # Bumped 180→360 (2026-06-24): 180s was the single largest timeout
+    # source (~12 fails/3d in run_p_with_tools) — the agentic WebFetch
+    # drill-through on curated boards routinely overran. 360s halves the
+    # miss rate; these run in the source-fetch pool, not the send path.
+    "ai_scrape_timeout_s":     360,
     # Web-search agent runs multiple WebSearch+WebFetch calls — needs more.
     # Bumped 300→360 (2026-06-07) alongside raising "up to 4"→"up to 6"
-    # searches per run (web_search.py): the extra two searches + their
-    # WebFetch drill-throughs add wall-time, and 300s was already
-    # occasionally timing out (logged as the cli_missing telemetry
-    # mislabel). 360s gives the wider sweep headroom without inviting
-    # indefinite hangs.
-    "ai_web_search_timeout_s": 360,
+    # searches per run; bumped 360→600 (2026-06-24) — still ~6 fails/3d at
+    # 360s as the open-web sweep + drill-throughs got slower. 600s gives the
+    # multi-step agent real headroom without inviting indefinite hangs.
+    "ai_web_search_timeout_s": 600,
 
     "message": {
         "parse_mode":      "MarkdownV2",
