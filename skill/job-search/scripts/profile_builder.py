@@ -34,6 +34,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -60,7 +61,15 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DEFAULT_MODEL = "opus"
-DEFAULT_TIMEOUT_S = 180
+# Opus profile-build latency has crept up over time (measured `claude_calls`
+# for caller='profile_builder': ~10-25s in May → 130-290s by late June; a
+# 2026-06-24 resume_upload rebuild for chat 433775883 took 287.8s). The old
+# 180s ceiling timed out outright, and even a 300s cap cleared that build by
+# only ~12s. Set to 3000s (operator request 2026-06-24) for generous headroom
+# against the slowest Opus builds — the build runs async on its own daemon
+# thread and a slow success is harmless, so a wide ceiling only matters as a
+# backstop against a genuinely hung CLI. Override via PROFILE_BUILD_TIMEOUT_S.
+DEFAULT_TIMEOUT_S = int(os.environ.get("PROFILE_BUILD_TIMEOUT_S", "3000"))
 DEFAULT_DEBOUNCE_S = 60.0
 
 # "resume_upload" skips the debounce and runs immediately; "prefs_change"
