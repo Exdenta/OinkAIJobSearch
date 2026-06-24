@@ -13,7 +13,7 @@ retry path — split-retry fires on parse/empty failures, not on slow
 SUCCESSES, and those are exactly the >5min Sonnet batches we observed.
 
 The fix:
-  * defaults.ai_sonnet_timeout_s = 300s — sized at p90 + headroom on
+  * defaults.ai_sonnet_timeout_s = 480s — p90 + slow-tail headroom on
     the new batch=5 payload. Expected to fire on ~0% of healthy
     batches, ~100% of pathological slow-success ones.
   * enrich_jobs_ai now takes a dedicated `sonnet_timeout_s` kwarg
@@ -26,7 +26,7 @@ The fix:
     provenance in `job_scores`.
 
 This test pins:
-  1. The new `ai_sonnet_timeout_s = 300` default in defaults.py.
+  1. The `ai_sonnet_timeout_s = 480` default in defaults.py.
   2. The runtime behaviour: a Sonnet batch that times out (mocked via
      a fake wrapped_run_p that sleeps past `timeout_s` and returns
      None) is retried at batch_size=1 and the recovered verdicts
@@ -168,9 +168,9 @@ def test_defaults_pin() -> None:
     from defaults import DEFAULTS
 
     _assert(
-        DEFAULTS.get("ai_sonnet_timeout_s") == 300,
-        f"ai_sonnet_timeout_s=300 in defaults "
-        f"(got {DEFAULTS.get('ai_sonnet_timeout_s')!r})",
+        DEFAULTS.get("ai_sonnet_timeout_s") == 480,
+        f"ai_sonnet_timeout_s=480 in defaults (bumped 300→480 2026-06-24 "
+        f"to absorb slow-tail timeouts) (got {DEFAULTS.get('ai_sonnet_timeout_s')!r})",
     )
     # Slow-path / Haiku timeout stays at the legacy 1200s — only Sonnet
     # gets the tight cap.

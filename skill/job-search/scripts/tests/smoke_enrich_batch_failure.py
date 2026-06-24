@@ -221,7 +221,11 @@ def test_one_batch_fails_others_succeed() -> None:
         json.loads(line) for line in raw
         if json.loads(line).get("op") == "enrich_jobs_ai.batch"
     ]
-    # 4 primary batches + 2 split-retry sub-batches for the failing one = 6.
+    # 4 primary batches, plus retries for the failing one:
+    #   * 2 split-retry sub-batches (chunk halved on empty_result), then
+    #   * 1 targeted re-ask of the still-missing jobs (added 2026-06-24 so
+    #     format failures get a second shot with the JSON-only prompt).
+    # The poisoned batch never recovers here, so all 3 retry lines appear.
     primary = [b for b in batch_lines if b["input"]["retry_depth"] == 0]
     retries = [b for b in batch_lines if b["input"]["retry_depth"] >= 1]
     _assert(
@@ -229,9 +233,9 @@ def test_one_batch_fails_others_succeed() -> None:
         f"4 primary batch forensic lines (got {len(primary)})",
     )
     _assert(
-        len(retries) == 2,
-        f"2 split-retry forensic lines for the failing batch "
-        f"(got {len(retries)})",
+        len(retries) == 3,
+        f"3 retry forensic lines for the failing batch "
+        f"(2 split-retry + 1 targeted re-ask; got {len(retries)})",
     )
 
     # The failing primary batch must declare its reason explicitly.
