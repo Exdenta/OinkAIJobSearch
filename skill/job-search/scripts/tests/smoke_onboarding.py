@@ -231,12 +231,23 @@ def main() -> int:
         ms_msg_id = 9003
         on_complete_called = []
         on_run_search_called = []
+        # Capture the deferred Opus build enqueue instead of running a real
+        # one. finalize MUST kick this — the wizard defers the resume_upload
+        # build to its final step, and a regression where finalize forgot to
+        # do it left every onboarded user with a seed-less skeleton profile.
+        import bot as _bot
+        enqueued_builds: list[tuple[int, str]] = []
+        _orig_enqueue = _bot._enqueue_profile_rebuild
+        _bot._enqueue_profile_rebuild = (
+            lambda tg_, db_, cid_, *, trigger: enqueued_builds.append((cid_, trigger))
+        )
         ob.handle_callback(
             tg, db, _make_cb("cb-4", f"ob:{ob.CB_MIN_SCORE}:3", chat_id, ms_msg_id),
             chat_id, ms_msg_id, f"{ob.CB_MIN_SCORE}:3",
             on_complete=lambda cid: on_complete_called.append(cid),
             on_run_search=lambda cid: on_run_search_called.append(cid),
         )
+        _bot._enqueue_profile_rebuild = _orig_enqueue
         # Expected: 1 summary message with the two-button final keyboard
         summaries = [s for s in tg.sent if "Setup complete" in s["text"]]
         _assert(summaries, f"no summary found; sent={[s['text'][:40] for s in tg.sent]}")
@@ -257,6 +268,18 @@ def main() -> int:
         profile = json.loads(profile_raw) if profile_raw else {}
         _assert(int(profile.get("min_match_score") or 0) == 3,
                 f"min_match_score should be 3, got {profile.get('min_match_score')}")
+        # The AUTHORITATIVE ⭐ gate is the DB column, not the profile JSON.
+        # This is the fix: onboarding must write it there or the user's
+        # chosen floor silently never applies (gate falls back to default).
+        _assert(db.get_min_match_score(chat_id) == 3,
+                f"DB min_match_score column should be 3 (the gate the search "
+                f"reads), got {db.get_min_match_score(chat_id)}")
+        # And finalize must have kicked the deferred Opus build, exactly once,
+        # with the 'onboarding' trigger — otherwise the user is stuck with the
+        # seed-less skeleton and LinkedIn/seeded web_search never run for them.
+        _assert(enqueued_builds == [(chat_id, "onboarding")],
+                f"finalize must enqueue one 'onboarding' profile build, "
+                f"got {enqueued_builds}")
         _assert(db.get_onboarding_completed_at(chat_id) is not None,
                 "onboarding_completed_at should be set")
         _assert(db.get_onboarding_state(chat_id) is None,

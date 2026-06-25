@@ -74,8 +74,11 @@ DEFAULT_DEBOUNCE_S = 60.0
 
 # "resume_upload" skips the debounce and runs immediately; "prefs_change"
 # enters the debounce window. "manual" (/rebuildprofile) acts like
-# resume_upload — user asked explicitly, don't make them wait.
-_IMMEDIATE_TRIGGERS = {"resume_upload", "manual"}
+# resume_upload — user asked explicitly, don't make them wait. "onboarding"
+# is the wizard's final-step build (the wizard defers the resume_upload
+# build to finalize, so this is the user's FIRST real profile) — must run
+# immediately, never debounced.
+_IMMEDIATE_TRIGGERS = {"resume_upload", "manual", "onboarding"}
 
 _ALLOWED_ATS = frozenset({
     "greenhouse.io", "lever.co", "ashbyhq.com", "workable.com",

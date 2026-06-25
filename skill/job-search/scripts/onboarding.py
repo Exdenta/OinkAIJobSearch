@@ -930,15 +930,26 @@ def _finalize(
     except Exception:
         log.exception("finalize: set_prefs_free_text failed")
 
-    # Persist the min-score via the profile-level helper so the score
-    # survives a subsequent profile rebuild the same way /minscore does.
+    # Persist the min-score to the DB column — that's the AUTHORITATIVE ⭐
+    # gate the search reads (`db.get_min_match_score`). It lives in its own
+    # column precisely so it survives the Opus rebuild kicked below. The old
+    # code wrote it into the profile JSON via set_min_match_score(profile,…),
+    # which the score gate does NOT read and the rebuild overwrites — so the
+    # user's chosen floor silently never applied (DB column stayed 0 → gate
+    # fell back to the default). Also write a minimal skeleton profile so the
+    # user counts as "onboarded" during the ~150-290s build window.
+    min_score = int(answers.get("min_score") or 0)
+    try:
+        db.set_min_match_score(chat_id, min_score)
+    except Exception:
+        log.exception("finalize: set_min_match_score (DB column) failed")
     try:
         from user_profile import profile_from_json, profile_to_json, set_min_match_score
         profile = profile_from_json(db.get_user_profile(chat_id))
-        new_profile = set_min_match_score(profile, int(answers.get("min_score") or 0))
+        new_profile = set_min_match_score(profile, min_score)
         db.set_user_profile(chat_id, profile_to_json(new_profile))
     except Exception:
-        log.exception("finalize: persist min_match_score failed")
+        log.exception("finalize: persist skeleton profile failed")
 
     # Stamp completion BEFORE the summary send so the next /start falls
     # through to the welcome-back flow even if the summary send fails.
@@ -946,6 +957,21 @@ def _finalize(
         db.mark_onboarding_complete(chat_id)
     except Exception:
         log.exception("finalize: mark_onboarding_complete failed")
+
+    # Kick the Opus profile build the wizard DEFERRED to this final step.
+    # handle_document skips the resume_upload build while the user is mid-
+    # wizard ("so we only run it once the user has given all their signals"),
+    # delegating to finalize — but historically finalize never actually did
+    # it, leaving every wizard-onboarded user with the skeleton profile above:
+    # no search_seeds, so LinkedIn + seeded web_search never ran for them and
+    # they got almost no matches. This is the build that gives them a real
+    # profile (role, stack, search seeds) from their resume + synthesized
+    # prefs. Runs in the background; the queue notifies the user on completion.
+    try:
+        from bot import _enqueue_profile_rebuild
+        _enqueue_profile_rebuild(tg, db, chat_id, trigger="onboarding")
+    except Exception:
+        log.exception("finalize: profile build enqueue failed")
 
     # Live-spawn the continuous searcher for this newly-onboarded user.
     # No-op when HRYU_CONTINUOUS_MODE is off, or when the operator pinned a
