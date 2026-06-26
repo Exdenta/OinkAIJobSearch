@@ -1228,6 +1228,7 @@ ICON_VISA      = "🛂"
 ICON_APPLIED   = "✅"
 ICON_SKIPPED   = "⊘"    # lighter than 🚫 for the "not-applied" tag
 ICON_NEW       = "•"    # neutral bullet, used for fresh-post emphasis
+ICON_CONTACT   = "👤"   # hiring contact ("who to write to")
 
 
 def _score_bar(score: int, cells: int = 5) -> str:
@@ -1338,6 +1339,7 @@ def format_job_mdv2(
     snippet_chars: int = 240,
     applied_status: str | None = None,
     enrichment: dict | None = None,
+    hiring_contact: dict | None = None,
 ) -> str:
     """Render one job as a Telegram MarkdownV2 card.
 
@@ -1346,6 +1348,12 @@ def format_job_mdv2(
       - a resume-aware `why_match` line ("✅ Match: …")
       - an algorithm-v2 `why_mismatch` line ("⚠️ Mismatch: …") when present
       - a compact list of key_details (stack, seniority, remote, salary, …)
+
+    If `hiring_contact` is provided (from hiring_contact.lookup_contacts_for_jobs),
+    a "who to write to" block renders under the snippet: linked person name +
+    title, then the one-line reason they were picked. It is intentionally a
+    separate argument from `enrichment` — contacts attach at send time to the
+    final alive set and must not leak into the cached enrichment payloads.
 
     Without enrichment the card falls back to title / company / snippet / source.
     """
@@ -1391,6 +1399,25 @@ def format_job_mdv2(
             snip = snip[:snippet_chars].rstrip() + "…"
         lines.append("")
         lines.append(f"_{mdv2_escape(snip)}_")
+
+    # "Who to write to" block — last content section before the footer so
+    # it reads as the action step after triage. Renders only when both
+    # name and URL survived hiring_contact._normalize; a contact without
+    # a link is not actionable enough to spend a card line on.
+    if hiring_contact:
+        c_name = (hiring_contact.get("name") or "").strip()
+        c_url = (hiring_contact.get("profile_url") or "").strip()
+        if c_name and c_url:
+            c_title = (hiring_contact.get("title") or "").strip()
+            c_reason = (hiring_contact.get("reason") or "").strip()
+            label = f"{c_name} — {c_title}" if c_title else c_name
+            c_url_esc = c_url.replace(")", "\\)").replace("(", "\\(")
+            lines.append("")
+            lines.append(
+                f"{ICON_CONTACT} *[{mdv2_escape(label)}]({c_url_esc})*"
+            )
+            if c_reason:
+                lines.append(f"_{mdv2_escape(c_reason)}_")
 
     # Status chip + source footer. "Applied" / "Skipped" use the canonical
     # icon pair from the top of the module; "Saved" stays as a plain
@@ -2342,8 +2369,18 @@ def send_per_job_digest(
     skip_header: bool = False,
     pre_filtered: bool = False,
     force_empty_card: bool = False,
+    db=None,
 ) -> int:
     """Send one message per job, each with its own inline keyboard.
+
+    ``db`` (optional, a db.DB instance): enables the hiring-contact pass —
+    after the prefilter settles the final alive set, each job gets a
+    "who to write to" lookup (LLM + web search, see hiring_contact.py)
+    and the card renders a linked person + why-this-person line. The DB
+    handle is used for the per-job contact cache; passing None still
+    runs lookups but uncached. Set HIRING_CONTACT_OFF=1 to skip the
+    pass entirely. Lookups are fail-soft: any failure ships the card
+    without a contact block.
 
     `enrichments`, if provided, is a map keyed by Job.job_id → {match_score,
     why_match, key_details}. Each matching job's message will include the
@@ -2481,6 +2518,24 @@ def send_per_job_digest(
     sent = 0
 
     # ----------------------------------------------------------------
+    # Hiring-contact pass — runs AFTER the prefilter so we only spend
+    # lookups on jobs that actually ship. Lookups fan out on a small
+    # thread pool inside lookup_contacts_for_jobs; results are cached
+    # per job_id in the DB so digest replays and multi-user sends are
+    # near-free. Fail-soft: any failure here just means cards go out
+    # without the contact block.
+    # ----------------------------------------------------------------
+    contacts: dict[str, dict] = {}
+    try:
+        from hiring_contact import lookup_contacts_for_jobs
+        contacts = lookup_contacts_for_jobs(alive_jobs, db=db, chat_id=chat_id)
+    except Exception:
+        log.warning(
+            "hiring-contact pass failed; sending cards without contacts",
+            exc_info=True,
+        )
+
+    # ----------------------------------------------------------------
     # Per-job loop — pure send now, no gates. Every job in alive_jobs
     # passed the prefilter above.
     # ----------------------------------------------------------------
@@ -2488,6 +2543,7 @@ def send_per_job_digest(
         enr = enrichments.get(job.job_id)
         text = format_job_mdv2(
             job, include_snippet=inc_snip, snippet_chars=snip_chars, enrichment=enr,
+            hiring_contact=contacts.get(job.job_id),
         )
         kb = job_keyboard(job.job_id, url=job.url or None, chat_id=chat_id)
         send_status = "ok"
@@ -2521,6 +2577,7 @@ def send_per_job_digest(
                     "source": job.source,
                     "match_score": int((enr or {}).get("match_score") or 0) if enr else None,
                     "text_chars": len(text),
+                    "has_contact": job.job_id in contacts,
                 },
                 output={
                     "status": send_status,
@@ -2540,6 +2597,7 @@ def send_per_job_digest(
                 "too_old_count": too_old_count,
                 "forum_url_count": forum_url_count,
                 "web_search_closed_count": web_search_closed_count,
+                "contact_found_count": len(contacts),
                 "header_sent": not skip_header,
                 "sort_mode": sort_mode,
                 "sort_direction": "best_first",

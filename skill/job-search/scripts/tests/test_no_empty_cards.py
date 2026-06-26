@@ -38,6 +38,7 @@ sys.path.insert(0, str(HERE.parent))
 os.environ["URL_VALIDATION_OFF"] = "1"
 os.environ["TG_RATE_LIMIT_OFF"] = "1"
 os.environ["FORUM_FILTER_OFF"] = "1"
+os.environ["HIRING_CONTACT_OFF"] = "1"
 
 from dedupe import Job  # noqa: E402
 import db as db_module  # noqa: E402

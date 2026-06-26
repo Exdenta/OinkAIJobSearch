@@ -193,11 +193,27 @@ presses keep working between digests.
    Senior Frontend Developer (Remote EU)
    Acme Inc · Remote · $80k–$120k
    We need a React + TypeScript engineer to build our design system…
+
+   👤 Jane Doe — Senior Technical Recruiter
+   recruits frontend engineers at Acme, covers EMEA
    linkedin
 
    [✅ Applied]  [🚫 Not applied]
    [✍️ Tailor my resume]
    ```
+
+   The 👤 line is the **hiring contact** — for every card about to ship, a
+   Claude agent (WebSearch + WebFetch, `hiring_contact.py`) hunts for the
+   one person who most plausibly owns the opening: the recruiter named on
+   the posting, the talent-acquisition partner covering that function and
+   region, the hiring manager, or a founder at a tiny startup. The name
+   links to their public profile (LinkedIn `/in/…` preferred) and the
+   italic line says why this person was picked. Verdicts are cached per
+   posting in the `hiring_contacts` table, lookups run only for jobs that
+   survived every send gate, and any failure just ships the card without
+   the block. Knobs: `HIRING_CONTACT_OFF=1` disables the pass;
+   `HIRING_CONTACT_TIMEOUT_S` (default 180), `HIRING_CONTACT_WORKERS`
+   (default 3), `HIRING_CONTACT_MODEL` (default sonnet) tune it.
 
 4. Clicking **✅ Applied** — records the application and this job will never
    reappear in any future digest.
@@ -276,6 +292,9 @@ as `/prefs` before it reaches any Claude call.
   every Opus profile build
 - **research_runs** — audit log (status, elapsed_ms, workers_ok/workers_failed,
   docx_path, input hashes) for every `/marketresearch` run
+- **hiring_contacts** — per-job cache of "who to write to" lookups
+  (status ∈ {found, not_found} + the contact dict); transport errors are
+  never cached so they retry on the next send
 
 Deletion: to reset a user, `DELETE FROM users WHERE chat_id=?` and drop their
 `state/users/<chat_id>/` folder. To wipe job history, delete `state/jobs.db`.

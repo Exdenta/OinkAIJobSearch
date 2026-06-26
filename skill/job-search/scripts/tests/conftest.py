@@ -27,6 +27,20 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _hiring_contact_off_by_default(monkeypatch):
+    """Disable the send-time hiring-contact pass for every test by default.
+
+    ``send_per_job_digest`` runs an LLM + web-search lookup per alive job;
+    on a machine with the ``claude`` CLI installed that would spawn real
+    subprocesses from any test that exercises the send path. The flag is
+    read per call (not at import), so feature tests re-enable it with
+    ``monkeypatch.setenv("HIRING_CONTACT_OFF", "0")`` in their body.
+    """
+    monkeypatch.setenv("HIRING_CONTACT_OFF", "1")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _restore_module_globals():
     # Snapshot before the test.
     try:
