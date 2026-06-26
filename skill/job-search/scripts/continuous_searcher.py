@@ -229,6 +229,59 @@ class ContinuousSearcher:
         the `min_sleep_seconds` floor — never zero, never negative. The
         floor is the only thing between us and a hot loop when a source
         is timing out repeatedly.
+
+        Night-mute flush fix: if this iteration ran DURING the night-mute
+        window (23:00-09:00 Madrid by default), any ≥floor matches it found
+        are being HELD by the quality buffer — and the buffer only flushes
+        on a search run. Sleeping the full interval can land the next run
+        hours after the mute lifts, stranding the matches for most of a day
+        (observed: matches found 00:20 wouldn't send until the 16:00 run).
+        So we cap the sleep to wake shortly after the window ends, which
+        flushes the held buffer right at 09:00 instead. `min()` only ever
+        SHORTENS the sleep, so the normal (non-mute) cadence is untouched.
         """
         remaining = float(self._interval) - float(elapsed)
-        return max(float(self._min_sleep), remaining)
+        sleep_for = max(float(self._min_sleep), remaining)
+        mute_end = self._seconds_until_mute_end()
+        if mute_end is not None:
+            sleep_for = max(float(self._min_sleep), min(sleep_for, mute_end))
+        return sleep_for
+
+    def _seconds_until_mute_end(self) -> Optional[float]:
+        """If the night-mute window is active right now, return seconds
+        until it ends (plus a small per-chat jitter so N searchers don't
+        all wake at the same instant). Otherwise return None.
+
+        Reads the same `night_mute_*` knobs `search_jobs._decide_buffer_flush`
+        uses, so the wake boundary matches the hold boundary exactly.
+        Fails safe to None (no cap) on any config/tz problem.
+        """
+        try:
+            from defaults import DEFAULTS as _D  # noqa: WPS433
+            tz_name = _D.get("night_mute_tz", "Europe/Madrid")
+            start_h = int(_D.get("night_mute_start_hour", 23))
+            end_h = int(_D.get("night_mute_end_hour", 9))
+        except Exception:
+            return None
+        if start_h == end_h:
+            return None
+        try:
+            import datetime as _dt  # noqa: WPS433
+            from zoneinfo import ZoneInfo  # noqa: WPS433
+            tz = ZoneInfo(tz_name)
+            now = _dt.datetime.now(tz)
+        except Exception:
+            return None
+        h = now.hour
+        in_mute = (
+            (start_h <= h < end_h) if start_h < end_h
+            else (h >= start_h or h < end_h)
+        )
+        if not in_mute:
+            return None
+        end_today = now.replace(hour=end_h, minute=0, second=0, microsecond=0)
+        if end_today <= now:
+            end_today = end_today + _dt.timedelta(days=1)
+        secs = (end_today - now).total_seconds()
+        jitter = 60.0 + float(abs(int(self._chat_id)) % 120)
+        return max(0.0, secs) + jitter
