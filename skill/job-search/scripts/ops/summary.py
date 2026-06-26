@@ -10,7 +10,12 @@ run is always for a single user). Layout:
 
   📤 Positions:
   • [<score>] <Title> — <Company>
+     ↳ 👤 <Contact name — their title> · <why this person>
   • ...
+
+The ↳ line mirrors the "who to write to" block on the user's job card
+(read back from the `hiring_contacts` cache — no extra LLM call) and is
+omitted when the send-time lookup found nobody.
 
 That is ALL the operator sees — no recent-runs table, no per-source
 funnel, no queue contents, no anomalies/footer.
@@ -38,6 +43,7 @@ respected by line-boundary chunking when a run ships a long list.
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 from typing import Any, Iterable
@@ -183,11 +189,15 @@ def _sent_jobs_for_run(
     """Return jobs shipped during this run's window, with their match score.
 
     List shape, ordered best-match-first (NULL scores last):
-      [{"title", "url", "company", "source", "score": int | None}, ...]
+      [{"title", "url", "company", "source", "score": int | None,
+        "contact": dict | None}, ...]
 
     Score comes from `job_scores` via LEFT JOIN on (chat_id, job_id) — a
-    job with no persisted score row yields score=None. Empty when nothing
-    shipped or `db` is unavailable.
+    job with no persisted score row yields score=None. `contact` is the
+    hiring contact the user's card carried, read back from the
+    `hiring_contacts` cache that the send-time lookup populated (job-keyed,
+    so no extra LLM call here); None when the lookup found nobody or the
+    feature is off. Empty when nothing shipped or `db` is unavailable.
     """
     if db is None or chat_id is None or not started:
         return []
@@ -200,11 +210,14 @@ def _sent_jobs_for_run(
             rows = c.execute(
                 """
                 SELECT j.title, j.url, j.company, j.source, s.sent_at,
-                       sc.match_score
+                       sc.match_score,
+                       hc.status AS hc_status, hc.contact_json
                   FROM sent_messages s
                   JOIN jobs j ON j.job_id = s.job_id
              LEFT JOIN job_scores sc
                     ON sc.chat_id = s.chat_id AND sc.job_id = s.job_id
+             LEFT JOIN hiring_contacts hc
+                    ON hc.job_id = s.job_id
                  WHERE s.chat_id = ? AND s.sent_at BETWEEN ? AND ?
                  ORDER BY sc.match_score DESC, s.sent_at
                 """,
@@ -216,12 +229,21 @@ def _sent_jobs_for_run(
     out: list[dict] = []
     for r in rows:
         score = r["match_score"]
+        contact = None
+        if r["hc_status"] == "found" and r["contact_json"]:
+            try:
+                parsed = json.loads(r["contact_json"])
+            except (TypeError, ValueError):
+                parsed = None
+            if isinstance(parsed, dict) and parsed.get("name"):
+                contact = parsed
         out.append({
             "title":   (r["title"] or "(no title)"),
             "url":     (r["url"] or ""),
             "company": (r["company"] or ""),
             "source":  (r["source"] or "?"),
             "score":   int(score) if score is not None else None,
+            "contact": contact,
         })
     return out
 
@@ -290,6 +312,23 @@ def build_daily_summary(store: Any, run_id: int, db: Any | None = None) -> str:
                 lines.append(f"• {score_txt} <a href=\"{url}\">{title}</a>{comp_suffix}")
             else:
                 lines.append(f"• {score_txt} {title}{comp_suffix}")
+            # Mirror of the user card's "who to write to" block, indented
+            # under its position so the operator sees exactly what the
+            # user was told to do next.
+            contact = j.get("contact")
+            if contact:
+                c_name = _html_escape(str(contact.get("name") or ""))
+                c_title = _html_escape(str(contact.get("title") or ""))
+                c_url = _html_escape(str(contact.get("profile_url") or ""))
+                c_reason = _html_escape(str(contact.get("reason") or ""))
+                label = f"{c_name} — {c_title}" if c_title else c_name
+                line = (
+                    f"   ↳ 👤 <a href=\"{c_url}\">{label}</a>"
+                    if c_url else f"   ↳ 👤 {label}"
+                )
+                if c_reason:
+                    line += f" · {c_reason}"
+                lines.append(line)
 
     return "\n".join(lines)
 

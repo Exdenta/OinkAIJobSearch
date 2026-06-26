@@ -40,6 +40,7 @@ os.environ["FORENSIC_OFF"] = "1"
 os.environ["JOB_AGE_FILTER_OFF"] = "1"
 os.environ["FORUM_FILTER_OFF"] = "1"
 os.environ["TG_RATE_LIMIT_OFF"] = "1"
+os.environ["HIRING_CONTACT_OFF"] = "1"
 os.environ["STATE_DIR"] = tempfile.mkdtemp(prefix="smoke_send_sort_")
 
 # Reload to pick up env.

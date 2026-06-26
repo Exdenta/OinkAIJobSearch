@@ -198,6 +198,7 @@ def _reset_modules(env_overrides: dict) -> None:
     # We always isolate from URL probes for this test.
     os.environ["URL_VALIDATION_OFF"] = "1"
     os.environ["TG_RATE_LIMIT_OFF"] = "1"
+    os.environ["HIRING_CONTACT_OFF"] = "1"
     os.environ.pop("FORENSIC_OFF", None)
     os.environ.pop("FORENSIC_FULL", None)
     for k, v in env_overrides.items():

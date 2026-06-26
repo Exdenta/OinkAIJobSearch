@@ -136,6 +136,7 @@ def test_end_to_end() -> None:
     os.environ["STATE_DIR"] = td
     os.environ["URL_VALIDATION_OFF"] = "1"
     os.environ["JOB_AGE_FILTER_OFF"] = "1"
+    os.environ["HIRING_CONTACT_OFF"] = "1"
     os.environ.pop("FORUM_FILTER_OFF", None)
     os.environ.pop("FORENSIC_OFF", None)
     os.environ.pop("FORUM_HOST_BLOCKLIST", None)
@@ -240,6 +241,7 @@ def test_filter_off() -> None:
     os.environ["FORUM_FILTER_OFF"] = "1"
     os.environ["URL_VALIDATION_OFF"] = "1"
     os.environ["JOB_AGE_FILTER_OFF"] = "1"
+    os.environ["HIRING_CONTACT_OFF"] = "1"
     td = tempfile.mkdtemp()
     os.environ["STATE_DIR"] = td
     for mod in ("forensic", "telegram_client"):
