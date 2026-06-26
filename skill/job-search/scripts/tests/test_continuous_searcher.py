@@ -301,6 +301,34 @@ def test_ctor_rejects_invalid_args() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_night_mute_caps_next_sleep() -> None:
+    section("7. night-mute window caps next_sleep to wake at mute-end")
+    s = ContinuousSearcher(
+        db=None, chat_id=433775883, interval_seconds=28800,
+        search_run_callable=lambda **kw: 0, min_sleep_seconds=60,
+    )
+    # Not in mute → no cap; normal interval-minus-elapsed sleep.
+    s._seconds_until_mute_end = lambda: None
+    _assert(s._next_sleep(1000.0) == 27800.0,
+            f"no-mute sleep should be 27800, got {s._next_sleep(1000.0)}")
+    # In mute, ends in 1h → cap to mute-end (flush right after window),
+    # NOT the full ~8h interval that would strand held matches.
+    s._seconds_until_mute_end = lambda: 3600.0
+    _assert(s._next_sleep(1000.0) == 3600.0,
+            f"in-mute sleep should cap to 3600, got {s._next_sleep(1000.0)}")
+    # min() never EXTENDS an already-short sleep, and the floor still holds.
+    s._seconds_until_mute_end = lambda: 3600.0
+    _assert(s._next_sleep(28790.0) == 60.0,
+            f"overrun sleep should stay at 60s floor, got {s._next_sleep(28790.0)}")
+    # Real helper returns a float-or-None and never raises.
+    real = ContinuousSearcher(
+        db=None, chat_id=1, interval_seconds=10,
+        search_run_callable=lambda **kw: 0, min_sleep_seconds=1,
+    )._seconds_until_mute_end()
+    _assert(real is None or isinstance(real, float),
+            f"_seconds_until_mute_end must be None|float, got {real!r}")
+
+
 def main() -> int:
     test_run_forever_calls_search_each_interval()
     test_iteration_failure_does_not_kill_loop()
@@ -308,6 +336,7 @@ def main() -> int:
     test_cancellation_propagates()
     test_chat_id_passed_to_search_callable()
     test_ctor_rejects_invalid_args()
+    test_night_mute_caps_next_sleep()
     print("\nAll continuous-searcher tests passed.")
     return 0
 
