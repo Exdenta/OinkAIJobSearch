@@ -69,7 +69,7 @@ if [[ ! -d "${APP_DIR}" ]]; then
 fi
 
 # ----- 1. Base apt packages ---------------------------------------------
-say "Step 1/10: base apt packages"
+say "Step 1/8: base apt packages"
 ensure_apt_pkgs \
     "${PY_VERSION}" \
     "${PY_VERSION}-venv" \
@@ -81,7 +81,7 @@ ensure_apt_pkgs \
     sudo
 
 # ----- 2. Caddy via Cloudsmith ------------------------------------------
-say "Step 2/10: Caddy"
+say "Step 2/8: Caddy"
 if ! command -v caddy >/dev/null 2>&1; then
     install -d -m 0755 /usr/share/keyrings
     if [[ ! -f /usr/share/keyrings/caddy-stable-archive-keyring.gpg ]]; then
@@ -98,7 +98,12 @@ fi
 # Always make sure caddy is enabled and running — cheap and idempotent.
 systemctl enable --now caddy.service
 
+# ----- 3. Node.js 20 via NodeSource -------------------------------------
+# Needed for `npm install -g @anthropic-ai/claude-code` below.
+say "Step 3/9: Node.js ${NODE_MAJOR}"
 need_node=true
+if command -v node >/dev/null 2>&1; then
+    cur="$(node --version | sed 's/^v//;s/\..*//')"
     if [[ "${cur}" -ge "${NODE_MAJOR}" ]]; then
         need_node=false
     fi
@@ -108,14 +113,16 @@ if ${need_node}; then
     apt-get install -y --no-install-recommends nodejs
 fi
 
-# ----- 4. Claude CLI ----------------------------------------------------
-say "Step 4/10: Claude CLI"
+# ----- 4. Claude CLI ------------------------------------------------------
+say "Step 4/9: Claude CLI"
 if ! command -v claude >/dev/null 2>&1; then
+    npm install -g @anthropic-ai/claude-code
 fi
+# Ownership of npm's global prefix is fine — claude is invoked by the
 # hryu user via PATH; the binary itself need not be owned by hryu.
 
 # ----- 5. hryu user + dirs ---------------------------------------------
-say "Step 5/10: hryu user and directory tree"
+say "Step 5/9: hryu user and directory tree"
 if ! id -u "${HRYU_USER}" >/dev/null 2>&1; then
     useradd -m -s /bin/bash "${HRYU_USER}"
 fi
@@ -135,36 +142,20 @@ fi
 chmod 600 "${ENV_FILE}"
 chown "${HRYU_USER}:${HRYU_USER}" "${ENV_FILE}"
 
-# without this. Idempotent: only fires when no non-empty value is set.
-    SESSION_SECRET="$(openssl rand -hex 32)"
-        # Empty-value line present — replace it in place.
-            "${ENV_FILE}"
-    else
-        # Line missing entirely — append it.
-    fi
-    unset SESSION_SECRET
-    chmod 600 "${ENV_FILE}"
-    chown "${HRYU_USER}:${HRYU_USER}" "${ENV_FILE}"
-fi
-
 # Ensure Caddy can write its access log dir.
 install -d -o caddy -g caddy -m 0755 /var/log/caddy 2>/dev/null \
     || install -d -m 0755 /var/log/caddy
 
 # ----- 6. Python venv + deps -------------------------------------------
-say "Step 6/10: Python venv + dependencies"
+say "Step 6/9: Python venv + dependencies"
 if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
     run_as_hryu "${PY_VERSION} -m venv '${VENV_DIR}'"
 fi
 run_as_hryu "'${VENV_DIR}/bin/pip' install -U pip wheel setuptools"
 run_as_hryu "'${VENV_DIR}/bin/pip' install -r '${APP_DIR}/requirements.txt'"
 
-# ----- 7. Frontend build ------------------------------------------------
-say "Step 7/10: Frontend build"
-# what Caddy serves; node_modules itself never ships to users.
-
-# ----- 8. systemd units -------------------------------------------------
-say "Step 8/10: systemd units"
+# ----- 7. systemd units -------------------------------------------------
+say "Step 7/9: systemd units"
 install -m 0644 "${SYSTEMD_SRC}/hryu-bot.service"     /etc/systemd/system/
 install -m 0644 "${SYSTEMD_SRC}/hryu-digest.service"  /etc/systemd/system/
 install -m 0644 "${SYSTEMD_SRC}/hryu-digest.timer"    /etc/systemd/system/
@@ -172,16 +163,16 @@ systemctl daemon-reload
 systemctl enable --now hryu-bot.service
 systemctl enable --now hryu-digest.timer
 
-# ----- 9. Caddyfile -----------------------------------------------------
-say "Step 9/10: Caddyfile"
+# ----- 8. Caddyfile -----------------------------------------------------
+say "Step 8/9: Caddyfile"
 install -m 0644 "${CADDY_SRC}" /etc/caddy/Caddyfile
 # `caddy validate` on the installed file before reloading — abort the
 # whole bootstrap if it's syntactically broken.
 caddy validate --config /etc/caddy/Caddyfile
 systemctl reload caddy.service
 
-# ----- 10. Sudoers ------------------------------------------------------
-say "Step 10/10: sudoers"
+# ----- 9. Sudoers ------------------------------------------------------
+say "Step 9/9: sudoers"
 # Make sure the hryu-deploy group exists; the file references it.
 groupadd -f hryu-deploy
 # Install with strict perms; visudo -cf validates BEFORE we put the file
@@ -194,6 +185,7 @@ install -o root -g root -m 0440 "${TMPFILE}" /etc/sudoers.d/hryu-deploy
 
 say "Done. Verify with:"
 cat <<'EOF'
+  systemctl status hryu-bot hryu-digest.timer caddy
   curl -sf https://hryu.example.com/healthz   # once DNS + cert are live
   journalctl -u hryu-bot -n 50
 EOF
