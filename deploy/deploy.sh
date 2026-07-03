@@ -59,12 +59,11 @@ rsync -azv --delete \
     ./ "${SSH_TARGET}:${APP_DIR}/" \
     || { echo "rsync failed" >&2; exit 3; }
 
-# ----- 2. install deps + rebuild frontend -------------------------------
-say "install Python deps + rebuild frontend"
+# ----- 2. install deps -------------------------------------------------
+say "install Python deps"
 ssh "${SSH_TARGET}" 'bash -se' <<'REMOTE' || { echo "remote install failed" >&2; exit 4; }
 set -euo pipefail
 sudo -u hryu /home/hryu/venv/bin/pip install -r /home/hryu/app/requirements.txt
-# The dist/ output is what production serves; node_modules never ships.
 REMOTE
 
 # ----- 3. restart services + reload Caddy -------------------------------
@@ -80,6 +79,7 @@ say "verifying services (10s journal tail)"
 ssh "${SSH_TARGET}" 'bash -se' <<'REMOTE' || { echo "post-restart verify failed" >&2; exit 5; }
 set -euo pipefail
 sleep 10
+for svc in hryu-bot.service caddy.service; do
     state="$(systemctl is-active "${svc}" || true)"
     if [[ "${state}" != "active" ]]; then
         echo "FAIL: ${svc} is ${state}" >&2

@@ -11,10 +11,6 @@
 hryu.example.com {
     encode zstd gzip
 
-    # ----- Backend API -----
-        reverse_proxy 127.0.0.1:8000
-    }
-
     # ----- Posting-click redirector -----
     # The redirect server is started in-process by hryu-bot.service (see
     # bot.py:2723). It listens on 127.0.0.1:8001 (REDIRECT_BIND_PORT in
@@ -34,11 +30,8 @@ hryu.example.com {
     # Intentionally unauthenticated — bodyless probe; no surface to abuse.
     respond /healthz 200
 
-    # Catch-all last. `try_files` falls back to index.html so client-side
-    handle {
-        try_files {path} /index.html
-        file_server
-    }
+    # No catch-all handler — nothing else is served on this domain now
+    # that the web app is gone. Unmatched paths 404.
 
     log {
         output file /var/log/caddy/hryu-access.log

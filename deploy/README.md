@@ -2,8 +2,9 @@
 
 Turnkey deploy bundle. Target: a single Hetzner CX22 (or equivalent), Ubuntu
 24.04 LTS. Goes from a fresh server to a running production install with
+Telegram bot and Caddy in front (for the click-redirector + health check).
 
-## Go-live checklist (~30 min once you have a domain)
+## Go-live checklist (~15 min once you have a domain)
 
 Everything code-side is done; these are the operator steps:
 
@@ -11,22 +12,24 @@ Everything code-side is done; these are the operator steps:
    set DNS A/AAAA records, wait for `dig +short yourdomain.tld`.
 2. **Provision** (sections below): rsync/clone the repo to
    `/home/hryu/app`, fill `/home/hryu/.env` from `deploy/env.example` —
-     → `https://yourdomain.tld`
-     login emails. Any relay works (Resend/Postmark/Mailgun/SES). Without
+   beyond the bot basics:
+   - `REDIRECT_BASE_URL` → `https://yourdomain.tld`, `REDIRECT_HMAC_SECRET`
+     (`openssl rand -hex 32`).
    - `ANTHROPIC_API_KEY` — the real profile build + scoring.
    Then `sudo bash /home/hryu/app/deploy/bootstrap.sh`.
 3. **Domain swap** in the Caddyfile (see "Domain swap" below).
+4. **Recommended — continuous mode** so feeds refresh ~2h instead of
    daily: add `HRYU_CONTINUOUS_MODE=1` to `.env` (do NOT set
-   `HRYU_CONTINUOUS_CHAT_ID` — unset means every onboarded user, web
-   signups included, picked up within ~10 min by the reconciler), then
+   `HRYU_CONTINUOUS_CHAT_ID` — unset means every onboarded user is
+   picked up within ~10 min by the reconciler), then
    `systemctl disable --now hryu-digest.timer` and
    `systemctl restart hryu-bot`.
 5. **CI deploys** (optional): repo variable `HETZNER_DEPLOY_ENABLED=true`
    + secrets `HETZNER_HOST`, `HETZNER_SSH_KEY` (workflow already lives in
    `.github/workflows/deploy.yml`; it skips silently until the variable
    is set).
-6. **Smoke test**: `curl -fsS https://yourdomain.tld/healthz`, then sign
-   build (1–3 min) → "Run search now" → feed populates; check
+6. **Smoke test**: `curl -fsS https://yourdomain.tld/healthz`, then send
+   `/start` to the Telegram bot and confirm a reply.
 
 ## What this deploys
 
@@ -37,19 +40,22 @@ Everything code-side is done; these are the operator steps:
                 ┌──────────────────────────────────────────────┐
                 │  Caddy   (systemd service: caddy)            │
                 │   :443 / :80                                 │
-                │   /r*    → 127.0.0.1:8001   (redirect svr)   │
+                │   /r*       → 127.0.0.1:8001 (redirect svr)  │
+                │   /healthz  → 200                            │
                 └──────────────────────────────────────────────┘
                                         │
    ┌────────────────────────────────────┼────────────────────────────────┐
-   ▼                                    ▼                                ▼
-┌──────────────┐               ┌────────────────────┐         ┌─────────────────┐
-│ 127.0.0.1    │               │  redirect server   │         │  via .timer)    │
-│ :8000        │               │  on 127.0.0.1      │         │                 │
-└──────┬───────┘               │  :8001)            │         └────────┬────────┘
-       │                       └─────────┬──────────┘                  │
-       │                                 │                             │
-       └────────────────► /home/hryu/state/jobs.db ◄───────────────────┘
-                          (SQLite — shared by all three)
+   ▼                                                                     ▼
+┌─────────────────────┐                                       ┌─────────────────┐
+│ hryu-bot             │                                       │ hryu-digest     │
+│ (long-poll +         │                                       │ (oneshot,       │
+│  in-process          │                                       │  daily 08:00    │
+│  redirect server     │                                       │  via .timer)    │
+│  on 127.0.0.1:8001)  │                                       │                 │
+└──────────┬───────────┘                                       └────────┬────────┘
+           │                                                             │
+           └──────────────────► /home/hryu/state/jobs.db ◄───────────────┘
+                                (SQLite — shared by both)
 ```
 
 Services:
@@ -60,7 +66,8 @@ Services:
   no `__main__` entry point and is meant to live inside `bot.py`.
 - **hryu-digest.timer** + **hryu-digest.service** — daily oneshot at 08:00
   Europe/Berlin. Runs `search_jobs.py`.
-  server. Auto-provisions Let's Encrypt certificates from DNS.
+- **caddy.service** — TLS termination + reverse proxy for the redirector
+  and health check. Auto-provisions Let's Encrypt certificates from DNS.
 
 Persistent state lives in `/home/hryu/state/` (SQLite + per-user resumes).
 Everything else is throwaway and can be redeployed at will.
@@ -92,8 +99,8 @@ Everything else is throwaway and can be redeployed at will.
    - `TELEGRAM_BOT_TOKEN` from @BotFather
    - `ANTHROPIC_API_KEY` (recommended) — see "Anthropic auth" below
    - `REDIRECT_HMAC_SECRET=$(openssl rand -hex 32)`
-   - `HRYU_PUBLIC_URL` and `REDIRECT_BASE_URL` — set both to
-     `https://hryu.example.com` (or your real domain).
+   - `REDIRECT_BASE_URL` — set to `https://hryu.example.com` (or your real
+     domain).
    - `OPERATOR_CHAT_ID` — DM the bot from your operator account once it's
      up, then read `journalctl -u hryu-bot` to find your chat_id.
 6. **Run bootstrap**:
@@ -103,6 +110,7 @@ Everything else is throwaway and can be redeployed at will.
    Prints each step and exits non-zero on failure. Re-runs are no-ops.
 7. **Verify**:
    ```bash
+   systemctl status hryu-bot hryu-digest.timer caddy
    curl -fsS https://hryu.example.com/healthz   # 200 OK once cert is live
    ```
    Smoke-test the bot: send `/start` to your Telegram bot, confirm reply.
@@ -110,6 +118,7 @@ Everything else is throwaway and can be redeployed at will.
 ### Generating secrets
 
 ```bash
+openssl rand -hex 32         # REDIRECT_HMAC_SECRET
 openssl rand -base64 24      # alternate format if base64 preferred
 ```
 
@@ -135,8 +144,8 @@ silently until enabled. In Settings → Secrets and variables → Actions:
 deploy/deploy.sh hryu.example.com
 ```
 
-The script rsyncs the working tree, reinstalls Python deps, rebuilds the
-frontend, restarts services, and verifies all are `active` before exiting.
+The script rsyncs the working tree, reinstalls Python deps, restarts
+services, and verifies all are `active` before exiting.
 
 ## Rollback
 
@@ -146,6 +155,7 @@ Two strategies:
 - **On the server** (faster, no CI roundtrip):
   ```bash
   ssh deploy@hryu.example.com 'cd /home/hryu/app && sudo -u hryu git fetch && sudo -u hryu git checkout <sha>'
+  ssh deploy@hryu.example.com 'sudo systemctl restart hryu-bot && sudo systemctl reload caddy'
   ```
   Note: server-side checkout requires the deploy method to be `git clone`
   rather than rsync. If you went the rsync route, only the laptop rollback
@@ -203,8 +213,8 @@ Replace the placeholder once DNS is real:
 ```bash
 sudo sed -i 's/hryu\.example\.com/realdomain.tld/g' /etc/caddy/Caddyfile
 sudo systemctl reload caddy
-# Then in /home/hryu/.env, update HRYU_PUBLIC_URL and REDIRECT_BASE_URL,
-# and restart the affected services:
+# Then in /home/hryu/.env, update REDIRECT_BASE_URL and restart the bot:
+sudo systemctl restart hryu-bot
 ```
 
 ## Continuous mode (Phase 3)
@@ -215,9 +225,9 @@ and pagination by the source-page cursors (P2), so each wake-up only
 flushes ≥4-scored matches and doesn't re-fetch the same source page
 within 6h.
 
-One searcher thread per onboarded user — Telegram (positive chat_ids)
+One searcher thread per onboarded user (Telegram chat_id). A reconciler
 thread re-scans the DB every `HRYU_CONTINUOUS_RECONCILE_S` (default
-without a bot restart.
+600s) so newly-onboarded users get a searcher without a bot restart.
 
 Enable on the server:
 
@@ -225,7 +235,7 @@ Enable on the server:
    ```bash
    HRYU_CONTINUOUS_MODE=1
    # Optional operator pin — ONLY these ids get searchers. Leave unset
-   # in production so every onboarded user (web included) is searched.
+   # in production so every onboarded user is searched.
    # HRYU_CONTINUOUS_CHAT_ID=433775883
    ```
 2. Disable the cron-fired digest so the same search doesn't run twice:
@@ -252,12 +262,6 @@ env vars, `systemctl enable --now hryu-digest.timer`, restart the bot.
 
 ## Limitations / known issues
 
-  a DB-backed token (sha256-hashed, 15-min expiry, single-use) and emails
-  it via `HRYU_SMTP_*`. With SMTP unconfigured it falls back to printing
-  for real users, so set the creds before launch.
-- **Web "Run search now" is a full pipeline run.** Minutes of wall-clock
-  and real Claude spend per click; rate-limited per user by
-  (continuous mode / digest timer) are the primary supply.
 - **No HA or failover.** Single CX22, single SQLite file. Fine for the MVP;
   plan a managed Postgres + 2nd app box before you outgrow it.
 - **Redirect server is in-process inside `bot.py`.** If you restart only
@@ -273,6 +277,7 @@ env vars, `systemctl enable --now hryu-digest.timer`, restart the bot.
 | `deploy/bootstrap.sh`                         | Fresh-server provisioning (root)         |
 | `deploy/deploy.sh`                            | Push-from-laptop / CI deploy             |
 | `deploy/env.example`                          | Template for `/home/hryu/.env`           |
+| `deploy/caddy/Caddyfile`                      | TLS + reverse proxy for redirector/healthz |
 | `deploy/systemd/hryu-bot.service`             | Long-poll bot + in-process redirector    |
 | `deploy/systemd/hryu-digest.service`          | Oneshot — daily digest                   |
 | `deploy/systemd/hryu-digest.timer`            | 08:00 Europe/Berlin trigger              |
