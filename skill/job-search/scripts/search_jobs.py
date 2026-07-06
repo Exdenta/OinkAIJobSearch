@@ -45,7 +45,7 @@ from defaults import DEFAULTS                              # noqa: E402
 from telegram_client import TelegramClient, send_per_job_digest  # noqa: E402
 from sources import (                                      # noqa: E402
     hackernews, remote_boards, linkedin, curated_boards, web_search,
-    reliefweb, euraxess, un_careers, math_ku_phd, ub_doctoral,
+    reliefweb, euraxess, math_ku_phd, ub_doctoral,
     # Wave 2 sources (added 2026-05-01). 10 live + 3 blocked-stubs.
     # Toggle each independently in defaults.py.
     eures, infojobs, tecnoempleo, ai_jobs_net, jobs_ac_uk,
@@ -91,7 +91,6 @@ SOURCES = {
     "curated_boards":  curated_boards,
     "reliefweb":       reliefweb,
     "euraxess":        euraxess,
-    "un_careers":      un_careers,
     "math_ku_phd":     math_ku_phd,
     "ub_doctoral":     ub_doctoral,
     # Wave 2 sources. Each adapter ships default-OFF in defaults.py — the
@@ -495,14 +494,14 @@ _CURSOR_AWARE_SOURCES = frozenset({"justjoinit", "nofluffjobs", "builtin"})
 # `search_fetches`, but through per-user dispatch (their `fetch_per_user`
 # entry points), so they don't appear in the cursor-aware set above.
 #
-# Tier 4 adds the three Claude-CLI delegation adapters that never paginate
-# (`devex`, `un_careers`, and the curated_boards module). The curated module
+# Tier 4 adds the Claude-CLI delegation adapter(s) that never paginate
+# (`devex` and the curated_boards module). The curated module
 # records under PER-SUB-BOARD keys (`remocate` / `wantapply` /
 # `remoterocketship`) — not under `curated_boards` — because the dispatcher
 # gates each sub-board's cooldown independently (see `_curated_subboards_to_run`
 # / `fetch_all`). So the instrumented set lists the three sub-board keys, not
-# the module name. `devex` / `un_careers` are single-key modules and use
-# their own name as the source key.
+# the module name. `devex` is a single-key module and uses its own name as
+# the source key.
 #
 # This list must stay COMPLETE: the P6-T1 migration
 # (`reset_uninstrumented_source_cooldowns`) uses it to tell which cooldown
@@ -511,8 +510,8 @@ _CURSOR_AWARE_SOURCES = frozenset({"justjoinit", "nofluffjobs", "builtin"})
 # missing here would be wrongly reset to 'normal' on every run.
 _P2_INSTRUMENTED_SOURCES = frozenset({
     "linkedin", "justjoinit", "nofluffjobs", "builtin", "web_search",
-    # Tier 4 — Claude-CLI delegation adapters (no native pagination).
-    "devex", "un_careers",
+    # Tier 4 — Claude-CLI delegation adapter (no native pagination).
+    "devex",
     # curated_boards sub-boards — each records + cools down on its own key.
     "remocate", "wantapply", "remoterocketship",
 })
@@ -528,7 +527,7 @@ _CURATED_SUBBOARDS = ("remocate", "wantapply", "remoterocketship")
 # that `_CURSOR_AWARE_SOURCES` adapters do. These are the Claude-CLI
 # delegation sources: they record one fixed-cell `search_fetches` row per
 # fetch so the cooldown FSM gets a novelty signal, without any page cursor.
-_DB_ONLY_SOURCES = frozenset({"devex", "un_careers", "curated_boards"})
+_DB_ONLY_SOURCES = frozenset({"devex", "curated_boards"})
 
 
 # Adaptive source cooldown (algorithm v2.8 / P4 pipeline overhaul).
@@ -817,7 +816,7 @@ def _fetch_one_source(
 
     `db` is forwarded to cursor-aware adapters (`_CURSOR_AWARE_SOURCES`)
     so they can advance their `search_fetches` cursor, and to the Tier-4
-    `_DB_ONLY_SOURCES` (devex / un_careers / curated_boards) so they can
+    `_DB_ONLY_SOURCES` (devex / curated_boards) so they can
     record fetch novelty (no page cursor). All other adapters keep their
     legacy `fetch(filters)` signature untouched.
     """
@@ -912,9 +911,9 @@ def fetch_all(
     Algorithm v2.2: switched from a serial for-loop to a thread pool
     (configurable via `defaults.ai_source_workers`, default 6). Source
     adapters are network-IO bound (HTTP/RSS/JSON gets, occasional
-    Claude CLI subprocess for curated_boards/devex/un_careers/
+    Claude CLI subprocess for curated_boards/devex/
     ub_doctoral) so threading scales them well — wall time drops from
-    ~11-23 min serial to ~2-4 min for 23 adapters.
+    ~11-23 min serial to ~2-4 min for 22 adapters.
 
     Thread-safety notes:
       * `forensic.log_step` is explicitly thread-safe (per-line append).
