@@ -1,16 +1,70 @@
-# Hryu - Job Alert Bot in Telegram
+# Hryu — Job Alert Bot in Telegram
 
 ![Welcome screen — orange-hat pig greeting the user in Telegram](assets/screenshots/welcome.png)
 
-A daily job-posting digest + interactive Telegram bot. Scrapes LinkedIn,
-HackerNews "Who is Hiring", and remote-focused boards; filters per-user via
-an Opus-built profile (resume + free-text /prefs);
-sends each new posting as its own Telegram message with inline buttons; tracks
-which roles you've applied to; and can produce a "tailored resume note" for any
-posting on demand.
+An AI-powered job-search agent that lives in Telegram. It scrapes 25+ job
+sources, scores every posting against a profile Claude builds from your
+resume, and sends only the real matches to your chat — each as its own card
+with Applied / Skip / "Tailor my resume" buttons.
 
 **Try the live bot:** [@job_search_everyday_bot](https://t.me/job_search_everyday_bot) —
-send `/start` to onboard.
+send `/start` and upload your CV. No install needed.
+
+## Who this is for
+
+Job seekers who want matching roles pushed to Telegram instead of
+doom-scrolling boards. The sources are strongest for:
+
+- **Software engineers** (frontend, backend, full-stack, DevOps/SRE) —
+  LinkedIn, HN "Who is Hiring", Welcome to the Jungle, Built In, Wellfound
+  (startups/YC), plus EU tech boards (JustJoin.it, NoFluffJobs, Tecnoempleo,
+  InfoJobs).
+- **ML / AI engineers and data scientists** — aijobs.net (curated AI/ML/MLOps
+  board) on top of all the general tech sources.
+- **Researchers and academics** (PhD positions, postdocs, faculty) — EURAXESS,
+  jobs.ac.uk, AcademicPositions, Ikerbasque, university doctoral boards.
+- **Humanitarian / international-development professionals** — ReliefWeb,
+  ImpactPool, DevEx, UN/INGO portals.
+- **Remote-first job hunters in any of the above** — dedicated remote boards
+  plus EU-wide vacancies via EURES.
+
+Use the live bot above and skip the rest of this README — or, if you're a
+**self-hoster / developer**, run your own instance (for yourself, friends, or
+a community), add sources, tweak the matching prompts: this README is your
+setup guide.
+
+**Not for**: recruiters sourcing candidates, bulk scraping, or hosting a
+public multi-tenant service — the scrapers are deliberately low-volume and
+some sources' TOS restrict use to personal job search.
+
+## What it does
+
+1. **Scrapes 25+ sources** — LinkedIn, HN "Who is Hiring", Wellfound,
+   EURES, ReliefWeb, remote-work boards, EU tech boards, academic/research
+   boards (full list in `skill/job-search/scripts/sources/`).
+2. **Builds your profile with Claude** — from your uploaded resume plus
+   free-text preferences (`/prefs`), rebuilt by Opus on demand.
+3. **Scores every posting with an LLM** — no keyword filters; a scoring
+   prompt weighs each job against your profile and only matches above your
+   `/minscore` threshold ship.
+4. **Delivers each match as a Telegram card** — with a "who to write to"
+   hiring contact found by a web-searching agent, and inline buttons to
+   track applications or generate a tailored resume note.
+5. **Runs deep market research on request** — `/marketresearch` fans out
+   10 Opus agents and returns a polished `.docx` report on demand, salaries,
+   and trends for your role + location.
+6. **Remembers everything** — applied/skipped roles never reappear; history
+   lives in a local SQLite DB you own.
+
+## What you need to self-host
+
+- **Python 3.10+** and the deps in `requirements.txt`.
+- **A Telegram bot token** — free, from [@BotFather](https://t.me/BotFather).
+- **Claude Code CLI** — the `claude` binary on PATH, authenticated (a
+  Claude subscription is enough; no API key required). All AI steps —
+  scoring, profile builds, hiring-contact lookup, market research — run
+  through `claude -p`. Without it the bot still scrapes but can't score
+  or personalize.
 
 ## Architecture
 
@@ -51,8 +105,10 @@ Per-user files:   state/users/<chat_id>/resume.pdf
 ```
 FindJobs/
 ├── README.md
+├── requirements.txt
 ├── .env                      ← TELEGRAM_BOT_TOKEN, OPERATOR_CONTACT (gitignored)
 ├── .env.example
+├── deploy/                   ← systemd units, Caddy config, VPS bootstrap scripts
 ├── docs/
 │   ├── PRIVACY.md            ← privacy policy published with the bot
 │   ├── per-user-profile-plan.md
@@ -83,13 +139,10 @@ FindJobs/
         │   ├── market_research_render.py  ← DOCX renderer for ResearchRun
         │   ├── safety_check.py        ← prompt-injection gate for user input
         │   ├── prompts/               ← fit_analysis.txt, market_research_{demand,history,...,manager}.txt, profile_builder.txt
-        │   ├── sources/
-        │   │   ├── hackernews.py
-        │   │   ├── remote_boards.py
-        │   │   ├── curated_boards.py
-        │   │   ├── web_search.py
-        │   │   ├── indeed.py
-        │   │   └── linkedin.py
+        │   ├── sources/               ← 25+ adapters, one file per board
+        │   │   ├── hackernews.py, linkedin.py, wellfound.py, eures.py,
+        │   │   ├── reliefweb.py, remote_boards.py, curated_boards.py,
+        │   │   └── … (see the directory for the full list)
         │   └── tools/
         │       └── reset_user.py      ← per-user history wipe
         └── references/
@@ -101,8 +154,9 @@ FindJobs/
 ### 1. Install dependencies
 
 ```bash
-pip install --break-system-packages \
-    requests feedparser beautifulsoup4 python-dotenv pdfplumber
+pip install --break-system-packages -r requirements.txt
+# or, better, in a venv:
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ```
 
 ### 2. Put your bot token in `.env`
@@ -319,3 +373,11 @@ Deletion: to reset a user, `DELETE FROM users WHERE chat_id=?` and drop their
   people use this instance, secure the filesystem accordingly.
 - If the bot token leaks: talk to [@BotFather](https://t.me/BotFather),
   `/revoke`, and paste the new one into `.env` then restart `bot.py`.
+
+## License
+
+[PolyForm Noncommercial 1.0.0](LICENSE.md) — free to use, modify, and share
+for any noncommercial purpose (personal job search, research, education,
+nonprofits). Commercial use is not permitted.
+
+Required Notice: Copyright Lex Sherman
