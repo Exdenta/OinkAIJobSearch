@@ -33,8 +33,8 @@ Paywall scope (separate from the bot wall):
     enough to surface a posting and let the user click through to evaluate.
 
 Maintaining a custom DataDome bypass is not viable (that's the entire point
-of DataDome), so we follow the same delegation pattern as ``un_careers.py``
-and ``curated_boards.py``: shell out to the ``claude`` CLI with WebSearch +
+of DataDome), so we follow the same delegation pattern as
+``curated_boards.py``: shell out to the ``claude`` CLI with WebSearch +
 WebFetch granted, and let it use Google site-search to discover the latest
 DevEx job URLs. WebFetch on individual ``devex.com/jobs/...`` pages is
 ALSO DataDome-blocked, so the prompt tells Claude to extract whatever is
@@ -85,7 +85,7 @@ UA = {"User-Agent": "FindJobs-Bot/1.0 (+https://github.com/; personal job-alert)
 # ---------------------------------------------------------------------------
 # Optional integrations: forensic + instrumented Claude CLI wrapper.
 #
-# Mirrors the un_careers.py guarding so this module also works in lean
+# Mirrors curated_boards.py's guarding so this module also works in lean
 # checkouts (older clones, isolated test envs) without those modules.
 # ---------------------------------------------------------------------------
 

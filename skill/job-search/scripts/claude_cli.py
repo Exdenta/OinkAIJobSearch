@@ -97,10 +97,10 @@ MID_MODEL = os.environ.get("CLAUDE_MID_MODEL", "sonnet")
 TOOLS_WEB_BOTH = "WebSearch,WebFetch"
 
 #: Allow ONLY WebFetch (no search). Used by callers that load a known URL
-#: directly (no discovery step) — currently ``sources/un_careers.py`` and
-#: ``sources/curated_boards.py``, both of which point Claude at a specific
-#: landing page and parse what it returns. Keeping the allow list minimal
-#: narrows the prompt-injection attack surface.
+#: directly (no discovery step) — currently ``sources/curated_boards.py``,
+#: which points Claude at a specific landing page and parses what it
+#: returns. Keeping the allow list minimal narrows the prompt-injection
+#: attack surface.
 TOOLS_WEB_FETCH_ONLY = "WebFetch"
 
 #: Deny shell + filesystem read/write. Use as the canonical

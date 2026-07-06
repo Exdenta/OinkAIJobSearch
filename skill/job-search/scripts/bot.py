@@ -476,7 +476,6 @@ _SOURCES_CATALOG: list[tuple[str, str]] = [
     ("reliefweb",       "ReliefWeb (humanitarian)"),
     ("impactpool",      "ImpactPool (UN/NGO)"),
     ("devex",           "DevEx (intl development)"),
-    ("un_careers",      "UN Careers"),
     # academic / research / postdoc
     ("euraxess",        "Euraxess (EU research)"),
     ("jobs_ac_uk",      "jobs.ac.uk (UK academic)"),

@@ -15,8 +15,7 @@ uses its own WebFetch tool to pull the current listings.
 The `--allowed-tools` grant is load-bearing: without it the CLI prompts the
 user interactively for tool permission, and in a non-interactive subprocess
 that prompt becomes the textual response ("I need permission to use
-WebFetch…") instead of the JSON envelope this adapter expects. See the
-2026-05 fix in `sources/un_careers.py` for the same class of bug.
+WebFetch…") instead of the JSON envelope this adapter expects (2026-05 fix).
 
 Requirements (on the machine that runs the cron):
   1. The `claude` CLI on PATH, already logged in (Anthropic account).
@@ -64,7 +63,7 @@ BOARDS: dict[str, str] = {
 # permission…" response instead of JSON. We do NOT grant WebSearch: the
 # prompt only ever asks Claude to WebFetch the target URL (and at most one
 # "next page" link). Keeping the allow list minimal narrows the attack
-# surface. See sources/un_careers.py / sources/devex.py for the same fix.
+# surface. See sources/devex.py for the same fix.
 _ALLOWED_TOOLS = TOOLS_WEB_FETCH_ONLY
 # Belt-and-suspenders: forbid filesystem/shell so a successful prompt-injection
 # in a fetched board page can't escalate.
@@ -122,8 +121,7 @@ def _scrape_one(board_key: str, url: str, filters: dict, *, db=None) -> list[Job
         # Pin to haiku (2026-05-25) — see same fix in devex/web_search.
         # Use the tool-aware wrapper: the prompt asks for WebFetch, and
         # without an explicit --allowed-tools grant the CLI prompts the
-        # user interactively (textual response, never JSON). See the
-        # 2026-05 fix in sources/un_careers.py for the same class of bug.
+        # user interactively (textual response, never JSON) — 2026-05 fix.
         from claude_cli import SMALLEST_MODEL as _MODEL
         stdout = wrapped_run_p_with_tools(
             None,

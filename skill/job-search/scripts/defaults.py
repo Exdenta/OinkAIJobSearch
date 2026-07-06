@@ -33,7 +33,6 @@ DEFAULTS: dict = {
         # Humanitarian + research/academic sources (added 2026-04-30).
         "reliefweb":        True,    # public API — humanitarian sector
         "euraxess":         True,    # EU researcher mobility portal — public API
-        "un_careers":       True,    # public JSON API (filteredV2) + chrome fallback
         "math_ku_phd":      True,    # KU employment RSS — math department
         "ub_doctoral":      True,    # Univ Barcelona — Claude CLI
         # Wave 2 sources (added 2026-05-01). 10 live + 3 blocked-stubs.
