@@ -1,8 +1,8 @@
 [Unit]
-Description=Daily run of Hryu digest
+Description=Daily run of Oink digest
 
 [Timer]
-# 08:00 in Europe/Berlin every day. Set TZ=Europe/Berlin in /home/hryu/.env
+# 08:00 in Europe/Berlin every day. Set TZ=Europe/Berlin in /home/oink/.env
 # if you also want app-level timestamps in the same zone; the systemd timer
 # itself uses the OnCalendar TZ regardless.
 OnCalendar=*-*-* 08:00:00 Europe/Berlin
@@ -10,7 +10,7 @@ OnCalendar=*-*-* 08:00:00 Europe/Berlin
 Persistent=true
 # Avoid stampedes if multiple servers ever exist behind a shared deploy.
 RandomizedDelaySec=300
-Unit=hryu-digest.service
+Unit=oink-digest.service
 
 [Install]
 WantedBy=timers.target

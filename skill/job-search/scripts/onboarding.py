@@ -974,7 +974,7 @@ def _finalize(
         log.exception("finalize: profile build enqueue failed")
 
     # Live-spawn the continuous searcher for this newly-onboarded user.
-    # No-op when HRYU_CONTINUOUS_MODE is off, or when the operator pinned a
+    # No-op when OINK_CONTINUOUS_MODE is off, or when the operator pinned a
     # specific chat_id list that excludes this user (see bot.start_continuous_searcher_for).
     # Lazy import: keeps onboarding.py importable in tests that don't load bot.py.
     try:

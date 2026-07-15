@@ -4,7 +4,7 @@
 Covers:
   1. `db.onboarded_chat_ids` returns only users with `onboarding_completed_at IS NOT NULL`
      AND a non-null/non-empty `user_profile`.
-  2. `_resolve_continuous_chat_ids` honours `HRYU_CONTINUOUS_CHAT_ID` when set,
+  2. `_resolve_continuous_chat_ids` honours `OINK_CONTINUOUS_CHAT_ID` when set,
      falls back to the DB list when unset.
   3. `_resolve_continuous_chat_ids` warns + falls back when the env var is set
      but parses to no valid ids.
@@ -127,11 +127,11 @@ def test_onboarded_chat_ids_filters_correctly() -> None:
 
 
 def test_resolver_env_override() -> None:
-    section("2. resolver honours HRYU_CONTINUOUS_CHAT_ID when set")
+    section("2. resolver honours OINK_CONTINUOUS_CHAT_ID when set")
     db = _make_tmpdb()
     # Seed a DB user so we can prove the env overrides the DB fallback.
     _seed_user(db, 500, completed=True, profile='{"x":1}')
-    with _EnvVar("HRYU_CONTINUOUS_CHAT_ID", "111,222"):
+    with _EnvVar("OINK_CONTINUOUS_CHAT_ID", "111,222"):
         ids = bot._resolve_continuous_chat_ids(db)
     _assert(ids == [111, 222], f"env override returned {ids!r}")
 
@@ -141,7 +141,7 @@ def test_resolver_db_fallback_when_env_unset() -> None:
     db = _make_tmpdb()
     _seed_user(db, 700, completed=True, profile='{"x":1}')
     _seed_user(db, 800, completed=True, profile='{"x":1}')
-    with _EnvVar("HRYU_CONTINUOUS_CHAT_ID", None):
+    with _EnvVar("OINK_CONTINUOUS_CHAT_ID", None):
         ids = bot._resolve_continuous_chat_ids(db)
     _assert(ids == [700, 800], f"DB fallback returned {ids!r}")
 
@@ -150,7 +150,7 @@ def test_resolver_db_fallback_when_env_blank() -> None:
     section("2c. resolver falls back to DB when env is empty string")
     db = _make_tmpdb()
     _seed_user(db, 901, completed=True, profile='{"x":1}')
-    with _EnvVar("HRYU_CONTINUOUS_CHAT_ID", "   "):
+    with _EnvVar("OINK_CONTINUOUS_CHAT_ID", "   "):
         ids = bot._resolve_continuous_chat_ids(db)
     _assert(ids == [901], f"blank env should fall back to DB; got {ids!r}")
 
@@ -159,7 +159,7 @@ def test_resolver_env_garbage_falls_back() -> None:
     section("3. resolver falls back to DB when env is set but parses to nothing")
     db = _make_tmpdb()
     _seed_user(db, 600, completed=True, profile='{"x":1}')
-    with _EnvVar("HRYU_CONTINUOUS_CHAT_ID", "abc,xyz"):
+    with _EnvVar("OINK_CONTINUOUS_CHAT_ID", "abc,xyz"):
         ids = bot._resolve_continuous_chat_ids(db)
     _assert(ids == [600], f"garbage env → DB fallback; got {ids!r}")
 
@@ -207,7 +207,7 @@ def test_maybe_start_no_op_when_mode_off() -> None:
     _fresh_registry()
     db = _make_tmpdb()
     _seed_user(db, 111, completed=True, profile='{"x":1}')
-    with _EnvVar("HRYU_CONTINUOUS_MODE", "0"), _EnvVar("HRYU_CONTINUOUS_CHAT_ID", None):
+    with _EnvVar("OINK_CONTINUOUS_MODE", "0"), _EnvVar("OINK_CONTINUOUS_CHAT_ID", None):
         result = bot._maybe_start_continuous_searcher(db)
     _assert(result is None, f"expected None when mode off, got {result!r}")
     _assert(
@@ -238,7 +238,7 @@ def test_maybe_start_uses_resolver_and_dedups_on_replay() -> None:
 
     bot._spawn_continuous_searcher_thread = _fake_spawn  # type: ignore[assignment]
     try:
-        with _EnvVar("HRYU_CONTINUOUS_MODE", "1"), _EnvVar("HRYU_CONTINUOUS_CHAT_ID", None):
+        with _EnvVar("OINK_CONTINUOUS_MODE", "1"), _EnvVar("OINK_CONTINUOUS_CHAT_ID", None):
             threads_1 = bot._maybe_start_continuous_searcher(db)
         # The fake spawn doesn't dedup — it's only here to capture which
         # chat_ids _maybe_start fed to the spawn helper. Real-spawn dedup
@@ -277,7 +277,7 @@ def test_maybe_start_replay_with_real_spawn_dedups() -> None:
     orig = continuous_searcher.ContinuousSearcher
     continuous_searcher.ContinuousSearcher = _StubSearcher  # type: ignore[assignment]
     try:
-        with _EnvVar("HRYU_CONTINUOUS_MODE", "1"), _EnvVar("HRYU_CONTINUOUS_CHAT_ID", None):
+        with _EnvVar("OINK_CONTINUOUS_MODE", "1"), _EnvVar("OINK_CONTINUOUS_CHAT_ID", None):
             ts1 = bot._maybe_start_continuous_searcher(db)
             time.sleep(0.1)  # let thread go live
             ts2 = bot._maybe_start_continuous_searcher(db)
@@ -293,7 +293,7 @@ def test_live_spawn_no_op_when_mode_off() -> None:
     section("7. start_continuous_searcher_for is a no-op when continuous mode is off")
     _fresh_registry()
     db = _make_tmpdb()
-    with _EnvVar("HRYU_CONTINUOUS_MODE", None), _EnvVar("HRYU_CONTINUOUS_CHAT_ID", None):
+    with _EnvVar("OINK_CONTINUOUS_MODE", None), _EnvVar("OINK_CONTINUOUS_CHAT_ID", None):
         result = bot.start_continuous_searcher_for(db, 999)
     _assert(result is None, f"expected None when mode off; got {result!r}")
     _assert(len(bot._CONTINUOUS_REGISTRY) == 0, "registry untouched")
@@ -313,7 +313,7 @@ def test_live_spawn_env_pinned_exclude_and_include() -> None:
     bot._spawn_continuous_searcher_thread = _fake_spawn  # type: ignore[assignment]
     try:
         # env pinned to 111 → live-spawn for 222 is a no-op.
-        with _EnvVar("HRYU_CONTINUOUS_MODE", "1"), _EnvVar("HRYU_CONTINUOUS_CHAT_ID", "111"):
+        with _EnvVar("OINK_CONTINUOUS_MODE", "1"), _EnvVar("OINK_CONTINUOUS_CHAT_ID", "111"):
             r1 = bot.start_continuous_searcher_for(db, 222)
             r2 = bot.start_continuous_searcher_for(db, 111)
         _assert(r1 is None, "live-spawn for excluded chat_id is None")
@@ -347,7 +347,7 @@ def test_live_spawn_idempotent_for_already_running() -> None:
     orig = continuous_searcher.ContinuousSearcher
     continuous_searcher.ContinuousSearcher = _StubSearcher  # type: ignore[assignment]
     try:
-        with _EnvVar("HRYU_CONTINUOUS_MODE", "1"), _EnvVar("HRYU_CONTINUOUS_CHAT_ID", None):
+        with _EnvVar("OINK_CONTINUOUS_MODE", "1"), _EnvVar("OINK_CONTINUOUS_CHAT_ID", None):
             t1 = bot.start_continuous_searcher_for(db, 888)
             time.sleep(0.1)
             t2 = bot.start_continuous_searcher_for(db, 888)
@@ -361,13 +361,13 @@ def test_live_spawn_idempotent_for_already_running() -> None:
 def test_continuous_mode_enabled_truthy_values() -> None:
     section("10. _continuous_mode_enabled accepts the documented truthy strings")
     for v in ("1", "true", "TRUE", "Yes", "on"):
-        with _EnvVar("HRYU_CONTINUOUS_MODE", v):
+        with _EnvVar("OINK_CONTINUOUS_MODE", v):
             _assert(
                 bot._continuous_mode_enabled() is True,
                 f"{v!r} should enable continuous mode",
             )
     for v in ("0", "false", "no", "off", "", "   "):
-        with _EnvVar("HRYU_CONTINUOUS_MODE", v):
+        with _EnvVar("OINK_CONTINUOUS_MODE", v):
             _assert(
                 bot._continuous_mode_enabled() is False,
                 f"{v!r} should NOT enable continuous mode",
@@ -476,7 +476,7 @@ def test_reconciler_spawns_missing_users() -> None:
     orig = bot._spawn_continuous_searcher_thread
     bot._spawn_continuous_searcher_thread = _fake_spawn  # type: ignore[assignment]
     try:
-        with _EnvVar("HRYU_CONTINUOUS_CHAT_ID", None):
+        with _EnvVar("OINK_CONTINUOUS_CHAT_ID", None):
             spawned = bot._reconcile_continuous_once(db)
             _assert(sorted(calls) == [-4, 100],
                     f"first pass spawns both users; got {calls!r}")
@@ -490,7 +490,7 @@ def test_reconciler_spawns_missing_users() -> None:
         # Env pin restricts the reconciler exactly like startup.
         _fresh_registry()
         calls.clear()
-        with _EnvVar("HRYU_CONTINUOUS_CHAT_ID", "100"):
+        with _EnvVar("OINK_CONTINUOUS_CHAT_ID", "100"):
             bot._reconcile_continuous_once(db)
             _assert(calls == [100], f"pin honored; got {calls!r}")
     finally:

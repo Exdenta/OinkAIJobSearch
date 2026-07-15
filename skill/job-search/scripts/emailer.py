@@ -1,14 +1,14 @@
 """SMTP email delivery for web users — magic links + digest notifications.
 
 Transport config comes entirely from env (the systemd units load
-/home/hryu/.env; local dev reads the repo .env via load_env or shell):
+/home/oink/.env; local dev reads the repo .env via load_env or shell):
 
-    HRYU_SMTP_HOST       smtp.example.com — unset → emailer disabled
-    HRYU_SMTP_PORT       587 (default)
-    HRYU_SMTP_USERNAME   optional — unset → no AUTH (e.g. localhost relay)
-    HRYU_SMTP_PASSWORD   optional
-    HRYU_SMTP_FROM       From: header; falls back to HRYU_SMTP_USERNAME
-    HRYU_SMTP_SECURITY   starttls (default) | ssl | none
+    OINK_SMTP_HOST       smtp.example.com — unset → emailer disabled
+    OINK_SMTP_PORT       587 (default)
+    OINK_SMTP_USERNAME   optional — unset → no AUTH (e.g. localhost relay)
+    OINK_SMTP_PASSWORD   optional
+    OINK_SMTP_FROM       From: header; falls back to OINK_SMTP_USERNAME
+    OINK_SMTP_SECURITY   starttls (default) | ssl | none
 
 Both the web backend (magic links, via the shared scripts sys.path) and
 search_jobs (digest notifications for web-only users) import this module.
@@ -41,23 +41,23 @@ _DIGEST_EMAIL_TOP_N = 5
 def smtp_configured() -> bool:
     """True when a transport host is set. Username/password stay optional
     so a localhost relay works."""
-    return bool((os.environ.get("HRYU_SMTP_HOST") or "").strip())
+    return bool((os.environ.get("OINK_SMTP_HOST") or "").strip())
 
 
 def _smtp_settings() -> dict:
-    host = (os.environ.get("HRYU_SMTP_HOST") or "").strip()
+    host = (os.environ.get("OINK_SMTP_HOST") or "").strip()
     try:
-        port = int(os.environ.get("HRYU_SMTP_PORT") or _DEFAULT_PORT)
+        port = int(os.environ.get("OINK_SMTP_PORT") or _DEFAULT_PORT)
     except ValueError:
         port = _DEFAULT_PORT
-    username = (os.environ.get("HRYU_SMTP_USERNAME") or "").strip()
+    username = (os.environ.get("OINK_SMTP_USERNAME") or "").strip()
     return {
         "host": host,
         "port": port,
         "username": username,
-        "password": os.environ.get("HRYU_SMTP_PASSWORD") or "",
-        "from_addr": (os.environ.get("HRYU_SMTP_FROM") or "").strip() or username,
-        "security": (os.environ.get("HRYU_SMTP_SECURITY") or _DEFAULT_SECURITY)
+        "password": os.environ.get("OINK_SMTP_PASSWORD") or "",
+        "from_addr": (os.environ.get("OINK_SMTP_FROM") or "").strip() or username,
+        "security": (os.environ.get("OINK_SMTP_SECURITY") or _DEFAULT_SECURITY)
         .strip()
         .lower(),
     }
@@ -69,12 +69,12 @@ def send_email(to: str, subject: str, body: str) -> bool:
     unconfigured — callers gate on `smtp_configured()` for their fallback.
     """
     if not smtp_configured():
-        log.debug("emailer: HRYU_SMTP_HOST unset — send_email(%r) skipped", to)
+        log.debug("emailer: OINK_SMTP_HOST unset — send_email(%r) skipped", to)
         return False
 
     cfg = _smtp_settings()
     if not cfg["from_addr"]:
-        log.error("emailer: HRYU_SMTP_FROM and HRYU_SMTP_USERNAME both empty")
+        log.error("emailer: OINK_SMTP_FROM and OINK_SMTP_USERNAME both empty")
         return False
 
     msg = EmailMessage()
@@ -115,7 +115,7 @@ def send_email(to: str, subject: str, body: str) -> bool:
 def _notify_min_interval_s() -> int:
     try:
         return int(
-            os.environ.get("HRYU_EMAIL_NOTIFY_MIN_INTERVAL_S")
+            os.environ.get("OINK_EMAIL_NOTIFY_MIN_INTERVAL_S")
             or _DEFAULT_NOTIFY_MIN_INTERVAL_S
         )
     except ValueError:
@@ -127,7 +127,7 @@ def maybe_send_web_digest_email(db, chat_id: int, jobs, enrichments) -> bool:
 
     Gates, in order: SMTP configured → user exists, has a verified email,
     and notify_email is on → at least one match this run → last email
-    older than HRYU_EMAIL_NOTIFY_MIN_INTERVAL_S (default 20h, so the 2h
+    older than OINK_EMAIL_NOTIFY_MIN_INTERVAL_S (default 20h, so the 2h
     continuous-searcher cadence doesn't turn into 12 emails a day).
 
     Returns True only when an email actually went out. Never raises.
@@ -150,7 +150,7 @@ def maybe_send_web_digest_email(db, chat_id: int, jobs, enrichments) -> bool:
             )
             return False
 
-        public_url = (os.environ.get("HRYU_PUBLIC_URL") or "").strip().rstrip("/")
+        public_url = (os.environ.get("OINK_PUBLIC_URL") or "").strip().rstrip("/")
         feed_url = f"{public_url}/" if public_url else ""
 
         scored = []
@@ -168,7 +168,7 @@ def maybe_send_web_digest_email(db, chat_id: int, jobs, enrichments) -> bool:
             lines.append(f"  …and {more} more")
 
         n = len(scored)
-        subject = f"Hryu found {n} new job match{'es' if n != 1 else ''}"
+        subject = f"Oink found {n} new job match{'es' if n != 1 else ''}"
         body = (
             f"Your latest search turned up {n} match{'es' if n != 1 else ''}:\n\n"
             + "\n".join(lines)

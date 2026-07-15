@@ -8,12 +8,12 @@
 #   Variables:
 #     HETZNER_DEPLOY_ENABLED  "true"
 #   Secrets:
-#     HETZNER_HOST     Hostname or IP of the server (e.g. hryu.example.com)
+#     HETZNER_HOST     Hostname or IP of the server (e.g. oink.example.com)
 #     HETZNER_SSH_KEY  Private ED25519 key whose public half is in the
 #                      `deploy` user's ~/.ssh/authorized_keys on the server.
 #                      Generate locally with:
-#                        ssh-keygen -t ed25519 -C "github-deploy" -f hryu_deploy
-#                      Put hryu_deploy.pub on the server, paste hryu_deploy
+#                        ssh-keygen -t ed25519 -C "github-deploy" -f oink_deploy
+#                      Put oink_deploy.pub on the server, paste oink_deploy
 #                      into the GH secret. Never commit either.
 
 name: Deploy to Hetzner

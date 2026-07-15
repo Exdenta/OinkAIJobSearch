@@ -1,4 +1,4 @@
-# Hryu — Hetzner deployment
+# Oink — Hetzner deployment
 
 Turnkey deploy bundle. Target: a single Hetzner CX22 (or equivalent), Ubuntu
 24.04 LTS. Goes from a fresh server to a running production install with
@@ -11,19 +11,19 @@ Everything code-side is done; these are the operator steps:
 1. **Domain + server**: buy/point a domain, create a CX22 (Ubuntu 24.04),
    set DNS A/AAAA records, wait for `dig +short yourdomain.tld`.
 2. **Provision** (sections below): rsync/clone the repo to
-   `/home/hryu/app`, fill `/home/hryu/.env` from `deploy/env.example` —
+   `/home/oink/app`, fill `/home/oink/.env` from `deploy/env.example` —
    beyond the bot basics:
    - `REDIRECT_BASE_URL` → `https://yourdomain.tld`, `REDIRECT_HMAC_SECRET`
      (`openssl rand -hex 32`).
    - `ANTHROPIC_API_KEY` — the real profile build + scoring.
-   Then `sudo bash /home/hryu/app/deploy/bootstrap.sh`.
+   Then `sudo bash /home/oink/app/deploy/bootstrap.sh`.
 3. **Domain swap** in the Caddyfile (see "Domain swap" below).
 4. **Recommended — continuous mode** so feeds refresh ~2h instead of
-   daily: add `HRYU_CONTINUOUS_MODE=1` to `.env` (do NOT set
-   `HRYU_CONTINUOUS_CHAT_ID` — unset means every onboarded user is
+   daily: add `OINK_CONTINUOUS_MODE=1` to `.env` (do NOT set
+   `OINK_CONTINUOUS_CHAT_ID` — unset means every onboarded user is
    picked up within ~10 min by the reconciler), then
-   `systemctl disable --now hryu-digest.timer` and
-   `systemctl restart hryu-bot`.
+   `systemctl disable --now oink-digest.timer` and
+   `systemctl restart oink-bot`.
 5. **CI deploys** (optional): repo variable `HETZNER_DEPLOY_ENABLED=true`
    + secrets `HETZNER_HOST`, `HETZNER_SSH_KEY` (workflow already lives in
    `.github/workflows/deploy.yml`; it skips silently until the variable
@@ -47,37 +47,37 @@ Everything code-side is done; these are the operator steps:
    ┌────────────────────────────────────┼────────────────────────────────┐
    ▼                                                                     ▼
 ┌─────────────────────┐                                       ┌─────────────────┐
-│ hryu-bot             │                                       │ hryu-digest     │
+│ oink-bot             │                                       │ oink-digest     │
 │ (long-poll +         │                                       │ (oneshot,       │
 │  in-process          │                                       │  daily 08:00    │
 │  redirect server     │                                       │  via .timer)    │
 │  on 127.0.0.1:8001)  │                                       │                 │
 └──────────┬───────────┘                                       └────────┬────────┘
            │                                                             │
-           └──────────────────► /home/hryu/state/jobs.db ◄───────────────┘
+           └──────────────────► /home/oink/state/jobs.db ◄───────────────┘
                                 (SQLite — shared by both)
 ```
 
 Services:
-- **hryu-bot.service** — `python skill/job-search/scripts/bot.py`. The bot
+- **oink-bot.service** — `python skill/job-search/scripts/bot.py`. The bot
   starts the redirect server in-process on `127.0.0.1:8001` (see
   `bot.py:2723` and `redirect_server.py:start_redirect_server`).
   We do **not** run the redirect server as a separate systemd unit; it has
   no `__main__` entry point and is meant to live inside `bot.py`.
-- **hryu-digest.timer** + **hryu-digest.service** — daily oneshot at 08:00
+- **oink-digest.timer** + **oink-digest.service** — daily oneshot at 08:00
   Europe/Berlin. Runs `search_jobs.py`.
 - **caddy.service** — TLS termination + reverse proxy for the redirector
   and health check. Auto-provisions Let's Encrypt certificates from DNS.
 
-Persistent state lives in `/home/hryu/state/` (SQLite + per-user resumes).
+Persistent state lives in `/home/oink/state/` (SQLite + per-user resumes).
 Everything else is throwaway and can be redeployed at will.
 
 ## First-time provisioning
 
 1. **Hetzner console** — create a CX22 with Ubuntu 24.04 LTS, attach your
    SSH public key, note the IPv4/IPv6 addresses.
-2. **DNS** — point `hryu.example.com` (and `www.hryu.example.com`) A/AAAA
-   records at the server. Wait for propagation (`dig +short hryu.example.com`).
+2. **DNS** — point `oink.example.com` (and `www.oink.example.com`) A/AAAA
+   records at the server. Wait for propagation (`dig +short oink.example.com`).
 3. **SSH in as root** and create the unprivileged tree:
    ```bash
    ssh root@<server-ip>
@@ -87,31 +87,31 @@ Everything else is throwaway and can be redeployed at will.
    - From your laptop:
      ```bash
      rsync -azv --exclude='.git' --exclude='node_modules' \
-         --exclude='state' ./ root@<server-ip>:/home/hryu/app/
+         --exclude='state' ./ root@<server-ip>:/home/oink/app/
      ```
    - Or `git clone` directly on the server (requires a deploy key for
      private repos):
      ```bash
-     git clone https://github.com/your-org/FindJobs /home/hryu/app
+     git clone https://github.com/your-org/FindJobs /home/oink/app
      ```
-5. **Edit `/home/hryu/.env`**. Bootstrap creates it from `env.example`
+5. **Edit `/home/oink/.env`**. Bootstrap creates it from `env.example`
    with `chmod 600` if missing. Fill in:
    - `TELEGRAM_BOT_TOKEN` from @BotFather
    - `ANTHROPIC_API_KEY` (recommended) — see "Anthropic auth" below
    - `REDIRECT_HMAC_SECRET=$(openssl rand -hex 32)`
-   - `REDIRECT_BASE_URL` — set to `https://hryu.example.com` (or your real
+   - `REDIRECT_BASE_URL` — set to `https://oink.example.com` (or your real
      domain).
    - `OPERATOR_CHAT_ID` — DM the bot from your operator account once it's
-     up, then read `journalctl -u hryu-bot` to find your chat_id.
+     up, then read `journalctl -u oink-bot` to find your chat_id.
 6. **Run bootstrap**:
    ```bash
-   sudo bash /home/hryu/app/deploy/bootstrap.sh
+   sudo bash /home/oink/app/deploy/bootstrap.sh
    ```
    Prints each step and exits non-zero on failure. Re-runs are no-ops.
 7. **Verify**:
    ```bash
-   systemctl status hryu-bot hryu-digest.timer caddy
-   curl -fsS https://hryu.example.com/healthz   # 200 OK once cert is live
+   systemctl status oink-bot oink-digest.timer caddy
+   curl -fsS https://oink.example.com/healthz   # 200 OK once cert is live
    ```
    Smoke-test the bot: send `/start` to your Telegram bot, confirm reply.
 
@@ -131,9 +131,9 @@ silently until enabled. In Settings → Secrets and variables → Actions:
 
 1. Add repository **variable** `HETZNER_DEPLOY_ENABLED` = `true`.
 2. Add **secrets**:
-   - `HETZNER_HOST` — `hryu.example.com` or raw IP.
+   - `HETZNER_HOST` — `oink.example.com` or raw IP.
    - `HETZNER_SSH_KEY` — private ED25519 key. Generate with
-     `ssh-keygen -t ed25519 -C github-deploy -f hryu_deploy`. Public half
+     `ssh-keygen -t ed25519 -C github-deploy -f oink_deploy`. Public half
      goes into `~deploy/.ssh/authorized_keys` on the server.
 3. Future pushes to `master` deploy automatically. Or trigger manually
    with the "Deploy to Hetzner" workflow's *Run workflow* button.
@@ -141,7 +141,7 @@ silently until enabled. In Settings → Secrets and variables → Actions:
 ### Manually from a laptop
 
 ```bash
-deploy/deploy.sh hryu.example.com
+deploy/deploy.sh oink.example.com
 ```
 
 The script rsyncs the working tree, reinstalls Python deps, restarts
@@ -154,8 +154,8 @@ Two strategies:
 - **Local**: `git checkout <previous-tag-or-sha>` and re-run `deploy.sh`.
 - **On the server** (faster, no CI roundtrip):
   ```bash
-  ssh deploy@hryu.example.com 'cd /home/hryu/app && sudo -u hryu git fetch && sudo -u hryu git checkout <sha>'
-  ssh deploy@hryu.example.com 'sudo systemctl restart hryu-bot && sudo systemctl reload caddy'
+  ssh deploy@oink.example.com 'cd /home/oink/app && sudo -u oink git fetch && sudo -u oink git checkout <sha>'
+  ssh deploy@oink.example.com 'sudo systemctl restart oink-bot && sudo systemctl reload caddy'
   ```
   Note: server-side checkout requires the deploy method to be `git clone`
   rather than rsync. If you went the rsync route, only the laptop rollback
@@ -164,10 +164,10 @@ Two strategies:
 ## Logs
 
 ```bash
-journalctl -u hryu-bot    -f       # Telegram bot + redirect server
-journalctl -u hryu-digest -n 200   # Last digest run
+journalctl -u oink-bot    -f       # Telegram bot + redirect server
+journalctl -u oink-digest -n 200   # Last digest run
 journalctl -u caddy       -f       # TLS / proxy
-tail -f /var/log/caddy/hryu-access.log
+tail -f /var/log/caddy/oink-access.log
 ```
 
 ## Backups
@@ -178,12 +178,12 @@ schedule and credentials):
 
 ```cron
 # 0 3 * * *  /usr/local/bin/restic -r sftp:user@u123.your-storagebox.de:/backups \
-#              --password-file /home/hryu/.restic-pw \
-#              backup --tag nightly /home/hryu/state /home/hryu/.env
+#              --password-file /home/oink/.restic-pw \
+#              backup --tag nightly /home/oink/state /home/oink/.env
 ```
 
-What to back up: `/home/hryu/state/` (DB + per-user files) and
-`/home/hryu/.env` (secrets). Skip `/home/hryu/app/` — that's redeployable.
+What to back up: `/home/oink/state/` (DB + per-user files) and
+`/home/oink/.env` (secrets). Skip `/home/oink/app/` — that's redeployable.
 
 ## Anthropic auth
 
@@ -198,10 +198,10 @@ to the `claude` CLI. Two modes:
   <https://console.anthropic.com/settings/keys>.
 - **Interactive OAuth**:
   ```bash
-  sudo -u hryu -H bash -lc 'claude'
+  sudo -u oink -H bash -lc 'claude'
   ```
   …and follow the device-flow prompts once. Stores credentials in
-  `/home/hryu/.claude/`. Survives reboots; breaks if the user is rotated.
+  `/home/oink/.claude/`. Survives reboots; breaks if the user is rotated.
 
 If neither is configured, the bot keeps running but every Claude-backed
 feature falls back to its heuristic (still useful, just less smart).
@@ -211,44 +211,44 @@ feature falls back to its heuristic (still useful, just less smart).
 Replace the placeholder once DNS is real:
 
 ```bash
-sudo sed -i 's/hryu\.example\.com/realdomain.tld/g' /etc/caddy/Caddyfile
+sudo sed -i 's/oink\.example\.com/realdomain.tld/g' /etc/caddy/Caddyfile
 sudo systemctl reload caddy
-# Then in /home/hryu/.env, update REDIRECT_BASE_URL and restart the bot:
-sudo systemctl restart hryu-bot
+# Then in /home/oink/.env, update REDIRECT_BASE_URL and restart the bot:
+sudo systemctl restart oink-bot
 ```
 
 ## Continuous mode (Phase 3)
 
 The bot can run its own search loop in-process instead of relying on the
-`hryu-digest.timer` cron. Quality is gated by the per-user buffer (P1)
+`oink-digest.timer` cron. Quality is gated by the per-user buffer (P1)
 and pagination by the source-page cursors (P2), so each wake-up only
 flushes ≥4-scored matches and doesn't re-fetch the same source page
 within 6h.
 
 One searcher thread per onboarded user (Telegram chat_id). A reconciler
-thread re-scans the DB every `HRYU_CONTINUOUS_RECONCILE_S` (default
+thread re-scans the DB every `OINK_CONTINUOUS_RECONCILE_S` (default
 600s) so newly-onboarded users get a searcher without a bot restart.
 
 Enable on the server:
 
-1. Add to `/home/hryu/.env`:
+1. Add to `/home/oink/.env`:
    ```bash
-   HRYU_CONTINUOUS_MODE=1
+   OINK_CONTINUOUS_MODE=1
    # Optional operator pin — ONLY these ids get searchers. Leave unset
    # in production so every onboarded user is searched.
-   # HRYU_CONTINUOUS_CHAT_ID=433775883
+   # OINK_CONTINUOUS_CHAT_ID=433775883
    ```
 2. Disable the cron-fired digest so the same search doesn't run twice:
    ```bash
-   sudo systemctl disable --now hryu-digest.timer
+   sudo systemctl disable --now oink-digest.timer
    ```
 3. Restart the bot to pick up the env change:
    ```bash
-   sudo systemctl restart hryu-bot
+   sudo systemctl restart oink-bot
    ```
 4. Verify the loop started:
    ```bash
-   journalctl -u hryu-bot -n 50 | grep -E 'continuous_(searcher|reconciler)'
+   journalctl -u oink-bot -n 50 | grep -E 'continuous_(searcher|reconciler)'
    # expect: continuous_searcher started: chat_id=… interval=7200s
    #         continuous_reconciler started (period=600s)
    ```
@@ -258,7 +258,7 @@ Tuning lives in `skill/job-search/scripts/defaults.py` —
 `continuous_min_sleep_seconds` (default 60s back-pressure floor).
 
 Disable continuous mode and roll back to cron with the inverse: unset the
-env vars, `systemctl enable --now hryu-digest.timer`, restart the bot.
+env vars, `systemctl enable --now oink-digest.timer`, restart the bot.
 
 ## Limitations / known issues
 
@@ -276,10 +276,10 @@ env vars, `systemctl enable --now hryu-digest.timer`, restart the bot.
 |-----------------------------------------------|------------------------------------------|
 | `deploy/bootstrap.sh`                         | Fresh-server provisioning (root)         |
 | `deploy/deploy.sh`                            | Push-from-laptop / CI deploy             |
-| `deploy/env.example`                          | Template for `/home/hryu/.env`           |
+| `deploy/env.example`                          | Template for `/home/oink/.env`           |
 | `deploy/caddy/Caddyfile`                      | TLS + reverse proxy for redirector/healthz |
-| `deploy/systemd/hryu-bot.service`             | Long-poll bot + in-process redirector    |
-| `deploy/systemd/hryu-digest.service`          | Oneshot — daily digest                   |
-| `deploy/systemd/hryu-digest.timer`            | 08:00 Europe/Berlin trigger              |
-| `deploy/sudoers.d/hryu-deploy`                | NOPASSWD restart/reload for deploy group |
+| `deploy/systemd/oink-bot.service`             | Long-poll bot + in-process redirector    |
+| `deploy/systemd/oink-digest.service`          | Oneshot — daily digest                   |
+| `deploy/systemd/oink-digest.timer`            | 08:00 Europe/Berlin trigger              |
+| `deploy/sudoers.d/oink-deploy`                | NOPASSWD restart/reload for deploy group |
 | `.github/workflows/deploy.yml`                | GHA deploy — inert until repo var `HETZNER_DEPLOY_ENABLED=true` |

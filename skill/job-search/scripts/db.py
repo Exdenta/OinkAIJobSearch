@@ -561,7 +561,7 @@ class DB:
         meaningfully run against.
 
         Used by bot.py to bootstrap continuous-mode threads when the operator
-        leaves `HRYU_CONTINUOUS_CHAT_ID` unset (the new default — every onboarded
+        leaves `OINK_CONTINUOUS_CHAT_ID` unset (the new default — every onboarded
         user gets a searcher thread). Ordered by chat_id ascending so the
         startup stagger is deterministic across restarts.
         """

@@ -366,10 +366,10 @@ DEFAULTS: dict = {
     },
 
     # Continuous searcher (Phase 3). When bot.py is started with the env var
-    # HRYU_CONTINUOUS_MODE=1 it spawns an in-process searcher loop instead of
+    # OINK_CONTINUOUS_MODE=1 it spawns an in-process searcher loop instead of
     # relying on the daily cron. The loop calls `search_jobs.run` every
     # `continuous_interval_seconds` for a single chat_id (set via
-    # HRYU_CONTINUOUS_CHAT_ID). Quality is gated by the P1 buffer; pages are
+    # OINK_CONTINUOUS_CHAT_ID). Quality is gated by the P1 buffer; pages are
     # gated by the P2 cursor memory; this knob just controls how often the
     # searcher wakes up.
     #

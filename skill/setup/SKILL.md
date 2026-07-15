@@ -1,6 +1,6 @@
 ---
 name: setup
-description: Interactively walks a new self-hoster from a fresh clone to a running Hryu bot — Python/pip check, Claude Code CLI check, .env creation (Telegram token + optional APIFY_TOKEN), run-mode choice with a generated cron/launchd/systemd/continuous-mode snippet, and a final getMe smoke test. Use whenever the user says "set up the bot", "/setup", "onboard me", or is running this repo for the first time.
+description: Interactively walks a new self-hoster from a fresh clone to a running Oink bot — Python/pip check, Claude Code CLI check, .env creation (Telegram token + optional APIFY_TOKEN), run-mode choice with a generated cron/launchd/systemd/continuous-mode snippet, and a final getMe smoke test. Use whenever the user says "set up the bot", "/setup", "onboard me", or is running this repo for the first time.
 ---
 
 # setup skill
@@ -60,7 +60,7 @@ Two mutually exclusive modes — ask the user which they want (see README
 `## Setup` → step 6 for full detail on both):
 
 - **Continuous mode** (recommended, single-user): `bot.py` runs the search
-  loop itself. Set `HRYU_CONTINUOUS_MODE=1` and `HRYU_CONTINUOUS_CHAT_ID=<chat_id>`
+  loop itself. Set `OINK_CONTINUOUS_MODE=1` and `OINK_CONTINUOUS_CHAT_ID=<chat_id>`
   before launching `bot.py`. No cron entry needed — if one exists, tell the
   user to remove it (`crontab -e`) to avoid double-running.
 - **Cron mode** (legacy, multi-user or non-continuous): schedule
