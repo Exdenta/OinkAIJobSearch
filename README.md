@@ -28,11 +28,25 @@
 2. Send `/start` and upload your CV (PDF)
 3. Matching jobs will start arriving
 
-Every card looks like this:
+## How it works
 
-<div align="center">
+<table>
+<tr>
+<td width="320" align="center" valign="middle">
 <img src="assets/screenshots/job_card.jpg" alt="Job card in Telegram" width="300">
-</div>
+</td>
+<td valign="middle">
+
+- **Scrapes 25+ sources** — LinkedIn, HN "Who is Hiring", Wellfound, EURES, ReliefWeb, remote boards, EU tech boards, academic/research boards (full list in `skill/job-search/scripts/sources/`).
+- **Builds your profile with Claude** — from your uploaded resume plus free-text preferences (`/prefs`), rebuilt by Opus on demand.
+- **Scores every posting with an LLM** — no keyword filters; a scoring prompt weighs each job against your profile, and only matches above your `/minscore` threshold ship.
+- **Delivers each match as a Telegram card** — with a hiring contact and inline buttons to track applications or generate a tailored resume note.
+- **Runs deep market research on request** — `/marketresearch` fans out 10 Opus agents and returns a polished `.docx` report on demand, salaries, and trends for your role + location.
+- **Remembers everything** — applied/skipped roles never reappear; history lives in a local SQLite DB you own.
+
+</td>
+</tr>
+</table>
 
 ## Ways to use this
 
@@ -42,24 +56,6 @@ Every card looks like this:
 | 🏢 [**oinkjobsearch.com**](https://oinkjobsearch.com) | A managed private instance: uptime, upgrades, and support handled for you | Free to try |
 | 🔌 [**Apify actors**](#the-scrapers-as-an-api) | The scrapers behind this bot as clean JSON APIs — proxies and anti-bot handled | Pay per result, from ~1$ per month + your Claude subscription |
 | 🛠️ **Self-host this repo** | Full control: your keys, your data, your prompts — see [Setup](#setup-self-hosting) | Free, only your Claude subscription |
-
-## How it works
-
-1. **Scrapes 25+ sources** — LinkedIn, HN "Who is Hiring", Wellfound, EURES,
-   ReliefWeb, remote boards, EU tech boards, academic/research boards
-   (full list in `skill/job-search/scripts/sources/`).
-2. **Builds your profile with Claude** — from your uploaded resume plus
-   free-text preferences (`/prefs`), rebuilt by Opus on demand.
-3. **Scores every posting with an LLM** — no keyword filters; a scoring
-   prompt weighs each job against your profile, and only matches above your
-   `/minscore` threshold ship.
-4. **Delivers each match as a Telegram card** — with a hiring contact and
-   inline buttons to track applications or generate a tailored resume note.
-5. **Runs deep market research on request** — `/marketresearch` fans out
-   10 Opus agents and returns a polished `.docx` report on demand, salaries,
-   and trends for your role + location.
-6. **Remembers everything** — applied/skipped roles never reappear; history
-   lives in a local SQLite DB you own.
 
 ## Who it's for
 
