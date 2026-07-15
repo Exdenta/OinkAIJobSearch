@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 12-hour continuous digest stress test for chat_id 433775883.
-# Stops at END_TS or when /tmp/hryu_stop_loop exists.
+# Stops at END_TS or when /tmp/oink_stop_loop exists.
 # Per-cycle: writes a metrics line to LOOP_LOG, full digest output to DIGEST_LOG.
 set -u
 
@@ -11,7 +11,7 @@ END_TS=$(($(date +%s) + 12*3600))
 LOOP_LOG="$ROOT/state/12h_loop.log"
 DIGEST_LOG="$ROOT/state/digest.log"
 PY="$ROOT/.venv/bin/python"
-STOP_FILE=/tmp/hryu_stop_loop
+STOP_FILE=/tmp/oink_stop_loop
 
 i=1
 echo "=== 12h LOOP START $(date -Is) end_ts=$END_TS chat_id=$CHAT_ID ===" >> "$LOOP_LOG"

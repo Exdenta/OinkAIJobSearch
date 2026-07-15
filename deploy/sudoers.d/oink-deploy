@@ -1,0 +1,16 @@
+# /etc/sudoers.d/oink-deploy — deploy automation only.
+#
+# Install as: sudo install -o root -g root -m 0440 \
+#   /home/oink/app/deploy/sudoers.d/oink-deploy /etc/sudoers.d/oink-deploy
+# Validate with `visudo -c` BEFORE logging out — a bad sudoers file locks
+# you out of root.
+#
+# Members of the oink-deploy group can restart Oink services and reload
+# Caddy without a password. They CANNOT escalate to a root shell.
+#
+# Bootstrap setup:
+#   sudo groupadd -f oink-deploy
+#   sudo useradd -m -s /bin/bash -G oink-deploy deploy   # if not present
+#   sudo usermod -aG oink-deploy deploy
+
+%oink-deploy  ALL=(root) NOPASSWD: /bin/systemctl restart oink-bot.service, /bin/systemctl restart oink-digest.service, /bin/systemctl reload caddy.service, /bin/systemctl status oink-bot.service, /bin/systemctl status oink-digest.service, /bin/systemctl status oink-digest.timer, /bin/systemctl is-active oink-bot.service, /bin/journalctl -u oink-bot.service *, /bin/journalctl -u oink-digest.service *

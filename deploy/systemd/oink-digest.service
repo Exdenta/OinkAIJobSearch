@@ -1,17 +1,17 @@
 [Unit]
-Description=Hryu daily digest (search_jobs.py)
+Description=Oink daily digest (search_jobs.py)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=hryu
-Group=hryu
-WorkingDirectory=/home/hryu/app
-EnvironmentFile=/home/hryu/.env
-Environment=PATH=/home/hryu/venv/bin:/usr/bin:/bin
-Environment=PYTHONPATH=/home/hryu/app/skill/job-search/scripts
-ExecStart=/home/hryu/venv/bin/python skill/job-search/scripts/search_jobs.py
+User=oink
+Group=oink
+WorkingDirectory=/home/oink/app
+EnvironmentFile=/home/oink/.env
+Environment=PATH=/home/oink/venv/bin:/usr/bin:/bin
+Environment=PYTHONPATH=/home/oink/app/skill/job-search/scripts
+ExecStart=/home/oink/venv/bin/python skill/job-search/scripts/search_jobs.py
 StandardOutput=journal
 StandardError=journal
 
@@ -23,7 +23,7 @@ TimeoutStartSec=2700
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/hryu/state /home/hryu/logs
+ReadWritePaths=/home/oink/state /home/oink/logs
 ProtectKernelTunables=true
 ProtectKernelModules=true
 PrivateTmp=true

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# deploy.sh — push working tree to the Hryu server and restart services.
+# deploy.sh — push working tree to the Oink server and restart services.
 #
 # Usage:
 #   deploy/deploy.sh <host>
-#       host = hostname or IP, e.g. hryu.example.com or 1.2.3.4
+#       host = hostname or IP, e.g. oink.example.com or 1.2.3.4
 #
 # Designed to run from CI (see deploy/github-actions/deploy.yml) and from a
 # developer's laptop. Idempotent — re-running is safe; rsync only ships
@@ -22,7 +22,7 @@ set -euo pipefail
 HOST="${1:-}"
 DEPLOY_USER="${DEPLOY_USER:-deploy}"
 SSH_TARGET="${DEPLOY_USER}@${HOST}"
-APP_DIR="/home/hryu/app"
+APP_DIR="/home/oink/app"
 
 if [[ -z "${HOST}" ]]; then
     echo "Usage: $0 <host>" >&2
@@ -37,9 +37,9 @@ say() { printf '\n\033[1;36m==>\033[0m %s\n' "$*"; }
 
 # ----- 1. rsync working tree --------------------------------------------
 say "rsync → ${SSH_TARGET}:${APP_DIR}/"
-# --rsync-path uses sudo -u hryu so files land owned by hryu:hryu without
+# --rsync-path uses sudo -u oink so files land owned by oink:oink without
 # needing root for the rsync receive end. The deploy user must be allowed
-# to `sudo -u hryu rsync` (configure in /etc/sudoers.d/hryu-deploy if you
+# to `sudo -u oink rsync` (configure in /etc/sudoers.d/oink-deploy if you
 # want this; or run rsync as deploy and let bootstrap chown afterwards).
 #
 # Excludes: VCS, build artifacts, runtime state, dotenv. .env on the
@@ -63,14 +63,14 @@ rsync -azv --delete \
 say "install Python deps"
 ssh "${SSH_TARGET}" 'bash -se' <<'REMOTE' || { echo "remote install failed" >&2; exit 4; }
 set -euo pipefail
-sudo -u hryu /home/hryu/venv/bin/pip install -r /home/hryu/app/requirements.txt
+sudo -u oink /home/oink/venv/bin/pip install -r /home/oink/app/requirements.txt
 REMOTE
 
 # ----- 3. restart services + reload Caddy -------------------------------
 say "restart services"
 ssh "${SSH_TARGET}" 'bash -se' <<'REMOTE'
 set -euo pipefail
-sudo /bin/systemctl restart hryu-bot.service
+sudo /bin/systemctl restart oink-bot.service
 sudo /bin/systemctl reload  caddy.service
 REMOTE
 
@@ -79,7 +79,7 @@ say "verifying services (10s journal tail)"
 ssh "${SSH_TARGET}" 'bash -se' <<'REMOTE' || { echo "post-restart verify failed" >&2; exit 5; }
 set -euo pipefail
 sleep 10
-for svc in hryu-bot.service caddy.service; do
+for svc in oink-bot.service caddy.service; do
     state="$(systemctl is-active "${svc}" || true)"
     if [[ "${state}" != "active" ]]; then
         echo "FAIL: ${svc} is ${state}" >&2

@@ -2919,7 +2919,7 @@ def _apply_tailor(
 
 # ---------- continuous searcher (Phase 3) ----------
 
-# Truthy strings accepted for HRYU_CONTINUOUS_MODE. Anything else (including
+# Truthy strings accepted for OINK_CONTINUOUS_MODE. Anything else (including
 # empty) leaves the searcher OFF — `python bot.py` in dev does NOT start
 # hammering sources. Operators flip this on explicitly via the systemd unit
 # or env file.
@@ -2935,18 +2935,18 @@ _CONTINUOUS_REGISTRY: dict[int, threading.Thread] = {}
 
 
 def _continuous_mode_enabled() -> bool:
-    return (os.environ.get("HRYU_CONTINUOUS_MODE", "") or "").strip().lower() \
+    return (os.environ.get("OINK_CONTINUOUS_MODE", "") or "").strip().lower() \
         in _CONTINUOUS_MODE_TRUTHY
 
 
 def _parse_continuous_chat_ids_env() -> list[int]:
-    """Parse the comma-separated HRYU_CONTINUOUS_CHAT_ID env var.
+    """Parse the comma-separated OINK_CONTINUOUS_CHAT_ID env var.
 
     Returns the list of positive ints, dropping blanks and bad tokens.
     An empty / unset env var yields []. Pulled into a helper so the resolver
     and the tests can share parsing logic.
     """
-    chat_raw = (os.environ.get("HRYU_CONTINUOUS_CHAT_ID", "") or "").strip()
+    chat_raw = (os.environ.get("OINK_CONTINUOUS_CHAT_ID", "") or "").strip()
     chat_ids: list[int] = []
     for tok in chat_raw.split(","):
         tok = tok.strip()
@@ -2965,7 +2965,7 @@ def _resolve_continuous_chat_ids(db: DB) -> list[int]:
     """Decide which chat_ids the continuous searcher should run for at startup.
 
     Resolution order:
-      1. If HRYU_CONTINUOUS_CHAT_ID is set and parses to ≥1 positive int,
+      1. If OINK_CONTINUOUS_CHAT_ID is set and parses to ≥1 positive int,
          use exactly those ids. This is the operator-override path: pin
          the loop to a single user for debugging without touching the DB.
       2. Otherwise, fall back to every onboarded user in the DB (the new
@@ -2976,12 +2976,12 @@ def _resolve_continuous_chat_ids(db: DB) -> list[int]:
     typo wiped everyone's continuous mode" failure mode.
     """
     env_ids = _parse_continuous_chat_ids_env()
-    env_raw = (os.environ.get("HRYU_CONTINUOUS_CHAT_ID", "") or "").strip()
+    env_raw = (os.environ.get("OINK_CONTINUOUS_CHAT_ID", "") or "").strip()
     if env_ids:
         return env_ids
     if env_raw:
         log.warning(
-            "HRYU_CONTINUOUS_CHAT_ID set but parsed to no valid ids (got %r) "
+            "OINK_CONTINUOUS_CHAT_ID set but parsed to no valid ids (got %r) "
             "— falling back to onboarded users from DB",
             env_raw,
         )
@@ -3104,8 +3104,8 @@ def _maybe_start_continuous_searcher(db: DB) -> list[threading.Thread] | None:
     Resolution
     ----------
     The chat-id list is resolved via `_resolve_continuous_chat_ids`:
-      • HRYU_CONTINUOUS_CHAT_ID set      → use those ids (operator override)
-      • HRYU_CONTINUOUS_CHAT_ID empty    → every onboarded user in the DB
+      • OINK_CONTINUOUS_CHAT_ID set      → use those ids (operator override)
+      • OINK_CONTINUOUS_CHAT_ID empty    → every onboarded user in the DB
 
     Spawning is delegated to `_spawn_continuous_searcher_thread`, which is
     the same code path used by the live-spawn hook from onboarding.py. The
@@ -3136,7 +3136,7 @@ def _maybe_start_continuous_searcher(db: DB) -> list[threading.Thread] | None:
     if not chat_ids:
         log.warning(
             "continuous_mode enabled but resolver returned no chat_ids — "
-            "no onboarded users in DB and no HRYU_CONTINUOUS_CHAT_ID override; "
+            "no onboarded users in DB and no OINK_CONTINUOUS_CHAT_ID override; "
             "skipping searcher",
         )
         return None
@@ -3174,8 +3174,8 @@ def start_continuous_searcher_for(db: DB, chat_id: int) -> threading.Thread | No
     completes the wizard.
 
     No-ops when:
-      • continuous mode is OFF (HRYU_CONTINUOUS_MODE unset/zero)
-      • HRYU_CONTINUOUS_CHAT_ID is set AND `chat_id` is NOT in the list —
+      • continuous mode is OFF (OINK_CONTINUOUS_MODE unset/zero)
+      • OINK_CONTINUOUS_CHAT_ID is set AND `chat_id` is NOT in the list —
         operator pinned to a specific subset, so we honor the pin and do
         NOT auto-add new onboarded users.
       • a thread is already registered for `chat_id` (idempotent).
@@ -3221,20 +3221,20 @@ def _start_continuous_reconciler(db: DB) -> threading.Thread | None:
     idempotent per chat_id and replaces dead registry entries.
 
     Resolution honors the same rules as startup: when
-    HRYU_CONTINUOUS_CHAT_ID pins a list, only those ids ever spawn.
-    Disable with HRYU_CONTINUOUS_RECONCILE_S=0.
+    OINK_CONTINUOUS_CHAT_ID pins a list, only those ids ever spawn.
+    Disable with OINK_CONTINUOUS_RECONCILE_S=0.
     """
     if not _continuous_mode_enabled():
         return None
     try:
         period = int(
-            os.environ.get("HRYU_CONTINUOUS_RECONCILE_S")
+            os.environ.get("OINK_CONTINUOUS_RECONCILE_S")
             or _CONTINUOUS_RECONCILE_DEFAULT_S
         )
     except ValueError:
         period = _CONTINUOUS_RECONCILE_DEFAULT_S
     if period <= 0:
-        log.info("continuous_reconciler disabled (HRYU_CONTINUOUS_RECONCILE_S<=0)")
+        log.info("continuous_reconciler disabled (OINK_CONTINUOUS_RECONCILE_S<=0)")
         return None
 
     import time as _time
@@ -3307,7 +3307,7 @@ def main() -> int:
         log.exception("redirect_server: failed to start; continuing without it")
 
     # Continuous searcher (Phase 3). OFF by default — flip on with
-    # HRYU_CONTINUOUS_MODE=1 + HRYU_CONTINUOUS_CHAT_ID=<chat_id> in the
+    # OINK_CONTINUOUS_MODE=1 + OINK_CONTINUOUS_CHAT_ID=<chat_id> in the
     # environment. See README + deploy/README for the production setup.
     try:
         _maybe_start_continuous_searcher(db)

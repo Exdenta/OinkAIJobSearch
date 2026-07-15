@@ -1,6 +1,7 @@
 .env
 state/
-.claude/
+.claude/*
+!.claude/skills/
 __pycache__/
 *.pyc
 .venv/

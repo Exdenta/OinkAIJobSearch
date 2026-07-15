@@ -50,9 +50,9 @@ class _FakeSMTP:
 @pytest.fixture(autouse=True)
 def _clean_env_and_fake(monkeypatch):
     for var in (
-        "HRYU_SMTP_HOST", "HRYU_SMTP_PORT", "HRYU_SMTP_USERNAME",
-        "HRYU_SMTP_PASSWORD", "HRYU_SMTP_FROM", "HRYU_SMTP_SECURITY",
-        "HRYU_EMAIL_NOTIFY_MIN_INTERVAL_S", "HRYU_PUBLIC_URL",
+        "OINK_SMTP_HOST", "OINK_SMTP_PORT", "OINK_SMTP_USERNAME",
+        "OINK_SMTP_PASSWORD", "OINK_SMTP_FROM", "OINK_SMTP_SECURITY",
+        "OINK_EMAIL_NOTIFY_MIN_INTERVAL_S", "OINK_PUBLIC_URL",
     ):
         monkeypatch.delenv(var, raising=False)
     _FakeSMTP.calls = []
@@ -63,9 +63,9 @@ def _clean_env_and_fake(monkeypatch):
 
 
 def _configure(monkeypatch, **extra):
-    monkeypatch.setenv("HRYU_SMTP_HOST", "smtp.test")
-    monkeypatch.setenv("HRYU_SMTP_USERNAME", "robot@test")
-    monkeypatch.setenv("HRYU_SMTP_PASSWORD", "hunter2")
+    monkeypatch.setenv("OINK_SMTP_HOST", "smtp.test")
+    monkeypatch.setenv("OINK_SMTP_USERNAME", "robot@test")
+    monkeypatch.setenv("OINK_SMTP_PASSWORD", "hunter2")
     for k, v in extra.items():
         monkeypatch.setenv(k, v)
 
@@ -90,12 +90,12 @@ def test_send_starttls_happy_path(monkeypatch):
 
 
 def test_send_ssl_skips_starttls(monkeypatch):
-    _configure(monkeypatch, HRYU_SMTP_SECURITY="ssl", HRYU_SMTP_FROM="hi@hryu.app")
+    _configure(monkeypatch, OINK_SMTP_SECURITY="ssl", OINK_SMTP_FROM="hi@oink.app")
     assert emailer.send_email("user@example.com", "S", "B") is True
     kinds = [c[0] for c in _FakeSMTP.calls]
     assert "starttls" not in kinds
     send = next(c for c in _FakeSMTP.calls if c[0] == "send")
-    assert send[1] == "hi@hryu.app"
+    assert send[1] == "hi@oink.app"
 
 
 def test_send_failure_returns_false(monkeypatch):
@@ -132,14 +132,14 @@ def _enrichments():
 
 def test_digest_email_happy_path_and_rate_limit(monkeypatch, tmp_path):
     _configure(monkeypatch)
-    monkeypatch.setenv("HRYU_PUBLIC_URL", "https://hryu.app")
+    monkeypatch.setenv("OINK_PUBLIC_URL", "https://oink.app")
     db, chat_id = _web_user(tmp_path)
 
     assert emailer.maybe_send_web_digest_email(db, chat_id, _jobs(), _enrichments()) is True
     send = next(c for c in _FakeSMTP.calls if c[0] == "send")
     assert "2" in send[3]                       # subject mentions the count
     assert "React Engineer" in send[4]
-    assert "https://hryu.app/" in send[4]
+    assert "https://oink.app/" in send[4]
     assert db.get_last_email_notified_at(chat_id) is not None
 
     # Second run inside the min interval → suppressed.

@@ -1,5 +1,5 @@
 [Unit]
-Description=Hryu Telegram bot (long-poll)
+Description=Oink Telegram bot (long-poll)
 # Bot also runs the in-process redirect server (see bot.py:2723), which
 # binds REDIRECT_BIND_PORT (8001 in our .env). Caddy proxies /r* there.
 After=network-online.target
@@ -7,15 +7,15 @@ Wants=network-online.target
 
 [Service]
 Type=exec
-User=hryu
-Group=hryu
-WorkingDirectory=/home/hryu/app
-EnvironmentFile=/home/hryu/.env
-Environment=PATH=/home/hryu/venv/bin:/usr/bin:/bin
+User=oink
+Group=oink
+WorkingDirectory=/home/oink/app
+EnvironmentFile=/home/oink/.env
+Environment=PATH=/home/oink/venv/bin:/usr/bin:/bin
 # bot.py imports modules with sibling-relative paths; add scripts dir to PYTHONPATH
 # so `from redirect_server import ...` resolves the same way as in dev.
-Environment=PYTHONPATH=/home/hryu/app/skill/job-search/scripts
-ExecStart=/home/hryu/venv/bin/python skill/job-search/scripts/bot.py
+Environment=PYTHONPATH=/home/oink/app/skill/job-search/scripts
+ExecStart=/home/oink/venv/bin/python skill/job-search/scripts/bot.py
 Restart=always
 RestartSec=10
 StandardOutput=journal
@@ -24,7 +24,7 @@ StandardError=journal
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/hryu/state /home/hryu/logs
+ReadWritePaths=/home/oink/state /home/oink/logs
 ProtectKernelTunables=true
 ProtectKernelModules=true
 PrivateTmp=true

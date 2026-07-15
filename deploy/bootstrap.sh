@@ -1,40 +1,40 @@
 #!/usr/bin/env bash
-# bootstrap.sh — fresh CX22 (Ubuntu 24.04) → running Hryu deployment.
+# bootstrap.sh — fresh CX22 (Ubuntu 24.04) → running Oink deployment.
 #
 # Run as root, ON THE SERVER, after you've rsynced or git-cloned the repo
-# to /home/hryu/app/. Idempotent: re-running is a no-op when nothing has
+# to /home/oink/app/. Idempotent: re-running is a no-op when nothing has
 # changed. Every step prints what it's doing and exits non-zero on failure.
 #
-#   sudo bash /home/hryu/app/deploy/bootstrap.sh
+#   sudo bash /home/oink/app/deploy/bootstrap.sh
 #
 # Pre-flight assumptions:
 #   * Ubuntu 24.04 LTS, root SSH access.
-#   * /home/hryu/app/ already contains the repo (rsync from CI or git clone).
-#   * Real /home/hryu/.env already filled in (or you'll fill it before
+#   * /home/oink/app/ already contains the repo (rsync from CI or git clone).
+#   * Real /home/oink/.env already filled in (or you'll fill it before
 #     enabling services — bootstrap creates .env from env.example with 600
 #     perms but does not invent secrets).
 
 set -euo pipefail
 
 # ----- Constants ---------------------------------------------------------
-HRYU_USER="hryu"
-HRYU_HOME="/home/${HRYU_USER}"
-APP_DIR="${HRYU_HOME}/app"
-STATE_DIR="${HRYU_HOME}/state"
-LOGS_DIR="${HRYU_HOME}/logs"
-VENV_DIR="${HRYU_HOME}/venv"
-ENV_FILE="${HRYU_HOME}/.env"
+OINK_USER="oink"
+OINK_HOME="/home/${OINK_USER}"
+APP_DIR="${OINK_HOME}/app"
+STATE_DIR="${OINK_HOME}/state"
+LOGS_DIR="${OINK_HOME}/logs"
+VENV_DIR="${OINK_HOME}/venv"
+ENV_FILE="${OINK_HOME}/.env"
 ENV_EXAMPLE="${APP_DIR}/deploy/env.example"
 SYSTEMD_SRC="${APP_DIR}/deploy/systemd"
 CADDY_SRC="${APP_DIR}/deploy/caddy/Caddyfile"
-SUDOERS_SRC="${APP_DIR}/deploy/sudoers.d/hryu-deploy"
+SUDOERS_SRC="${APP_DIR}/deploy/sudoers.d/oink-deploy"
 
 NODE_MAJOR=20
 PY_VERSION=python3.12
 
 # ----- Helpers -----------------------------------------------------------
 say() { printf '\n\033[1;36m==>\033[0m %s\n' "$*"; }
-run_as_hryu() { sudo -u "${HRYU_USER}" -H bash -lc "$*"; }
+run_as_oink() { sudo -u "${OINK_USER}" -H bash -lc "$*"; }
 
 require_root() {
     if [[ "${EUID}" -ne 0 ]]; then
@@ -119,28 +119,28 @@ if ! command -v claude >/dev/null 2>&1; then
     npm install -g @anthropic-ai/claude-code
 fi
 # Ownership of npm's global prefix is fine — claude is invoked by the
-# hryu user via PATH; the binary itself need not be owned by hryu.
+# oink user via PATH; the binary itself need not be owned by oink.
 
-# ----- 5. hryu user + dirs ---------------------------------------------
-say "Step 5/9: hryu user and directory tree"
-if ! id -u "${HRYU_USER}" >/dev/null 2>&1; then
-    useradd -m -s /bin/bash "${HRYU_USER}"
+# ----- 5. oink user + dirs ---------------------------------------------
+say "Step 5/9: oink user and directory tree"
+if ! id -u "${OINK_USER}" >/dev/null 2>&1; then
+    useradd -m -s /bin/bash "${OINK_USER}"
 fi
-install -d -o "${HRYU_USER}" -g "${HRYU_USER}" -m 0755 "${APP_DIR}"
-install -d -o "${HRYU_USER}" -g "${HRYU_USER}" -m 0750 "${STATE_DIR}"
-install -d -o "${HRYU_USER}" -g "${HRYU_USER}" -m 0755 "${LOGS_DIR}"
+install -d -o "${OINK_USER}" -g "${OINK_USER}" -m 0755 "${APP_DIR}"
+install -d -o "${OINK_USER}" -g "${OINK_USER}" -m 0750 "${STATE_DIR}"
+install -d -o "${OINK_USER}" -g "${OINK_USER}" -m 0755 "${LOGS_DIR}"
 
-# Make sure the rsynced app tree is owned by hryu (idempotent chown).
-chown -R "${HRYU_USER}:${HRYU_USER}" "${APP_DIR}"
+# Make sure the rsynced app tree is owned by oink (idempotent chown).
+chown -R "${OINK_USER}:${OINK_USER}" "${APP_DIR}"
 
-# /home/hryu/.env — created from env.example if missing (operator fills in).
+# /home/oink/.env — created from env.example if missing (operator fills in).
 if [[ ! -f "${ENV_FILE}" ]]; then
-    install -o "${HRYU_USER}" -g "${HRYU_USER}" -m 0600 \
+    install -o "${OINK_USER}" -g "${OINK_USER}" -m 0600 \
         "${ENV_EXAMPLE}" "${ENV_FILE}"
     say "Created ${ENV_FILE} from env.example. Edit it before enabling services."
 fi
 chmod 600 "${ENV_FILE}"
-chown "${HRYU_USER}:${HRYU_USER}" "${ENV_FILE}"
+chown "${OINK_USER}:${OINK_USER}" "${ENV_FILE}"
 
 # Ensure Caddy can write its access log dir.
 install -d -o caddy -g caddy -m 0755 /var/log/caddy 2>/dev/null \
@@ -149,19 +149,19 @@ install -d -o caddy -g caddy -m 0755 /var/log/caddy 2>/dev/null \
 # ----- 6. Python venv + deps -------------------------------------------
 say "Step 6/9: Python venv + dependencies"
 if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
-    run_as_hryu "${PY_VERSION} -m venv '${VENV_DIR}'"
+    run_as_oink "${PY_VERSION} -m venv '${VENV_DIR}'"
 fi
-run_as_hryu "'${VENV_DIR}/bin/pip' install -U pip wheel setuptools"
-run_as_hryu "'${VENV_DIR}/bin/pip' install -r '${APP_DIR}/requirements.txt'"
+run_as_oink "'${VENV_DIR}/bin/pip' install -U pip wheel setuptools"
+run_as_oink "'${VENV_DIR}/bin/pip' install -r '${APP_DIR}/requirements.txt'"
 
 # ----- 7. systemd units -------------------------------------------------
 say "Step 7/9: systemd units"
-install -m 0644 "${SYSTEMD_SRC}/hryu-bot.service"     /etc/systemd/system/
-install -m 0644 "${SYSTEMD_SRC}/hryu-digest.service"  /etc/systemd/system/
-install -m 0644 "${SYSTEMD_SRC}/hryu-digest.timer"    /etc/systemd/system/
+install -m 0644 "${SYSTEMD_SRC}/oink-bot.service"     /etc/systemd/system/
+install -m 0644 "${SYSTEMD_SRC}/oink-digest.service"  /etc/systemd/system/
+install -m 0644 "${SYSTEMD_SRC}/oink-digest.timer"    /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable --now hryu-bot.service
-systemctl enable --now hryu-digest.timer
+systemctl enable --now oink-bot.service
+systemctl enable --now oink-digest.timer
 
 # ----- 8. Caddyfile -----------------------------------------------------
 say "Step 8/9: Caddyfile"
@@ -173,19 +173,19 @@ systemctl reload caddy.service
 
 # ----- 9. Sudoers ------------------------------------------------------
 say "Step 9/9: sudoers"
-# Make sure the hryu-deploy group exists; the file references it.
-groupadd -f hryu-deploy
+# Make sure the oink-deploy group exists; the file references it.
+groupadd -f oink-deploy
 # Install with strict perms; visudo -cf validates BEFORE we put the file
 # in /etc/sudoers.d/, so a bad rule cannot lock root out.
 TMPFILE="$(mktemp)"
 trap 'rm -f "${TMPFILE}"' EXIT
 install -m 0440 "${SUDOERS_SRC}" "${TMPFILE}"
 visudo -cf "${TMPFILE}"
-install -o root -g root -m 0440 "${TMPFILE}" /etc/sudoers.d/hryu-deploy
+install -o root -g root -m 0440 "${TMPFILE}" /etc/sudoers.d/oink-deploy
 
 say "Done. Verify with:"
 cat <<'EOF'
-  systemctl status hryu-bot hryu-digest.timer caddy
-  curl -sf https://hryu.example.com/healthz   # once DNS + cert are live
-  journalctl -u hryu-bot -n 50
+  systemctl status oink-bot oink-digest.timer caddy
+  curl -sf https://oink.example.com/healthz   # once DNS + cert are live
+  journalctl -u oink-bot -n 50
 EOF
