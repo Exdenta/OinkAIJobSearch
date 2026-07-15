@@ -69,10 +69,21 @@ Costs / pacing
 ~3 HTTP requests per run (one RSS attempt + one HTML attempt + one country
 fan-out fallback). All capped at `max_per_source`. No new pip deps — we
 reuse `requests`, `feedparser`, and `bs4` already installed for other adapters.
+
+Apify fallback (opt-in, default OFF)
+-------------------------------------
+When the operator sets the `APIFY_TOKEN` env var, `fetch()` tries the
+confirmed `nomad-agent/academicpositions-scraper` Apify Actor first
+(Playwright + residential proxy, already clears Cloudflare BFM — see
+https://apify.com/nomad-agent/academicpositions-scraper). Its dataset items
+are mapped straight to `Job`, ahead of the RSS/HTML/Chrome stages below.
+With `APIFY_TOKEN` unset, this path is never invoked and behavior is
+byte-for-byte the historic stub.
 """
 from __future__ import annotations
 
 import logging
+import os
 import re
 from typing import Any
 from urllib.parse import urljoin, urlencode
@@ -85,6 +96,8 @@ from dedupe import Job
 from text_utils import clean_snippet, fix_mojibake
 
 log = logging.getLogger(__name__)
+
+_APIFY_ACTOR = "nomad-agent/academicpositions-scraper"
 
 # Best-effort forensic logger; module may not exist in every checkout.
 try:  # pragma: no cover - thin shim
@@ -164,6 +177,58 @@ def _extract_id(url: str) -> str:
     # Last URL path segment as a fallback id.
     seg = url.rstrip("/").rsplit("/", 1)[-1]
     return seg or url
+
+
+def _try_apify(*, search: str, cap: int, token: str) -> list[Job]:
+    """Best-effort recovery via the confirmed Apify Actor. Never raises: any
+    transport or mapping problem degrades to `[]`, same contract as the RSS
+    / HTML / Chrome stages below.
+
+    `countryFilter` is left "" (the actor's own default) — the actor takes
+    a single country string, while this adapter's `_DEFAULT_COUNTRIES`
+    fan-out is a multi-country strategy for the requests-based HTML stage;
+    the two don't map cleanly, so we don't invent one here.
+    """
+    from sources._apify import run_actor
+
+    run_input = {
+        "keyword": search,
+        "maxItems": cap,
+        "countryFilter": "",
+        "proxyConfiguration": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]},
+    }
+    try:
+        items = run_actor(_APIFY_ACTOR, run_input, token=token)
+    except Exception as e:  # noqa: BLE001 - belt-and-suspenders, run_actor already no-raise
+        log.debug("academicpositions: apify actor raised (%s); returning []", e)
+        return []
+
+    jobs: list[Job] = []
+    for item in items:
+        try:
+            url = (item.get("url") or "").strip()
+            title = fix_mojibake(item.get("title") or "").strip()
+            if not (url and title):
+                continue
+            ext_id = (item.get("globalId") or "").strip() or _extract_id(url)
+            jobs.append(Job(
+                source="academicpositions",
+                external_id=ext_id,
+                title=title[:140],
+                company=fix_mojibake(item.get("company") or "")[:120],
+                location=(item.get("location") or "EU")[:120],
+                url=url,
+                posted_at=(item.get("postedAt") or "").strip(),
+                snippet=clean_snippet(item.get("snippet") or "", max_chars=400),
+                salary=(item.get("salary") or "").strip(),
+            ))
+        except Exception as e:  # noqa: BLE001
+            log.debug("academicpositions: skipped unmappable apify item (%s)", e)
+            continue
+
+    if jobs:
+        log.info("academicpositions: apify actor recovered %d listing(s)", len(jobs))
+    return jobs
 
 
 def _try_rss(*, search: str, cap: int) -> tuple[int, str, list[Job]]:
@@ -473,6 +538,14 @@ def fetch(filters: dict) -> list[Job]:
         countries = tuple(str(c).strip() for c in countries_raw if str(c).strip())
     if not countries:
         countries = _DEFAULT_COUNTRIES
+
+    # Opt-in Apify recovery. With APIFY_TOKEN unset (default) this branch
+    # never runs, so behavior below is identical to the historic stub.
+    apify_token = os.environ.get("APIFY_TOKEN")
+    if apify_token:
+        apify_jobs = _try_apify(search=search, cap=cap, token=apify_token)
+        if apify_jobs:
+            return apify_jobs
 
     rss_status = 0
     rss_body_head = ""
