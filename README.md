@@ -4,9 +4,7 @@
 
 # Oink — AI Job Search in Telegram
 
-**Stop doom-scrolling job boards. Oink scrapes 25+ sources, scores every
-posting against your resume with Claude, and pushes only the real matches
-to your Telegram — each with a hiring contact and one-tap tracking.**
+**Oink scrapes 25+ sources, scores every posting against your resume with Claude, and pushes only the real matches to your Telegram — each with a hiring contact and one-tap tracking.**
 
 [![Live bot](https://img.shields.io/badge/Telegram-try_the_live_bot-26A5E4?logo=telegram&logoColor=white)](https://t.me/job_search_everyday_bot)
 [![Python](https://img.shields.io/badge/python-3.10+-3776AB?logo=python&logoColor=white)](#setup-self-hosting)
@@ -24,46 +22,25 @@ to your Telegram — each with a hiring contact and one-tap tracking.**
 
 ---
 
-## Try it in 30 seconds
-
-No install, no keys, no config:
+## Try it first
 
 1. Open [**@job_search_everyday_bot**](https://t.me/job_search_everyday_bot)
 2. Send `/start` and upload your CV (PDF)
-3. Matching jobs start arriving as cards — **✅ Applied · 🚫 Skip · ✍️ Tailor my resume**
+3. Matching jobs will start arriving
 
 Every card looks like this:
 
-```
-Senior Frontend Developer (Remote EU)
-Acme Inc · Remote · $80k–$120k
-We need a React + TypeScript engineer to build our design system…
 
-👤 Jane Doe — Senior Technical Recruiter
-   recruits frontend engineers at Acme, covers EMEA
-
-[✅ Applied]  [🚫 Not applied]
-[✍️ Tailor my resume]
-```
-
-The 👤 line is the **hiring contact** — a web-searching Claude agent finds
-the one person who most plausibly owns the opening (named recruiter, TA
-partner for that region, hiring manager, or founder) and links their public
-profile, so you can write to a human instead of a portal.
+<img src="assets/screenshots/job_card.jpg" alt="Oink — the orange-hat pig greeting you in Telegram" width="620">
 
 ## Ways to use this
 
 | Path | You get | Cost |
 |------|---------|------|
-| 🐷 [**Hosted bot**](https://t.me/job_search_everyday_bot) *(recommended)* | `/start` in Telegram, upload CV, done — zero setup, sources maintained for you | **Free** |
-| 🏢 [**oinkjobsearch.com**](https://oinkjobsearch.com) | A managed private instance: uptime, upgrades, and support handled for you | Paid |
-| 🔌 [**Apify actors**](#the-scrapers-as-an-api) | The scrapers behind this bot as clean JSON APIs — proxies and anti-bot handled | Pay per result, from $0.90/1k |
-| 🛠️ **Self-host this repo** | Full control: your keys, your data, your prompts — see [Setup](#setup-self-hosting) | Free, your infra |
-
-> [!TIP]
-> If you just want job matches, use the hosted bot and skip the rest of this
-> README. Self-hosting is the developer path — expect Python, cron, and
-> prompt tweaking.
+| 🐷 [**Hosted bot**](https://t.me/job_search_everyday_bot) *(recommended first)* | `/start` in Telegram, upload CV, done — zero setup, sources maintained for you | Free to try |
+| 🏢 [**oinkjobsearch.com**](https://oinkjobsearch.com) | A managed private instance: uptime, upgrades, and support handled for you | Free to try |
+| 🔌 [**Apify actors**](#the-scrapers-as-an-api) | The scrapers behind this bot as clean JSON APIs — proxies and anti-bot handled | Pay per result, from ~1$ per month + your Claude subscription |
+| 🛠️ **Self-host this repo** | Full control: your keys, your data, your prompts — see [Setup](#setup-self-hosting) | Free, only your Claude subscription |
 
 ## How it works
 
