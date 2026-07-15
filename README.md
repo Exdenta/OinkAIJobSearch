@@ -30,14 +30,15 @@
 
 Every card looks like this:
 
-
+<div align="center">
 <img src="assets/screenshots/job_card.jpg" alt="Oink — the orange-hat pig greeting you in Telegram" width="620">
+</div>
 
 ## Ways to use this
 
 | Path | You get | Cost |
 |------|---------|------|
-| 🐷 [**Hosted bot**](https://t.me/job_search_everyday_bot) *(recommended first)* | `/start` in Telegram, upload CV, done — zero setup, sources maintained for you | Free to try |
+| 🐷 [**Hosted bot**](https://t.me/job_search_everyday_bot) *(recommend to try)* | `/start` in Telegram, upload CV, done — zero setup, sources maintained for you | Free to try |
 | 🏢 [**oinkjobsearch.com**](https://oinkjobsearch.com) | A managed private instance: uptime, upgrades, and support handled for you | Free to try |
 | 🔌 [**Apify actors**](#the-scrapers-as-an-api) | The scrapers behind this bot as clean JSON APIs — proxies and anti-bot handled | Pay per result, from ~1$ per month + your Claude subscription |
 | 🛠️ **Self-host this repo** | Full control: your keys, your data, your prompts — see [Setup](#setup-self-hosting) | Free, only your Claude subscription |
