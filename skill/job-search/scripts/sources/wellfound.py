@@ -64,10 +64,20 @@ identical to the historic DataDome stub — it still probes, logs the block
 reason, and returns ``[]``. Zero regression.
 
 Module key: wellfound  (default OFF — do not enable in filters.yaml)
+
+Apify fallback (opt-in, default OFF)
+-------------------------------------
+When the operator sets the `APIFY_TOKEN` env var, `fetch()` tries the
+confirmed `nomad-agent/wellfound-scraper` Apify Actor first (Playwright +
+residential proxy, already clears DataDome — see
+https://apify.com/nomad-agent/wellfound-scraper). Its dataset items are
+mapped straight to `Job`. With `APIFY_TOKEN` unset, this path is never
+invoked and behavior is byte-for-byte the historic stub.
 """
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 import requests
@@ -75,6 +85,8 @@ import requests
 from dedupe import Job
 
 log = logging.getLogger(__name__)
+
+_APIFY_ACTOR = "nomad-agent/wellfound-scraper"
 
 UA = {"User-Agent": "FindJobs-Bot/1.0 (+https://github.com/; personal job-alert)"}
 
@@ -147,6 +159,49 @@ def _coerce_str(value: Any) -> str:
         return str(value).strip()
     except Exception:  # noqa: BLE001
         return ""
+
+
+def _try_apify(filters: dict, *, cap: int, token: str) -> list[Job]:
+    """Best-effort recovery via the confirmed Apify Actor. Never raises:
+    any transport or mapping problem degrades to `[]`, same contract as the
+    Chrome fallback below.
+    """
+    from sources._apify import run_actor
+
+    run_input = {
+        "keyword": (filters.get("wellfound_search") or "").strip(),
+        "maxItems": cap,
+        "remoteOnly": bool(filters.get("wellfound_remote_only", False)),
+        "proxyConfiguration": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]},
+    }
+    try:
+        items = run_actor(_APIFY_ACTOR, run_input, token=token)
+    except Exception as e:  # noqa: BLE001 - belt-and-suspenders, run_actor already no-raise
+        log.debug("wellfound: apify actor raised (%s); returning []", e)
+        return []
+
+    jobs: list[Job] = []
+    for item in items:
+        try:
+            job_url = _coerce_str(item.get("url"))
+            jobs.append(Job(
+                source="wellfound",
+                external_id=_coerce_str(item.get("id")) or job_url,
+                title=_coerce_str(item.get("title")),
+                company=_coerce_str(item.get("company")),
+                location=_coerce_str(item.get("location")),
+                url=job_url,
+                posted_at=_coerce_str(item.get("postedAt")),
+                snippet=_coerce_str(item.get("snippet")),
+                salary=_coerce_str(item.get("salary")),
+            ))
+        except Exception as e:  # noqa: BLE001
+            log.debug("wellfound: skipped unmappable apify item (%s)", e)
+            continue
+
+    if jobs:
+        log.info("wellfound: apify actor recovered %d listing(s)", len(jobs))
+    return jobs
 
 
 def _try_chrome_fallback(*, max_items: int) -> list[Job]:
@@ -222,6 +277,14 @@ def fetch(filters: dict) -> list[Job]:
         and (for API parity) the probe log.
     """
     cap = int(filters.get("max_per_source") or 12)
+
+    # Opt-in Apify recovery. With APIFY_TOKEN unset (default) this branch
+    # never runs, so behavior below is identical to the historic stub.
+    apify_token = os.environ.get("APIFY_TOKEN")
+    if apify_token:
+        apify_jobs = _try_apify(filters, cap=cap, token=apify_token)
+        if apify_jobs:
+            return apify_jobs
 
     # Opt-in agentic-Chrome recovery. With the flag OFF (default) this
     # returns [] WITHOUT spawning anything, so the behavior below is

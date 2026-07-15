@@ -10,6 +10,20 @@ with Applied / Skip / "Tailor my resume" buttons.
 **Try the live bot:** [@job_search_everyday_bot](https://t.me/job_search_everyday_bot) —
 send `/start` and upload your CV. No install needed.
 
+## Ways to use this
+
+| Path | You get | Cost |
+|------|---------|------|
+| **[Hosted bot](https://t.me/job_search_everyday_bot)** (recommended) | `/start` in Telegram, upload CV, done — zero setup, sources maintained for you | Free |
+| **[oinkjobsearch.com](https://oinkjobsearch.com)** | A managed private instance: uptime, upgrades, and support handled for you | Paid |
+| **[Apify actors](#apify-actors--the-scrapers-as-an-api)** | The scrapers behind this bot as clean JSON APIs for your own pipeline — proxies and anti-bot handled | Pay per result, from $0.90/1k |
+| **Self-host this repo** | Full control: your keys, your data, your prompts — see [Setup](#setup) | Free, your infra |
+
+Self-hosting is the developer path — expect Python, cron, and prompt
+tweaking. The `/setup` Claude Code skill walks you through install, `.env`,
+and scheduling end to end. If you just want job matches, use the hosted bot
+above and skip the rest of this README.
+
 ## Who this is for
 
 Job seekers who want matching roles pushed to Telegram instead of
@@ -28,10 +42,9 @@ doom-scrolling boards. The sources are strongest for:
 - **Remote-first job hunters in any of the above** — dedicated remote boards
   plus EU-wide vacancies via EURES.
 
-Use the live bot above and skip the rest of this README — or, if you're a
-**self-hoster / developer**, run your own instance (for yourself, friends, or
-a community), add sources, tweak the matching prompts: this README is your
-setup guide.
+If you're a **self-hoster / developer**: run your own instance (for
+yourself, friends, or a community), add sources, tweak the matching
+prompts — this README is your setup guide.
 
 **Not for**: recruiters sourcing candidates, bulk scraping, or hosting a
 public multi-tenant service — the scrapers are deliberately low-volume and
@@ -106,7 +119,8 @@ Per-user files:   state/users/<chat_id>/resume.pdf
 FindJobs/
 ├── README.md
 ├── requirements.txt
-├── .env                      ← TELEGRAM_BOT_TOKEN, OPERATOR_CONTACT (gitignored)
+├── .env                      ← TELEGRAM_BOT_TOKEN, OPERATOR_CONTACT,
+│                                APIFY_TOKEN (optional) (gitignored)
 ├── .env.example
 ├── deploy/                   ← systemd units, Caddy config, VPS bootstrap scripts
 ├── docs/
@@ -166,6 +180,9 @@ TELEGRAM_BOT_TOKEN=123456789:AAE-your-bot-token-here
 ```
 
 No `TELEGRAM_CHAT_ID` needed anymore — users register themselves via `/start`.
+
+Optional: set `APIFY_TOKEN` to unblock AcademicPositions via the Apify
+actors — see [Apify actors](#apify-actors--the-scrapers-as-an-api) below.
 
 ### 3. Start the bot (long-running process)
 
@@ -362,6 +379,45 @@ Deletion: to reset a user, `DELETE FROM users WHERE chat_id=?` and drop their
   callback dispatcher in `bot.py::handle_callback`.
 - **Upgrade resume tailoring to a real LLM rewrite**: replace
   `resume_tailor.py::build_tailor_note` with an API call (Claude, GPT, etc.).
+
+## Apify actors — the scrapers as an API
+
+Every scraper behind Hryu is also published as a standalone Apify actor —
+call any source as a clean JSON API from your own pipeline, no bot
+required. These are the same actors this bot runs on in production every
+day, and they handle the hard stuff for you: residential proxies,
+DataDome/Cloudflare bypass, pagination, dedupe, and delta mode so you pay
+only for postings you haven't seen. No subscription — pay per result.
+
+| Actor | What it does |
+|-------|--------------|
+| [linkedin-scraper](https://apify.com/nomad-agent/linkedin-scraper) | LinkedIn Jobs without login — delta mode for scheduled alerts, $0.90/1k results. |
+| [all-jobs-scraper](https://apify.com/nomad-agent/all-jobs-scraper) | 19 job boards behind one endpoint — the whole fleet in a single call, from $1.20/1k. |
+| [ai-job-search-agent](https://apify.com/nomad-agent/ai-job-search-agent) | Full AI job search as an API — describe the candidate, get scored matches. No API key needed; AI cost included. |
+| [company-careers-bundle](https://apify.com/nomad-agent/company-careers-bundle) | Turn a company list into live postings by probing Greenhouse, Lever, Ashby, Workable, SmartRecruiters and Workday. |
+| [europe-jobs-bundle](https://apify.com/nomad-agent/europe-jobs-bundle) | 14 Europe-focused sources (EURES, EURAXESS, WTTJ, JustJoin.it, NoFluffJobs, InfoJobs, Tecnoempleo, jobs.ac.uk and more) behind one endpoint. |
+| [researcher-bundle](https://apify.com/nomad-agent/researcher-bundle) | 12-source academic/research aggregator (EURAXESS, jobs.ac.uk, EURES, AcademicPositions, ReliefWeb, Impactpool, Devex, Ikerbasque, LinkedIn + 2 university boards). |
+| [remote-boards-scraper](https://apify.com/nomad-agent/remote-boards-scraper) | 4 remote-job boards in one run — RemoteOK, Remotive, WeWorkRemotely, Himalayas. |
+| [eures-scraper](https://apify.com/nomad-agent/eures-scraper) | EURES — 2M+ live EU vacancies across 31 countries, official EU job-mobility portal. |
+| [euraxess-scraper](https://apify.com/nomad-agent/euraxess-scraper) | EURAXESS — the EU's official researcher-mobility portal: PhD, postdoc, fellowship and faculty roles. |
+| [jobs-ac-uk-scraper](https://apify.com/nomad-agent/jobs-ac-uk-scraper) | jobs.ac.uk — UK academic, postdoc and research jobs (lectureships, fellowships, PhD studentships). |
+| [academicpositions-scraper](https://apify.com/nomad-agent/academicpositions-scraper) | Postdoc, PhD and faculty jobs from academicpositions.com across EU, UK and Switzerland. |
+| [impactpool-scraper](https://apify.com/nomad-agent/impactpool-scraper) | Impactpool.org — UN, NGO and international-development careers. |
+| [unjobs-scraper](https://apify.com/nomad-agent/unjobs-scraper) | unjobs.org — UN and NGO vacancies across 143 agencies (UNICEF, WFP, UNDP, UNHCR...). |
+| [ycombinator-was-scraper](https://apify.com/nomad-agent/ycombinator-was-scraper) | Y Combinator's Work at a Startup board — 1,000+ jobs with parsed salary, equity and visa policy. |
+
+For several of these sources (EURAXESS, EURES, Impactpool, unjobs.org,
+jobs.ac.uk, AcademicPositions) these are the only maintained scrapers on
+Apify. **Full catalog — 50+ actors** covering jobs, search, app
+intelligence and open data: [apify.com/nomad-agent](https://apify.com/nomad-agent).
+
+<!-- TODO: append Apify fair-share affiliate parameter (e.g. ?fpr=<code>) to the links above once assigned -->
+
+AcademicPositions is blocked in the self-hosted scraper (Cloudflare — see
+`skill/job-search/references/source_notes.md`); set `APIFY_TOKEN` in
+`.env` and it's pulled through the actor above instead. That's also the
+easiest way to support this project: source fetches through the actors
+are what fund its maintenance.
 
 ## Security notes
 
