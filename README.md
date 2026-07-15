@@ -31,7 +31,7 @@
 Every card looks like this:
 
 <div align="center">
-<img src="assets/screenshots/job_card.jpg" alt="Job card in Telegram" width="620">
+<img src="assets/screenshots/job_card.jpg" alt="Job card in Telegram" width="300">
 </div>
 
 ## Ways to use this
