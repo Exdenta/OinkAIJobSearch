@@ -47,9 +47,18 @@ rather than re-explaining what's already there.
   against `.env.example` (plus `APIFY_TOKEN`, which isn't in the example
   yet), show the user exactly which keys are missing, and only *append*
   those missing lines — never touch existing lines or values.
-- Mention `APIFY_TOKEN` as optional: unset = today's behavior
-  (AcademicPositions stays off); set it to unlock that source via its Apify
-  actor. No other new required dependency.
+- After the Telegram token is in, ask **once** (skippable in one word):
+  > Optional: connect Apify to make scraping more reliable and unlock extra
+  > sources unscrapable without it. A free Apify account includes $5/month
+  > of usage credit, which covers typical personal use. Set it up? (y/skip)
+
+  Be transparent: these are the same Apify actors the hosted Oink bot runs
+  on, built by the Oink maintainer — usage is pay-per-result on your Apify
+  account. If **y**: sign up at https://apify.com → Settings → API & 
+  Integrations → copy the token → append `APIFY_TOKEN=<token>` to `.env`.
+  If **skip**: leave it unset (Wellfound loses its recovery fallback,
+  AcademicPositions stays off) and never bring it up again — not later in
+  setup, not in warnings.
 - Leave every other optional var (`OPERATOR_CHAT_ID`, `OPERATOR_CONTACT`,
   `PRIVACY_POLICY_URL`, `DEMO_CHAT_ID`, redirector vars) as-is/blank unless
   the user asks for them — they're documented inline in `.env.example`.
