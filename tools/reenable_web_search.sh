@@ -15,9 +15,9 @@
 #   5. Append a one-line summary to tools/reenable_web_search.log.
 
 set -u
-cd /home/uby/Projects/OinkAutoJobSearch
+cd /home/uby/Projects/OinkAIJobSearch
 
-LOG=/home/uby/Projects/OinkAutoJobSearch/tools/reenable_web_search.log
+LOG=/home/uby/Projects/OinkAIJobSearch/tools/reenable_web_search.log
 SINCE="2026-05-23"
 TARGET_DATE="2026-05-30"
 
