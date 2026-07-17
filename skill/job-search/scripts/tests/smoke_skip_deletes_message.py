@@ -5,7 +5,11 @@ Verifies the four contract points:
   1. Default skip → tg.delete_message called, no edit_reply_markup, DB writes
      "skipped", toast says "✕ Removed".
   2. delete_message returns False (e.g. >48h) → falls back to
-     edit_reply_markup, DB still writes "skipped", toast falls back.
+     edit_reply_markup, DB still writes "skipped". The toast is acked UP
+     FRONT (before the delete attempt, so a 429-sleep can't expire the
+     callback query), so it reflects the INTENDED outcome "✕ Removed" even
+     on the rare strikethrough-fallback path — a negligible cosmetic
+     overstatement since the job is still removed from future digests.
   3. SKIP_DELETES_MESSAGE=0 → delete is NEVER attempted, edit-keyboard runs,
      preserves the original UX.
   4. Applied (kind="a") → unchanged; delete_message NOT attempted.
@@ -154,60 +158,85 @@ def setup() -> None:
     os.environ["STATE_DIR"] = td
     # Make sure FORENSIC_OFF isn't set so log_step paths are exercised.
     os.environ.pop("FORENSIC_OFF", None)
+    # SKIP_FEEDBACK_ENABLED is managed per-test (see each test_* function) —
+    # this file exercises the plain skip+delete path, which since the 👍/👎
+    # rollout is the explicit kill-switch (SKIP_FEEDBACK_ENABLED=0) behavior
+    # rather than the implicit default. Setting it here in setup() wouldn't
+    # be reliable under pytest, which never calls setup()/main() for this
+    # plain-script-style test file — only test_* functions run.
 
 
 def test_skip_deletes_default() -> None:
     section("1. skip on fresh message → delete_message called, no edit, toast '✕ Removed'")
     os.environ.pop("SKIP_DELETES_MESSAGE", None)  # default = on
-    bot = _import_bot_fresh()
-    _patch_error_capture(bot)
+    # SKIP_FEEDBACK_ENABLED now defaults to ON (👍/👎 rollout); this file
+    # tests the plain skip+delete path, which is now the explicit
+    # kill-switch behavior. Set per-test (not just at module import time) so
+    # this stays correct regardless of pytest's cross-file execution order —
+    # other test files' finally-blocks pop this var back to unset between
+    # tests, so a module-level-only assignment isn't reliable here.
+    os.environ["SKIP_FEEDBACK_ENABLED"] = "0"
+    try:
+        bot = _import_bot_fresh()
+        _patch_error_capture(bot)
 
-    tg = FakeTG(delete_returns=True)
-    db = FakeDB()
-    cb = _make_cb(chat_id=123, msg_id=456, kind="n", job_id="job-1")
+        tg = FakeTG(delete_returns=True)
+        db = FakeDB()
+        cb = _make_cb(chat_id=123, msg_id=456, kind="n", job_id="job-1")
 
-    bot.handle_callback(tg, db, cb)
+        bot.handle_callback(tg, db, cb)
 
-    _assert(len(db.status_writes) == 1, "DB write happened exactly once")
-    _assert(db.status_writes[0] == (123, "job-1", "skipped"),
-            f"DB wrote skipped status (got {db.status_writes[0]})")
-    _assert(tg.delete_calls == [(123, 456)],
-            f"delete_message called with (chat_id, msg_id) (got {tg.delete_calls})")
-    _assert(tg.edit_calls == [],
-            f"edit_reply_markup NOT called (got {tg.edit_calls})")
-    _assert(len(tg.callback_answers) == 1, "answer_callback called once")
-    _assert(tg.callback_answers[0][1] == "✕ Removed",
-            f"toast text (got {tg.callback_answers[0][1]!r})")
+        _assert(len(db.status_writes) == 1, "DB write happened exactly once")
+        _assert(db.status_writes[0] == (123, "job-1", "skipped"),
+                f"DB wrote skipped status (got {db.status_writes[0]})")
+        _assert(tg.delete_calls == [(123, 456)],
+                f"delete_message called with (chat_id, msg_id) (got {tg.delete_calls})")
+        _assert(tg.edit_calls == [],
+                f"edit_reply_markup NOT called (got {tg.edit_calls})")
+        _assert(len(tg.callback_answers) == 1, "answer_callback called once")
+        _assert(tg.callback_answers[0][1] == "✕ Removed",
+                f"toast text (got {tg.callback_answers[0][1]!r})")
+    finally:
+        os.environ.pop("SKIP_FEEDBACK_ENABLED", None)
 
 
 def test_skip_delete_fails_falls_back() -> None:
     section("2. delete_message returns False (>48h) → edit_reply_markup fallback, DB still writes")
     os.environ.pop("SKIP_DELETES_MESSAGE", None)
-    bot = _import_bot_fresh()
-    _patch_error_capture(bot)
+    os.environ["SKIP_FEEDBACK_ENABLED"] = "0"  # see note in test 1
+    try:
+        bot = _import_bot_fresh()
+        _patch_error_capture(bot)
 
-    tg = FakeTG(delete_returns=False)
-    db = FakeDB()
-    cb = _make_cb(chat_id=123, msg_id=456, kind="n", job_id="job-2")
+        tg = FakeTG(delete_returns=False)
+        db = FakeDB()
+        cb = _make_cb(chat_id=123, msg_id=456, kind="n", job_id="job-2")
 
-    bot.handle_callback(tg, db, cb)
+        bot.handle_callback(tg, db, cb)
 
-    _assert(db.status_writes == [(123, "job-2", "skipped")],
-            "DB still wrote skipped status despite delete failing")
-    _assert(tg.delete_calls == [(123, 456)],
-            "delete_message was attempted")
-    _assert(len(tg.edit_calls) == 1,
-            f"edit_reply_markup called as fallback (got {tg.edit_calls})")
-    _assert(tg.edit_calls[0][0] == 123 and tg.edit_calls[0][1] == 456,
-            "edit_reply_markup got correct chat/msg ids")
-    # On failure we keep the prior toast text — user gets a non-error message.
-    _assert(tg.callback_answers[0][1] != "✕ Removed",
-            f"toast falls back to non-removed text (got {tg.callback_answers[0][1]!r})")
+        _assert(db.status_writes == [(123, "job-2", "skipped")],
+                "DB still wrote skipped status despite delete failing")
+        _assert(tg.delete_calls == [(123, 456)],
+                "delete_message was attempted")
+        _assert(len(tg.edit_calls) == 1,
+                f"edit_reply_markup called as fallback (got {tg.edit_calls})")
+        _assert(tg.edit_calls[0][0] == 123 and tg.edit_calls[0][1] == 456,
+                "edit_reply_markup got correct chat/msg ids")
+        # Toast is acked up front from the INTENDED outcome (delete enabled), so
+        # it stays "✕ Removed" even though delete failed and we struck-through
+        # instead. The early ack is what keeps a 429-sleep from expiring the
+        # callback query; the cosmetic overstatement is acceptable (job is still
+        # removed from future digests).
+        _assert(tg.callback_answers[0][1] == "✕ Removed",
+                f"toast reflects intended outcome (got {tg.callback_answers[0][1]!r})")
+    finally:
+        os.environ.pop("SKIP_FEEDBACK_ENABLED", None)
 
 
 def test_skip_delete_disabled_via_env() -> None:
     section("3. SKIP_DELETES_MESSAGE=0 → delete NOT attempted, original edit-keyboard path")
     os.environ["SKIP_DELETES_MESSAGE"] = "0"
+    os.environ["SKIP_FEEDBACK_ENABLED"] = "0"  # see note in test 1
     try:
         bot = _import_bot_fresh()
         _patch_error_capture(bot)
@@ -226,6 +255,7 @@ def test_skip_delete_disabled_via_env() -> None:
                 f"edit_reply_markup called (preserves original UX) (got {tg.edit_calls})")
     finally:
         os.environ.pop("SKIP_DELETES_MESSAGE", None)
+        os.environ.pop("SKIP_FEEDBACK_ENABLED", None)
 
 
 def test_applied_branch_unchanged() -> None:

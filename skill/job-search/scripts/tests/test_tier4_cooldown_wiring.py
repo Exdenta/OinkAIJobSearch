@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Tier 4 — wire devex / curated sub-boards into the adaptive
+"""Tier 4 — wire devex / un_careers / curated sub-boards into the adaptive
 source-cooldown FSM.
 
-Before Tier 4, ``devex`` and the curated sub-boards
+Before Tier 4, ``devex``, ``un_careers`` and the curated sub-boards
 (``remocate`` / ``wantapply`` / ``remoterocketship``) never called
 ``db.record_fetch``. They emitted no novelty signal, so the FSM's
 ``source_novelty_ratio`` returned ``None`` (no-data channel) and they ran
@@ -47,10 +47,10 @@ import db as db_module  # noqa: E402
 import search_jobs  # noqa: E402
 
 
-# The source keys Tier 4 newly instruments (devex + the three curated
-# sub-boards). The curated MODULE key `curated_boards` is deliberately
-# absent — it cools down per sub-board.
-_NEW_KEYS = ["devex", "remocate", "wantapply", "remoterocketship"]
+# The four source keys Tier 4 newly instruments (devex + un_careers +
+# the three curated sub-boards). The curated MODULE key `curated_boards`
+# is deliberately absent — it cools down per sub-board.
+_NEW_KEYS = ["devex", "un_careers", "remocate", "wantapply", "remoterocketship"]
 
 
 @pytest.fixture
@@ -220,6 +220,35 @@ def test_devex_records_fetch_under_devex_key(tmp_db, monkeypatch):
     assert row["jobs_new"] == 2
     # Novelty ratio is now available for the FSM.
     assert tmp_db.source_novelty_ratio("devex", 86400) == 1.0
+
+
+def test_un_careers_records_fetch_under_un_careers_key(tmp_db, monkeypatch):
+    from sources import un_careers
+    # un_careers is now an API-first adapter: stub the public-API page fetch so
+    # the test is hermetic (no live careers.un.org call). Page 0 returns two
+    # openings, page 1 is empty → pagination stops. The chrome fallback stays
+    # OFF (default), so it never fires.
+    pages = {
+        0: [
+            {"jobId": "55501", "postingTitle": "Frontend Engineer",
+             "dept": "OICT", "startDate": "2026-06-01"},
+            {"jobId": "55502", "postingTitle": "Vue Developer",
+             "dept": "UNDP", "startDate": "2026-06-02"},
+        ],
+    }
+    monkeypatch.setattr(
+        un_careers, "_post_page",
+        lambda page, *, timeout_s: pages.get(page, []),
+        raising=True,
+    )
+
+    jobs = un_careers.fetch({"max_per_source": 5, "ai_scrape_timeout_s": 30}, db=tmp_db)
+    assert len(jobs) == 2
+
+    row = tmp_db.get_fetch("un_careers", "un_careers", 1, "")
+    assert row is not None, "un_careers must record a search_fetches row"
+    assert row["jobs_seen"] == 2
+    assert row["jobs_new"] == 2
 
 
 def test_curated_boards_records_per_subboard(tmp_db, monkeypatch):

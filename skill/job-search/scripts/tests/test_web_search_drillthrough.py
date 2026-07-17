@@ -115,6 +115,7 @@ def test_prompt_still_formats_with_required_keys():
         seniority="mid", min_salary="", language="en",
         max_age_hours=168, excluded_domains="linkedin.com",
         user_request_block="", profile_seeds_block="",
+        ideal_fit_block="",
     )
     rendered = PROMPT.format(**keys)
     assert "frontend" in rendered

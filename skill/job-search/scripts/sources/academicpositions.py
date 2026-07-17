@@ -95,9 +95,9 @@ from bs4 import BeautifulSoup
 from dedupe import Job
 from text_utils import clean_snippet, fix_mojibake
 
-log = logging.getLogger(__name__)
-
 _APIFY_ACTOR = "nomad-agent/academicpositions-scraper"
+
+log = logging.getLogger(__name__)
 
 # Best-effort forensic logger; module may not exist in every checkout.
 try:  # pragma: no cover - thin shim

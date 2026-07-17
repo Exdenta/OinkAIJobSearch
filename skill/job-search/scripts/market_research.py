@@ -55,14 +55,32 @@ from instrumentation.wrappers import wrapped_run_p_with_tools
 
 
 def _instrumented_run_p_with_tools(prompt, **kwargs):
-    """Default `_run_p_with_tools` for market_research worker + manager calls.
+    """Default `_run_p_with_tools` for market_research WORKER calls.
 
     Records every Claude CLI invocation to the `claude_calls` telemetry table
-    under caller='market_research'. Worker vs manager distinction is lost at
-    this granularity (both share one wrapper) — acceptable trade-off so the
-    existing test-injection seam (`_run_p_with_tools=` kwarg) keeps working.
+    under caller='market_research'. Workers are genuinely agentic (up to 10
+    WebSearch + 15 WebFetch calls each, deciding mid-run whether to keep
+    searching) — no non-agentic equivalent exists yet, so they stay on this
+    Claude-CLI-with-tools path.
     """
     return wrapped_run_p_with_tools(None, "market_research", prompt, **kwargs)
+
+
+def _instrumented_run_p(prompt, **kwargs):
+    """Default `_run_p_with_tools` for the MANAGER call only.
+
+    The manager already has ZERO tool grants (`_MANAGER_ALLOWED_TOOLS=""`)
+    — it's a pure single-shot prompt→JSON synthesis over the workers'
+    already-collected JSON, no agentic loop involved. Routes through
+    `wrapped_run_p` (via the
+    "market_research_manager" stage) instead of `wrapped_run_p_with_tools`.
+    `allowed_tools`/`disallowed_tools` are stripped — meaningless for a
+    no-tools single-shot call and not accepted by the single-shot transport.
+    """
+    from instrumentation.wrappers import wrapped_run_p
+    kwargs.pop("allowed_tools", None)
+    kwargs.pop("disallowed_tools", None)
+    return wrapped_run_p(None, "market_research_manager", prompt, **kwargs)
 
 
 log = logging.getLogger(__name__)
@@ -77,6 +95,8 @@ DEFAULT_CONCURRENCY     = int(os.environ.get("MARKET_RESEARCH_CONCURRENCY", "8")
 DEFAULT_WORKER_TIMEOUT  = int(os.environ.get("MARKET_RESEARCH_WORKER_TIMEOUT_S", "900"))
 DEFAULT_OVERALL_TIMEOUT = int(os.environ.get("MARKET_RESEARCH_OVERALL_TIMEOUT_S", "2100"))
 DEFAULT_MANAGER_TIMEOUT = int(os.environ.get("MARKET_RESEARCH_MANAGER_TIMEOUT_S", "1500"))
+
+
 
 _PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
@@ -1017,9 +1037,11 @@ def synthesize_with_manager(
     *,
     model: str = DEFAULT_MODEL,
     timeout_s: int = DEFAULT_MANAGER_TIMEOUT,
-    _run_p_with_tools: Callable = _instrumented_run_p_with_tools,
+    _run_p_with_tools: Callable = _instrumented_run_p,
 ) -> tuple[dict | None, str | None]:
-    """Run the manager/synthesizer Opus call. Returns (report, error)."""
+    """Run the manager/synthesizer call (Opus by default; Mistral-routable
+    via the "market_research_manager" stage). Returns
+    (report, error)."""
     tmpl = _read_prompt("market_research_manager.txt")
     if not tmpl:
         return None, "prompt_missing"
@@ -1085,8 +1107,20 @@ def market_research_sync(
     manager_timeout_s: int = DEFAULT_MANAGER_TIMEOUT,
     progress: Callable[[int, int], None] | None = None,
     _run_p_with_tools: Callable = _instrumented_run_p_with_tools,
+    _run_p_manager: Callable | None = None,
 ) -> ResearchRun:
-    """Full run: fan out to 10 workers, then synthesize. Never raises."""
+    """Full run: fan out to 10 workers, then synthesize. Never raises.
+
+    `_run_p_manager` (optional): manager transport, independent of
+    `_run_p_with_tools`. When left `None`: if the caller ALSO left
+    `_run_p_with_tools` at its default (real production call, no test
+    stub), the manager routes through `_instrumented_run_p` — the
+    Mistral-routable path (see market_research_manager conversion). If
+    the caller DID override `_run_p_with_tools` (e.g. a test stub that
+    inspects the prompt to detect worker-vs-manager), that SAME callable
+    is reused for the manager call too — preserves every existing test's
+    single-stub-handles-both pattern without needing them updated.
+    """
     today_iso = time.strftime("%Y-%m-%d", time.gmtime())
     started_at_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     ctx = _build_ctx(resume_text, profile or {}, location, today_iso)
@@ -1102,6 +1136,14 @@ def market_research_sync(
         ctx.get("location") or "?",
         concurrency,
     )
+
+    manager_run_p = _run_p_manager
+    if manager_run_p is None:
+        manager_run_p = (
+            _instrumented_run_p
+            if _run_p_with_tools is _instrumented_run_p_with_tools
+            else _run_p_with_tools
+        )
 
     # Inject per-run timeout + run_p_with_tools into the worker callable.
     _worker_bound = functools.partial(
@@ -1168,7 +1210,7 @@ def market_research_sync(
                 ctx,
                 model=model,
                 timeout_s=manager_timeout_s,
-                _run_p_with_tools=_run_p_with_tools,
+                _run_p_with_tools=manager_run_p,
             )
             if manager_report is None:
                 # Manager failure demotes OK → partial; partial stays partial.

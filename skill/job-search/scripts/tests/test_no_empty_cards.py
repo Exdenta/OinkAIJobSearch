@@ -31,6 +31,7 @@ import pytest
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
+os.environ["HIRING_CONTACT_OFF"] = "1"
 
 # Isolate from network probes / rate-limit sleeps for every test in this
 # module. Done BEFORE importing telegram_client so the module-level
@@ -38,7 +39,6 @@ sys.path.insert(0, str(HERE.parent))
 os.environ["URL_VALIDATION_OFF"] = "1"
 os.environ["TG_RATE_LIMIT_OFF"] = "1"
 os.environ["FORUM_FILTER_OFF"] = "1"
-os.environ["HIRING_CONTACT_OFF"] = "1"
 
 from dedupe import Job  # noqa: E402
 import db as db_module  # noqa: E402
@@ -125,11 +125,13 @@ def test_send_per_job_digest_returns_zero_on_empty_input():
     )
 
 
-def test_send_per_job_digest_force_empty_card_still_works():
-    """``force_empty_card=True`` restores the legacy empty-card path:
-    the NO_MATCHES pig fires AND the "0 jobs" header card ships. This
-    keeps the option available for daily-cron heartbeat flows that
-    actually want it."""
+def test_send_per_job_digest_force_empty_card_emits_nothing():
+    """``force_empty_card=True`` is a vestigial no-op since e67c9f9 removed
+    the header card + pig preamble ("per-job cards only" operator decision,
+    2026-05-25): the flag skips the early empty-input return, but there is
+    no empty-card left to emit, so the call still returns 0 with zero
+    Telegram traffic. No production caller passes the flag; this pins the
+    current contract so a future header revival is a conscious choice."""
     tg = _FakeTG()
     sent_callbacks: list[tuple[int, str]] = []
 
@@ -142,24 +144,15 @@ def test_send_per_job_digest_force_empty_card_still_works():
         force_empty_card=True,
     )
 
-    # Header counts as 1 send when skip_header=False (default).
-    assert n == 1, f"expected 1 (header only), got {n}"
-    assert len(tg.send_message_calls) == 1, (
-        f"header card must fire exactly once "
-        f"(got {len(tg.send_message_calls)} send_message calls)"
+    assert n == 0, f"expected 0 sends (no empty card exists anymore), got {n}"
+    assert tg.send_message_calls == [], (
+        f"no header card must fire (got {tg.send_message_calls!r})"
     )
-    # Pig sticker is best-effort (rate-limit / no-file-id swallow silently),
-    # but on a clean env it should fire with NO_MATCHES.
-    sticker_calls = [
-        m for m, _ in tg.call_invocations if m == "sendSticker"
-    ]
-    assert len(sticker_calls) == 1, (
-        f"NO_MATCHES sticker must fire once on force_empty_card=True "
-        f"(got {len(sticker_calls)} sendSticker calls)"
+    assert tg.call_invocations == [], (
+        f"no sticker must fire (got {tg.call_invocations!r})"
     )
     assert sent_callbacks == [], (
-        "on_sent must not fire when there are no per-job cards "
-        f"(got {sent_callbacks!r})"
+        f"on_sent must not fire (got {sent_callbacks!r})"
     )
 
 

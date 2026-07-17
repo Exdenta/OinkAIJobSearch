@@ -33,7 +33,11 @@ def profile_hash(resume_text: str, prefs_text: str) -> str:
     """
     resume = (resume_text or "").strip()
     prefs = (prefs_text or "").strip()
-    blob = f"{resume}\n----\n{prefs}".encode("utf-8")
+    # Scorer-prompt generation salt: bump when the scoring prompt changes
+    # materially so cached verdicts from the old rubric stop matching.
+    # (2026-07-17: "np3" = neutralplus-v3 replaced the doctrine prompt;
+    #  "np4" = +R7 seniority-bar cap, +R8 thin-content cap.)
+    blob = f"{resume}\n----\n{prefs}\n----\nscorer:np4".encode("utf-8")
     return hashlib.sha1(blob).hexdigest()[:16]
 
 
@@ -91,6 +95,26 @@ CREATE TABLE IF NOT EXISTS applications (
     updated_at REAL    NOT NULL,
     PRIMARY KEY (chat_id, job_id)
 );
+
+-- Explicit per-job user feedback from the 👍/👎 buttons on job cards.
+-- One row per (user, job) — a re-tap flips the verdict in place rather
+-- than logging a history (the latest opinion is the only one scoring
+-- cares about). `reason` is either a structured code from the 👎
+-- follow-up keyboard (location | seniority | domain | salary |
+-- dead_link | seen) or the user's free-text reply from the "Other…"
+-- path, stored verbatim. NULL while the follow-up is unanswered.
+-- Consumed by feedback_digest.py, which summarizes rows into
+-- users.feedback_notes_text for the scoring prompt.
+CREATE TABLE IF NOT EXISTS job_feedback (
+    chat_id    INTEGER NOT NULL,
+    job_id     TEXT    NOT NULL,
+    verdict    TEXT    NOT NULL,    -- up | down
+    reason     TEXT,                -- structured code or free text
+    created_at REAL    NOT NULL,
+    PRIMARY KEY (chat_id, job_id)
+);
+CREATE INDEX IF NOT EXISTS idx_job_feedback_chat_age
+    ON job_feedback(chat_id, created_at);
 
 CREATE TABLE IF NOT EXISTS sent_messages (
     chat_id    INTEGER NOT NULL,
@@ -273,6 +297,7 @@ CREATE TABLE IF NOT EXISTS search_fetches (
     fetched_at    REAL    NOT NULL,
     jobs_seen     INTEGER NOT NULL DEFAULT 0,
     jobs_new      INTEGER NOT NULL DEFAULT 0,
+    jobs_json     TEXT,
     PRIMARY KEY (source, query, page, location)
 );
 CREATE INDEX IF NOT EXISTS idx_search_fetches_last_seen
@@ -307,9 +332,24 @@ CREATE TABLE IF NOT EXISTS magic_tokens (
     token_hash  TEXT PRIMARY KEY,           -- sha256(token), hex
     email       TEXT NOT NULL,              -- lowercased
     expires_at  INTEGER NOT NULL,           -- unix seconds
-    used_at     INTEGER                     -- unix seconds, NULL while unused
+    used_at     INTEGER,                    -- unix seconds, NULL while unused
+    code_hash   TEXT,                       -- sha256(6-digit OTP), hex; NULL on legacy rows
+    attempts    INTEGER NOT NULL DEFAULT 0  -- failed OTP entries against this row
 );
 CREATE INDEX IF NOT EXISTS idx_magic_tokens_email ON magic_tokens(email);
+
+-- Durable cache of onboarding-copy translations. One row per
+-- (target lang, sha1 of the RAW English string); `translated` is the
+-- Mistral output. Keyed so each English string translates at most once
+-- per language. Onboarding-only (onboarding.translate); English never
+-- writes here (it's the identity path). See onboarding.py.
+CREATE TABLE IF NOT EXISTS ui_translations (
+    lang        TEXT NOT NULL,
+    text_sha1   TEXT NOT NULL,     -- sha1(raw English), hex
+    translated  TEXT NOT NULL,
+    created_at  REAL NOT NULL,
+    PRIMARY KEY (lang, text_sha1)
+);
 
 CREATE INDEX IF NOT EXISTS idx_app_status ON applications(chat_id, status);
 CREATE INDEX IF NOT EXISTS idx_sent_job ON sent_messages(chat_id, job_id);
@@ -412,6 +452,12 @@ class DB:
             c.execute("ALTER TABLE users ADD COLUMN onboarding_state TEXT")
         if "onboarding_completed_at" not in have_cols:
             c.execute("ALTER TABLE users ADD COLUMN onboarding_completed_at REAL")
+        # Telegram UI language (BCP-47-ish code, e.g. 'es', 'ru', 'en-GB').
+        # Captured from the Telegram user object on /start + message upserts;
+        # NULL for pre-existing users / web accounts. Only the onboarding
+        # wizard reads it (to localize its copy); everything else is English.
+        if "language_code" not in have_cols:
+            c.execute("ALTER TABLE users ADD COLUMN language_code TEXT")
 
         # Web-app login columns. Optional — Telegram-onboarded users may
         # never set an email; web users always do. The unique index in
@@ -433,6 +479,23 @@ class DB:
             )
         if "last_email_notified_at" not in have_cols:
             c.execute("ALTER TABLE users ADD COLUMN last_email_notified_at REAL")
+        # Delivery-channel choice: 'email' | 'telegram' | 'both'. NULL means
+        # "never chose" and falls back to the account's natural channel
+        # (telegram for positive chat_ids, email for web-only negative ones)
+        # — see get_notify_channel. Writes keep the legacy `notify_email`
+        # flag in sync so emailer.maybe_send_web_digest_email needs no change.
+        if "notify_channel" not in have_cols:
+            c.execute("ALTER TABLE users ADD COLUMN notify_channel TEXT")
+
+        # Per-user auto-search opt-out (bottom-bar toggle). When 0 the
+        # continuous searcher skips this user's scheduled runs; the
+        # scheduler also stops enrolling them. Default 1 (on) so every
+        # onboarded non-operator user is auto-enrolled unless they opt out.
+        if "auto_search_enabled" not in have_cols:
+            c.execute(
+                "ALTER TABLE users ADD COLUMN "
+                "auto_search_enabled INTEGER NOT NULL DEFAULT 1"
+            )
 
         # Auto-rebuild counter (algorithm v2.8, P4 pipeline overhaul).
         # Bumped on every `append_skip_note` call; the searcher checks
@@ -445,6 +508,47 @@ class DB:
                 "ALTER TABLE users ADD COLUMN "
                 "skip_events_since_rebuild INTEGER NOT NULL DEFAULT 0"
             )
+
+        # Feedback digest (👍/👎 loop). `feedback_notes_text` holds the
+        # LLM-summarized preference/veto notes distilled from job_feedback
+        # + implicit signals; it is appended to prefs_text when scoring.
+        # `feedback_notes_updated_at` lets the digest trigger count only
+        # feedback rows newer than the last summarization pass.
+        if "feedback_notes_text" not in have_cols:
+            c.execute("ALTER TABLE users ADD COLUMN feedback_notes_text TEXT")
+        if "feedback_notes_updated_at" not in have_cols:
+            c.execute("ALTER TABLE users ADD COLUMN feedback_notes_updated_at REAL")
+
+        # Bot-blocked tombstone. Set to a unix timestamp when Telegram reports
+        # the user as unreachable (403 "bot was blocked" / "user is
+        # deactivated", or 400 "chat not found") on a send. The continuous
+        # searcher skips these users so we stop all fetch/LLM spend for
+        # someone who can't receive messages — WITHOUT deleting any of their
+        # data. Cleared back to NULL the moment they message the bot again
+        # (only possible after they unblock), which auto-resumes searches.
+        if "blocked_at" not in have_cols:
+            c.execute("ALTER TABLE users ADD COLUMN blocked_at REAL")
+
+
+        # Activity clock. `last_active_at` is stamped by bot._dispatch on
+        # every inbound update (message, edit, button tap) and by
+        # record_posting_click on every proxied link click.
+        if "last_active_at" not in have_cols:
+            c.execute("ALTER TABLE users ADD COLUMN last_active_at REAL")
+            # Start every existing user's activity clock at migration
+            # time: clicks were never tracked before this column existed,
+            # so prior silence is not evidence of inactivity.
+            c.execute("UPDATE users SET last_active_at = ?", (time.time(),))
+
+        # One-time feedback ask ("what would make matches better?"), sent
+        # after ≥3 days of tenure AND ≥3 proxied link clicks (a value
+        # signal, not a clock — see claude-docs/wiki/feedback-ask-research.md).
+        # `feedback_ask_sent_at` doubles as the never-re-ask flag;
+        # `feedback_ask_reply` holds the user's single free-text answer.
+        if "feedback_ask_sent_at" not in have_cols:
+            c.execute("ALTER TABLE users ADD COLUMN feedback_ask_sent_at REAL")
+        if "feedback_ask_reply" not in have_cols:
+            c.execute("ALTER TABLE users ADD COLUMN feedback_ask_reply TEXT")
 
         # Refresh; the ADD COLUMN statements above may have changed things.
         have_cols = {r["name"] for r in c.execute("PRAGMA table_info(users)")}
@@ -483,10 +587,32 @@ class DB:
             if legacy in have_cols:
                 c.execute(f"ALTER TABLE users DROP COLUMN {legacy}")
 
+        # OTP-code columns on magic_tokens. Pre-existing DBs created the
+        # table without them; `CREATE TABLE IF NOT EXISTS` won't add columns.
+        magic_cols = {r["name"] for r in c.execute("PRAGMA table_info(magic_tokens)")}
+        if magic_cols:
+            if "code_hash" not in magic_cols:
+                c.execute("ALTER TABLE magic_tokens ADD COLUMN code_hash TEXT")
+            if "attempts" not in magic_cols:
+                c.execute(
+                    "ALTER TABLE magic_tokens ADD COLUMN "
+                    "attempts INTEGER NOT NULL DEFAULT 0"
+                )
+
         # Indexes that reference columns ADD-ed above. Must come after the
         # ALTER TABLE, otherwise SQLite raises `no such column: email` when
         # called against a DB that pre-dates this migration.
         c.executescript(POST_MIGRATE_INDEXES)
+
+        # search_fetches: optional result payload so a fresh-enough row can
+        # satisfy a repeat fetch without hitting the actor/site again (rate
+        # limit relief for the ~16 apify sources that skip live requests
+        # entirely on a cache hit — see apify_fetch.fetch_all_apify).
+        have_fetch_cols = {
+            r["name"] for r in c.execute("PRAGMA table_info(search_fetches)")
+        }
+        if "jobs_json" not in have_fetch_cols:
+            c.execute("ALTER TABLE search_fetches ADD COLUMN jobs_json TEXT")
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
@@ -520,18 +646,22 @@ class DB:
         username: str | None = None,
         first_name: str | None = None,
         last_name: str | None = None,
+        language_code: str | None = None,
     ) -> None:
         with self._conn() as c:
             c.execute(
                 """
-                INSERT INTO users (chat_id, username, first_name, last_name, registered_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO users (chat_id, username, first_name, last_name, language_code, registered_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(chat_id) DO UPDATE SET
                     username = excluded.username,
                     first_name = excluded.first_name,
-                    last_name = excluded.last_name
+                    last_name = excluded.last_name,
+                    -- Preserve a known lang when a bare upsert_user(chat_id)
+                    -- (no user dict) passes NULL — only overwrite with a real code.
+                    language_code = COALESCE(excluded.language_code, users.language_code)
                 """,
-                (chat_id, username, first_name, last_name, time.time()),
+                (chat_id, username, first_name, last_name, language_code, time.time()),
             )
 
     def set_resume(self, chat_id: int, resume_path: str, resume_text: str) -> None:
@@ -549,10 +679,30 @@ class DB:
         with self._conn() as c:
             return list(c.execute("SELECT * FROM users"))
 
-    def users_with_resume(self) -> list[sqlite3.Row]:
+    def users_for_search(self) -> list[sqlite3.Row]:
+        """Users the digest run can meaningfully search for.
+
+        A CV is NOT required: the onboarding wizard lets people finish without
+        one ("Skip for now"), and the builder still produces a full profile
+        from their answers, which stands in for the resume at scoring time
+        (see `user_profile.profile_as_resume`). Gating this on `resume_path`
+        silently excluded those users from every fleet run while the
+        continuous searcher — which keys off `onboarded_chat_ids` — still ran
+        them, so they burned fetch quota and got nothing.
+
+        Either input is enough: a resume on file, or a built profile.
+        """
         with self._conn() as c:
             return list(c.execute(
-                "SELECT * FROM users WHERE resume_path IS NOT NULL AND resume_path <> ''"
+                """
+                SELECT * FROM users
+                WHERE (
+                        (resume_path IS NOT NULL AND resume_path <> '')
+                     OR (user_profile IS NOT NULL AND user_profile <> '')
+                      )
+                  AND COALESCE(auto_search_enabled, 1) = 1
+                  AND blocked_at IS NULL
+                """
             ))
 
     def onboarded_chat_ids(self) -> list[int]:
@@ -572,10 +722,37 @@ class DB:
                 WHERE onboarding_completed_at IS NOT NULL
                   AND user_profile IS NOT NULL
                   AND user_profile <> ''
+                  AND COALESCE(auto_search_enabled, 1) = 1
+                  AND blocked_at IS NULL
                 ORDER BY chat_id ASC
                 """,
             ).fetchall()
         return [int(r["chat_id"]) for r in rows]
+
+    def last_search_started_at(self, chat_id: int) -> float | None:
+        """Unix ts of this user's most recent search, or None if never searched.
+
+        Read by bot.py to survive the continuous-searcher's cycle across a
+        process restart: without it, restarts reset every searcher's clock,
+        which hands the head of the stagger list a free full search on every
+        deploy and starves the tail (which never outlives its stagger sleep).
+
+        Sourced from `source_runs` — a telemetry table (telemetry/schema.py)
+        that lives in this DB file but may be absent on a fresh install, hence
+        the guard. A manual /search counts too: the user just got a search, so
+        postponing their scheduled one is correct.
+        """
+        with self._conn() as c:
+            have = c.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'source_runs'"
+            ).fetchone()
+            if not have:
+                return None
+            r = c.execute(
+                "SELECT MAX(started_at) FROM source_runs WHERE user_chat_id = ?",
+                (int(chat_id),),
+            ).fetchone()
+        return float(r[0]) if r and r[0] is not None else None
 
     # ---------- web login: email lookup / allocation ----------
 
@@ -633,6 +810,158 @@ class DB:
             return False
         return bool(row["notify_email"])
 
+    # ---------- delivery channel (email / telegram / both) ----------
+
+    VALID_NOTIFY_CHANNELS = ("email", "telegram", "both")
+
+    def set_notify_channel(self, chat_id: int, channel: str) -> None:
+        """Persist the user's delivery-channel choice and keep the legacy
+        `notify_email` flag in sync (emailer gates on it): email/both → 1,
+        telegram → 0. Raises ValueError on an unknown channel so a typo'd
+        API value can't silently disable delivery."""
+        ch = (channel or "").strip().lower()
+        if ch not in self.VALID_NOTIFY_CHANNELS:
+            raise ValueError(f"invalid notify channel: {channel!r}")
+        with self._conn() as c:
+            c.execute(
+                "UPDATE users SET notify_channel = ?, notify_email = ? "
+                "WHERE chat_id = ?",
+                (ch, 1 if ch in ("email", "both") else 0, chat_id),
+            )
+
+    def get_notify_channel(self, chat_id: int) -> str:
+        """Return 'email' | 'telegram' | 'both'. A NULL column (user never
+        chose) falls back to the account's natural channel: telegram for
+        positive chat_ids, email for web-only negative ones."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT notify_channel FROM users WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchone()
+        raw = (row["notify_channel"] if row is not None else None) or ""
+        if raw in self.VALID_NOTIFY_CHANNELS:
+            return raw
+        return "telegram" if int(chat_id) > 0 else "email"
+
+    def set_auto_search_enabled(self, chat_id: int, enabled: bool) -> None:
+        """Persist the per-user auto-search opt-out (bottom-bar toggle)."""
+        with self._conn() as c:
+            c.execute(
+                "UPDATE users SET auto_search_enabled = ? WHERE chat_id = ?",
+                (1 if enabled else 0, chat_id),
+            )
+
+    def get_auto_search_enabled(self, chat_id: int) -> bool:
+        """Return whether scheduled auto-search is on for this user.
+
+        Defaults to True (on) for unknown users or a NULL column — so a
+        freshly-onboarded user is enrolled until they explicitly opt out.
+        """
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT auto_search_enabled FROM users WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchone()
+        if row is None or row["auto_search_enabled"] is None:
+            return True
+        return bool(row["auto_search_enabled"])
+
+    def mark_blocked(self, chat_id: int, when: float | None = None) -> None:
+        """Tombstone a user as unreachable (blocked bot / deleted account).
+
+        Idempotent — re-marking just refreshes the timestamp. Does NOT delete
+        any of the user's data; it only pauses their continuous searcher (see
+        `onboarded_chat_ids` + the searcher's per-iteration block gate).
+        Cleared by `clear_blocked` when they return.
+        """
+        ts = time.time() if when is None else float(when)
+        with self._conn() as c:
+            c.execute(
+                "UPDATE users SET blocked_at = ? WHERE chat_id = ?",
+                (ts, chat_id),
+            )
+
+    def clear_blocked(self, chat_id: int) -> bool:
+        """Un-tombstone a user who has returned. Returns True only when a
+        block was actually cleared (row existed and was flagged) — the caller
+        uses this to respawn the searcher / log a resume on a real recovery
+        rather than on every message from an already-active user.
+        """
+        with self._conn() as c:
+            cur = c.execute(
+                "UPDATE users SET blocked_at = NULL "
+                "WHERE chat_id = ? AND blocked_at IS NOT NULL",
+                (chat_id,),
+            )
+            return cur.rowcount > 0
+
+    def is_blocked(self, chat_id: int) -> bool:
+        """True when the user is currently tombstoned as unreachable."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT blocked_at FROM users WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchone()
+        return bool(row is not None and row["blocked_at"] is not None)
+
+    # ---------- stale-user check ----------
+
+    def touch_last_active(self, chat_id: int, when: float | None = None) -> None:
+        """Stamp the user's last inbound interaction (any update shape)."""
+        ts = time.time() if when is None else float(when)
+        with self._conn() as c:
+            c.execute(
+                "UPDATE users SET last_active_at = ? WHERE chat_id = ?",
+                (ts, chat_id),
+            )
+
+    def set_feedback_ask_sent_at(self, chat_id: int, when: float) -> None:
+        with self._conn() as c:
+            c.execute(
+                "UPDATE users SET feedback_ask_sent_at = ? WHERE chat_id = ?",
+                (float(when), chat_id),
+            )
+
+    def set_feedback_ask_reply(self, chat_id: int, text: str) -> None:
+        with self._conn() as c:
+            c.execute(
+                "UPDATE users SET feedback_ask_reply = ? WHERE chat_id = ?",
+                (text, chat_id),
+            )
+
+    def feedback_ask_users_to_ask(
+        self, registered_before: float, min_clicks: int,
+        chat_id: int | None = None,
+    ) -> list[int]:
+        """chat_ids due the one-time feedback ask: reachable Telegram users
+        with a built profile (same eligibility as the searcher / stale
+        check), registered longer ago than `registered_before`, with at
+        least `min_clicks` proxied link clicks (the value-moment trigger),
+        and never asked before. `feedback_ask_sent_at` is the once-ever
+        flag — there is deliberately no re-ask path. Pass `chat_id` to
+        check a single user (the click-time trigger path)."""
+        with self._conn() as c:
+            rows = c.execute(
+                """
+                SELECT u.chat_id FROM users u
+                WHERE u.chat_id > 0
+                  AND (? IS NULL OR u.chat_id = ?)
+                  AND u.user_profile IS NOT NULL
+                  AND u.user_profile <> ''
+                  AND u.blocked_at IS NULL
+                  AND u.feedback_ask_sent_at IS NULL
+                  AND u.registered_at < ?
+                  AND (SELECT COUNT(*) FROM posting_clicks pc
+                        WHERE pc.chat_id = u.chat_id) >= ?
+                ORDER BY u.chat_id ASC
+                """,
+                (chat_id, chat_id,
+                 float(registered_before), int(min_clicks)),
+            ).fetchall()
+        return [int(r["chat_id"]) for r in rows]
+
+    # ---------- payment / entitlement state ----------
+
     def set_last_email_notified_at(self, chat_id: int, ts: float) -> None:
         with self._conn() as c:
             c.execute(
@@ -654,15 +983,15 @@ class DB:
         """Reserve a negative chat_id for a web-only user (never seen on
         Telegram). Web users register without a chat_id; we mint negative
         integers so they can't collide with the positive ints Telegram
-        hands out. The next id is `-1 - <count of existing negative rows>`,
-        which is deterministic and monotonic for the lifetime of the DB.
+        hands out. The next id is one below the most-negative existing
+        web id, so deleting an older web row cannot cause id reuse.
         """
         with self._conn() as c:
             row = c.execute(
-                "SELECT COUNT(*) AS n FROM users WHERE chat_id < 0"
+                "SELECT MIN(chat_id) AS min_id FROM users WHERE chat_id < 0"
             ).fetchone()
-            n = int(row["n"] or 0) if row else 0
-            return -1 - n
+            min_id = row["min_id"] if row else None
+            return int(min_id) - 1 if min_id is not None else -1
 
     # ---------- web login: magic-link tokens ----------
     #
@@ -677,19 +1006,38 @@ class DB:
         token_hash: str,
         email: str,
         expires_at: int,
+        code_hash: str | None = None,
     ) -> None:
         """Persist one magic-link token. `token_hash` must already be the
         sha256 hex of the plaintext token — the plaintext is never accepted
         here. `email` is lowercased by the caller; we store verbatim.
+
+        `code_hash` is the sha256 hex of the 6-digit OTP mailed alongside
+        the link; either credential redeems the row (see
+        `consume_magic_code`). NULL keeps legacy link-only behavior.
         """
         with self._conn() as c:
             c.execute(
                 """
-                INSERT INTO magic_tokens (token_hash, email, expires_at, used_at)
-                VALUES (?, ?, ?, NULL)
+                INSERT INTO magic_tokens
+                    (token_hash, email, expires_at, used_at, code_hash, attempts)
+                VALUES (?, ?, ?, NULL, ?, 0)
                 """,
-                (str(token_hash), str(email), int(expires_at)),
+                (str(token_hash), str(email), int(expires_at), code_hash),
             )
+
+    def peek_magic_token(self, token_hash: str, now: int) -> str | None:
+        """Non-consuming lookup: the email bound to a live (unused,
+        unexpired) token, or None. Backs the GET interstitial page — mail
+        scanners that prefetch the link URL must not burn the token; only
+        the human's POST (consume_magic_token) does."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT email FROM magic_tokens "
+                "WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?",
+                (str(token_hash), int(now)),
+            ).fetchone()
+            return row["email"] if row is not None else None
 
     def consume_magic_token(self, token_hash: str, now: int) -> str | None:
         """Atomically redeem a token. Returns the bound email on success;
@@ -718,6 +1066,48 @@ class DB:
                 return None
             return row["email"]
 
+    # Failed-entry ceiling for the 6-digit OTP. 10^6 codes / 5 tries makes
+    # online guessing pointless within the 15-minute TTL.
+    MAX_CODE_ATTEMPTS = 5
+
+    def consume_magic_code(self, email: str, code_hash: str, now: int) -> str | None:
+        """Atomically redeem the newest live magic row for `email` by OTP
+        code. Returns the email on success; None when there is no live row,
+        the code mismatches, or the row burned its attempt budget.
+
+        Every mismatch increments `attempts` on the candidate row, so a
+        brute-forcer gets MAX_CODE_ATTEMPTS guesses per mailed code, not
+        unlimited. The UPDATE `WHERE used_at IS NULL` is the same atomic
+        single-use gate as consume_magic_token.
+        """
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT token_hash, code_hash, attempts FROM magic_tokens "
+                "WHERE email = ? AND used_at IS NULL AND expires_at > ? "
+                "AND code_hash IS NOT NULL "
+                "ORDER BY expires_at DESC LIMIT 1",
+                (str(email), int(now)),
+            ).fetchone()
+            if row is None:
+                return None
+            if int(row["attempts"] or 0) >= self.MAX_CODE_ATTEMPTS:
+                return None
+            if row["code_hash"] != str(code_hash):
+                c.execute(
+                    "UPDATE magic_tokens SET attempts = attempts + 1 "
+                    "WHERE token_hash = ?",
+                    (row["token_hash"],),
+                )
+                return None
+            cur = c.execute(
+                "UPDATE magic_tokens SET used_at = ? "
+                "WHERE token_hash = ? AND used_at IS NULL",
+                (int(now), row["token_hash"]),
+            )
+            if (cur.rowcount or 0) == 0:
+                return None
+            return str(email)
+
     def delete_expired_magic_tokens(self, now: int) -> int:
         """Garbage-collect tokens whose expiry passed >= 7 days ago AND
         already-consumed rows in the same window. Returns rows deleted.
@@ -734,6 +1124,79 @@ class DB:
                 (cutoff, cutoff),
             )
             return int(cur.rowcount or 0)
+
+    # ---------- telegram account-link tokens (web → bot) ----------
+    #
+    # Mirrors the magic-token hygiene: sha256(token) only, single-use,
+    # time-boxed, opportunistic GC on insert.
+
+    # ---------- telegram sign-in tokens (web ← bot) ----------
+    #
+    # Reverse handshake: the anonymous BROWSER mints a token, the BOT
+    # claims it (stamping the Telegram chat_id), and the browser's poll
+    # loop consumes the claimed token to receive its session. Split into
+    # claim + consume so the session lands on the device that started the
+    # sign-in, not inside Telegram's webview.
+
+    def migrate_chat_id(self, old_chat_id: int, new_chat_id: int) -> None:
+        """Re-key a whole account from `old_chat_id` to `new_chat_id` — the
+        web→Telegram link flow moving a negative web account onto the real
+        Telegram chat_id. One transaction: every per-user table plus the
+        telemetry tables (which live in the same sqlite file, but are
+        guarded per-table because a test DB may not have run the telemetry
+        migration).
+
+        Refuses (ValueError) when `new_chat_id` already has a users row —
+        the caller must resolve that conflict first (delete the placeholder
+        row, or refuse the link for an already-onboarded Telegram account).
+
+        NOTE: file paths stored in the users row (resume_path) are updated
+        by string replacement of the `/users/<old>/` path segment; the
+        caller owns actually moving the directory on disk.
+        """
+        old, new = int(old_chat_id), int(new_chat_id)
+        if old == new:
+            return
+        with self._conn() as c:
+            if c.execute(
+                "SELECT 1 FROM users WHERE chat_id = ?", (new,)
+            ).fetchone() is not None:
+                raise ValueError(f"chat_id {new} already has a users row")
+            # hiring_contacts is keyed by job_id only — global, not per-user.
+            per_user_tables = [
+                "users", "applications", "job_feedback", "sent_messages",
+                "resume_suggestions", "fit_analyses", "profile_builds",
+                "research_runs", "digest_run_jobs", "job_scores",
+                "posting_clicks", "queued_matches",
+            ]
+            have = {
+                r["name"] for r in c.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            for t in per_user_tables:
+                if t not in have:
+                    continue
+                c.execute(
+                    f"UPDATE {t} SET chat_id = ? WHERE chat_id = ?", (new, old)
+                )
+            # Telemetry tables (same DB file; see telemetry/schema.py).
+            for t, col in (
+                ("query_runs", "chat_id"),
+                ("claude_calls", "chat_id"),
+                ("error_events", "chat_id"),
+                ("source_runs", "user_chat_id"),
+            ):
+                if t in have:
+                    c.execute(
+                        f"UPDATE {t} SET {col} = ? WHERE {col} = ?", (new, old)
+                    )
+            # Path columns that embed the chat_id directory segment.
+            c.execute(
+                "UPDATE users SET resume_path = REPLACE(resume_path, ?, ?) "
+                "WHERE chat_id = ? AND resume_path IS NOT NULL",
+                (f"/users/{old}/", f"/users/{new}/", new),
+            )
 
     # ---------- prefs free-text (raw input for the profile builder) ----------
 
@@ -1346,6 +1809,26 @@ class DB:
                 (completed_at, chat_id),
             )
 
+    # ---------- onboarding UI translation cache ----------
+
+    def get_ui_translation(self, lang: str, text_sha1: str) -> str | None:
+        """Cached translation for (lang, sha1(raw English)), or None on miss."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT translated FROM ui_translations WHERE lang = ? AND text_sha1 = ?",
+                (lang, text_sha1),
+            ).fetchone()
+        return row["translated"] if row is not None else None
+
+    def set_ui_translation(self, lang: str, text_sha1: str, translated: str) -> None:
+        """Persist one translation. INSERT OR REPLACE — idempotent per key."""
+        with self._conn() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO ui_translations "
+                "(lang, text_sha1, translated, created_at) VALUES (?, ?, ?, ?)",
+                (lang, text_sha1, translated, time.time()),
+            )
+
     def get_onboarding_completed_at(self, chat_id: int) -> float | None:
         with self._conn() as c:
             row = c.execute(
@@ -1355,6 +1838,20 @@ class DB:
                 return None
             val = row["onboarding_completed_at"]
             return float(val) if val is not None else None
+
+    def get_stalled_onboarding(self) -> list[tuple[int, str]]:
+        """(chat_id, onboarding_state JSON) for every user mid-wizard —
+        state present, completion never stamped. Consumed by the proactive
+        nudge loop (onboarding.nudge_stalled)."""
+        with self._conn() as c:
+            rows = c.execute(
+                """
+                SELECT chat_id, onboarding_state FROM users
+                WHERE onboarding_state IS NOT NULL
+                  AND onboarding_completed_at IS NULL
+                """
+            ).fetchall()
+            return [(row["chat_id"], row["onboarding_state"]) for row in rows]
 
     # ---------- awaiting-state (bot conversational state) ----------
     #
@@ -1459,6 +1956,16 @@ class DB:
         with self._conn() as c:
             return c.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
 
+    def recent_jobs(self, limit: int = 25) -> list[sqlite3.Row]:
+        """Most-recently-seen postings, newest first. Used by the onboarding
+        nudge to pick a teaser job. Small `limit` — this feeds an LLM prompt."""
+        with self._conn() as c:
+            return c.execute(
+                "SELECT job_id, title, company, location, url FROM jobs "
+                "ORDER BY first_seen_at DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+
     def get_jobs_by_ids(self, job_ids: Iterable[str]) -> dict[str, sqlite3.Row]:
         """Bulk-fetch `jobs` rows for the given job_ids. Returns ``{job_id: row}``.
 
@@ -1528,6 +2035,112 @@ class DB:
                     "SELECT job_id FROM applications WHERE chat_id = ?", (chat_id,)
                 )
             }
+
+    # ---------- job feedback (👍/👎 buttons) ----------
+
+    def record_job_feedback(
+        self, chat_id: int, job_id: str, verdict: str,
+        reason: str | None = None,
+    ) -> None:
+        """Upsert the user's 👍/👎 verdict for a job.
+
+        A verdict flip (👍 → 👎 or back) resets `reason` to the value
+        passed here (usually None) — the old reason described the old
+        verdict. The reason follow-up calls `set_job_feedback_reason`
+        afterwards to fill it in without touching the verdict.
+        """
+        if verdict not in ("up", "down"):
+            raise ValueError(f"bad feedback verdict: {verdict!r}")
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT INTO job_feedback (chat_id, job_id, verdict, reason, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id, job_id) DO UPDATE SET
+                    verdict = excluded.verdict,
+                    reason = excluded.reason,
+                    created_at = excluded.created_at
+                """,
+                (chat_id, job_id, verdict, reason, time.time()),
+            )
+
+    def clear_job_feedback(self, chat_id: int, job_id: str) -> None:
+        """Remove the 👍/👎 verdict — the un-vote path (fb0: callback)."""
+        with self._conn() as c:
+            c.execute(
+                "DELETE FROM job_feedback WHERE chat_id = ? AND job_id = ?",
+                (chat_id, job_id),
+            )
+
+    def set_job_feedback_reason(self, chat_id: int, job_id: str, reason: str) -> None:
+        """Attach a reason to an existing verdict row (👎 follow-up).
+
+        No-op when the verdict row is missing — a stale reason callback
+        after /cleardata shouldn't resurrect a deleted verdict.
+        """
+        with self._conn() as c:
+            c.execute(
+                "UPDATE job_feedback SET reason = ? WHERE chat_id = ? AND job_id = ?",
+                (reason, chat_id, job_id),
+            )
+
+    def get_job_feedback(self, chat_id: int, job_id: str) -> sqlite3.Row | None:
+        with self._conn() as c:
+            return c.execute(
+                "SELECT verdict, reason, created_at FROM job_feedback "
+                "WHERE chat_id = ? AND job_id = ?",
+                (chat_id, job_id),
+            ).fetchone()
+
+    def get_job_feedback_since(
+        self, chat_id: int, since: float = 0.0, limit: int = 200,
+    ) -> list[sqlite3.Row]:
+        """Feedback rows newer than `since`, oldest first, joined with the
+        job metadata the summarizer needs (title/company/source/location)."""
+        with self._conn() as c:
+            return c.execute(
+                """
+                SELECT f.job_id, f.verdict, f.reason, f.created_at,
+                       j.title, j.company, j.source, j.location, j.snippet
+                FROM job_feedback f
+                LEFT JOIN jobs j ON j.job_id = f.job_id
+                WHERE f.chat_id = ? AND f.created_at > ?
+                ORDER BY f.created_at ASC
+                LIMIT ?
+                """,
+                (chat_id, since, limit),
+            ).fetchall()
+
+    def count_job_feedback_since(self, chat_id: int, since: float = 0.0) -> int:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT COUNT(*) AS n FROM job_feedback "
+                "WHERE chat_id = ? AND created_at > ?",
+                (chat_id, since),
+            ).fetchone()
+            return int(row["n"]) if row else 0
+
+    # ---------- feedback digest notes ----------
+
+    def get_feedback_notes(self, chat_id: int) -> tuple[str | None, float | None]:
+        """Return (notes_text, updated_at) for the user's feedback digest."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT feedback_notes_text, feedback_notes_updated_at "
+                "FROM users WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchone()
+            if row is None:
+                return None, None
+            return row["feedback_notes_text"], row["feedback_notes_updated_at"]
+
+    def set_feedback_notes(self, chat_id: int, notes: str | None) -> None:
+        with self._conn() as c:
+            c.execute(
+                "UPDATE users SET feedback_notes_text = ?, "
+                "feedback_notes_updated_at = ? WHERE chat_id = ?",
+                (notes, time.time(), chat_id),
+            )
 
     def clear_application(self, chat_id: int, job_id: str) -> int:
         """Drop the (chat, job) applications row entirely, restoring the
@@ -1629,6 +2242,7 @@ class DB:
         referer: str | None = None,
     ) -> None:
         """Append one click event. Caller has already verified the HMAC."""
+        now = time.time()
         with self._conn() as c:
             c.execute(
                 """
@@ -1636,9 +2250,14 @@ class DB:
                     (chat_id, job_id, clicked_at, user_agent, referer)
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                (int(chat_id), str(job_id), time.time(),
+                (int(chat_id), str(job_id), now,
                  (user_agent or "")[:300] or None,
                  (referer or "")[:300] or None),
+            )
+            # A click on a job link is a usage signal for the stale-user check.
+            c.execute(
+                "UPDATE users SET last_active_at = ? WHERE chat_id = ?",
+                (now, int(chat_id)),
             )
 
     def get_job_url(self, job_id: str) -> str | None:
@@ -1762,6 +2381,23 @@ class DB:
             )
             return cur.rowcount or 0
 
+    def get_job_enrichment(self, chat_id: int, job_id: str) -> dict | None:
+        """Latest cached enrichment for this (chat, job) — used to re-render
+        a card with its ⭐ score/match lines intact (fbr:back restore).
+        None when never enriched or already purged by age."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT enrichment_json FROM digest_run_jobs "
+                "WHERE chat_id = ? AND job_id = ? ORDER BY run_id DESC LIMIT 1",
+                (chat_id, job_id),
+            ).fetchone()
+        if not row or not row["enrichment_json"]:
+            return None
+        try:
+            return _json.loads(row["enrichment_json"])
+        except (TypeError, ValueError):
+            return None
+
     def latest_digest_run_id(self, chat_id: int) -> int | None:
         """Return the most recent run_id with cached digest rows for this user."""
         with self._conn() as c:
@@ -1823,6 +2459,52 @@ class DB:
                 (chat_id, int(run_id), int(score)),
             ).fetchall()
             return [(r["job_id"], int(r["match_score"]), r["enrichment_json"]) for r in rows]
+
+    def fetch_digest_history(
+        self,
+        chat_id: int,
+        score: int,
+        limit: int = 500,
+    ) -> list[tuple[str, int, str | None, float]]:
+        """Every job scored at or above ``score`` for this user, one row per
+        job_id: ``(job_id, match_score, enrichment_json, first_seen)``.
+
+        Powers the web feed, which is a *history* rather than a delivery
+        queue: unlike :meth:`fetch_unsent_at_score` it spans all runs and
+        ignores ``sent_floor``, so jobs already pushed to the user's Telegram
+        chat still show up. Score and enrichment come from the job's most
+        recent run (re-scoring can move them); ``first_seen`` is the earliest
+        `recorded_at`, i.e. the date the job was found — what the web groups by.
+
+        Newest-first, then score-desc. Capped at ``limit`` rows — a floor-0
+        user has tens of thousands of low-score rows and the feed must not
+        try to render them all.
+        """
+        with self._conn() as c:
+            rows = c.execute(
+                """
+                SELECT d.job_id, d.match_score, d.enrichment_json, f.first_seen
+                  FROM digest_run_jobs d
+                  JOIN (
+                         SELECT job_id,
+                                MAX(run_id)      AS last_run,
+                                MIN(recorded_at) AS first_seen
+                           FROM digest_run_jobs
+                          WHERE chat_id = ?
+                          GROUP BY job_id
+                       ) f
+                    ON f.job_id = d.job_id AND f.last_run = d.run_id
+                 WHERE d.chat_id = ? AND d.match_score >= ?
+                 ORDER BY f.first_seen DESC, d.match_score DESC, d.job_id
+                 LIMIT ?
+                """,
+                (chat_id, chat_id, int(score), int(limit)),
+            ).fetchall()
+            return [
+                (r["job_id"], int(r["match_score"]), r["enrichment_json"],
+                 float(r["first_seen"]))
+                for r in rows
+            ]
 
     def purge_digest_run_jobs_older_than(self, max_age_seconds: float) -> int:
         """Drop cached rows whose `recorded_at` is older than ``max_age_seconds``.
@@ -2168,6 +2850,7 @@ class DB:
         location: str,
         jobs_seen: int,
         jobs_new: int,
+        jobs_json: str | None = None,
     ) -> None:
         """Record (or overwrite) one fetch's cursor + telemetry.
 
@@ -2180,6 +2863,12 @@ class DB:
         adapter call must not pollute the table). `location` may legally
         be the empty string — that's how worldwide / no-location fetches
         are keyed.
+
+        `jobs_json` (optional) is a serialized job list for callers that
+        want this fetch replayable from cache instead of re-hit later —
+        see `recent_fetch_jobs`. Bespoke adapters that already do their
+        own incremental page-walking (linkedin, builtin, ...) have no
+        need for it and can leave it None.
         """
         if not source or query is None:
             return
@@ -2191,15 +2880,53 @@ class DB:
                 """
                 INSERT OR REPLACE INTO search_fetches
                   (source, query, page, location, fetched_at,
-                   jobs_seen, jobs_new)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                   jobs_seen, jobs_new, jobs_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(source), q_str, int(page), loc, time.time(),
                     max(0, int(jobs_seen or 0)),
                     max(0, int(jobs_new or 0)),
+                    jobs_json,
                 ),
             )
+
+    def recent_fetch_jobs(
+        self,
+        source: str,
+        query: str,
+        location: str,
+        max_age_s: float,
+    ) -> list[dict] | None:
+        """Return the cached job-dict list for (source, query, location) if
+        a `record_fetch` row exists with a payload younger than `max_age_s`.
+
+        None on a cache miss (no row, row too old, or row has no payload) —
+        callers fall back to a live fetch. Rate-limit relief for sources
+        wired through `apify_fetch.fetch_all_apify`: a fresh-enough row
+        skips the actor call (and the live hit on the upstream site)
+        entirely for that cycle.
+        """
+        if not source or query is None:
+            return None
+        loc = "" if location is None else str(location)
+        cutoff = time.time() - float(max_age_s)
+        with self._conn() as c:
+            row = c.execute(
+                """
+                SELECT jobs_json FROM search_fetches
+                 WHERE source = ? AND query = ? AND page = 0 AND location = ?
+                   AND fetched_at >= ?
+                """,
+                (str(source), str(query), loc, cutoff),
+            ).fetchone()
+        if row is None or not row["jobs_json"]:
+            return None
+        try:
+            data = _json.loads(row["jobs_json"])
+        except (TypeError, ValueError):
+            return None
+        return data if isinstance(data, list) else None
 
     def get_fetch(
         self,

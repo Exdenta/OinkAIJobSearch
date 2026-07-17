@@ -230,6 +230,44 @@ def test_decide_flush_held_at_night_threshold_met(tmp_db, monkeypatch, caplog):
     ), f"expected night-mute hold log line, got: {caplog.records}"
 
 
+def test_decide_flush_manual_run_bypasses_night_mute(tmp_db, monkeypatch, caplog):
+    """manual_run=True + night-mute True ⇒ flush_now=True (deliver now).
+
+    A user pressing "Check Now" / sending /jobs mid-quiet-hours gets their
+    matches immediately — night-mute only suppresses scheduled deliveries.
+    Mirror of test_decide_flush_held_at_night_threshold_met but with
+    manual_run flipped on; expects the opposite verdict + a bypass log line.
+    """
+    monkeypatch.setattr(
+        search_jobs, "_is_in_night_mute_window", lambda **kw: True,
+    )
+    phash = db_module.profile_hash("resume", "prefs")
+    chat_id = 103
+    jobs = [_make_job("linkedin", f"manual_j{n}") for n in range(5)]
+    for j in jobs:
+        _save_job(tmp_db, j)
+    enrichments = {
+        j.job_id: {"match_score": 4, "why_match": "", "why_mismatch": "",
+                   "key_details": {}}
+        for j in jobs
+    }
+    filters = _filters(threshold=5)
+
+    with caplog.at_level(logging.INFO, logger="job-search"):
+        out_jobs, flush_now, depth, _age = search_jobs._decide_buffer_flush(
+            tmp_db, chat_id, jobs, enrichments, phash, filters,
+            manual_run=True,
+        )
+
+    assert flush_now is True
+    assert {j.job_id for j in out_jobs} == {j.job_id for j in jobs}
+    assert depth == 5
+    assert any(
+        "manual check" in rec.message and "bypassing mute" in rec.message
+        for rec in caplog.records
+    ), f"expected manual-bypass log line, got: {caplog.records}"
+
+
 def test_decide_flush_held_at_night_age_met(tmp_db, monkeypatch):
     """Age-based flush (depth=1, queued_at=now-49h) is ALSO muted at night.
     Confirms the gate covers BOTH branches, not just the threshold one."""

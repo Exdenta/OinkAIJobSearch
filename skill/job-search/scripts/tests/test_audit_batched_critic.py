@@ -66,14 +66,22 @@ def _envelope(payload: dict | list) -> str:
     return json.dumps({"result": json.dumps(payload, ensure_ascii=False)})
 
 
-def _scorer_reviews(jobs: list[Job], *, score: int = 3,
+def _scorer_reviews(jobs_or_ids, *, score: int = 3,
                     delta: int = 0) -> list[dict]:
-    """Build a list of scorer reviews for `jobs`.
+    """Build a list of scorer reviews for `jobs_or_ids`.
+
+    The audit prompt hands the model OPAQUE per-batch ids ("j1"…"jN"), not
+    external_ids (a percent-encoded URL doesn't survive the round trip — see
+    `job_enrich._id_lookup`). A real model echoes back what it was given, so
+    the fake does too: ids parsed from the prompt pass through verbatim, and
+    a list of Jobs becomes its positional keys.
 
     `score` is the original score the audit sees in
     `enrichments_by_external_id`; `delta` shifts the revised_score
     so we can drive the verdict direction.
     """
+    ids = [x if isinstance(x, str) else f"j{i}"
+           for i, x in enumerate(jobs_or_ids, 1)]
     out = []
     revised = max(0, min(5, score + delta))
     if revised > score:
@@ -82,9 +90,9 @@ def _scorer_reviews(jobs: list[Job], *, score: int = 3,
         verdict = "lower"
     else:
         verdict = "agree"
-    for j in jobs:
+    for jid in ids:
         out.append({
-            "id": j.external_id,
+            "id": jid,
             "verdict": verdict,
             "revised_score": revised,
             "comment": "ok" if verdict == "agree" else "drift caught",

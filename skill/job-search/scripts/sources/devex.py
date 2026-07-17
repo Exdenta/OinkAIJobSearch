@@ -33,8 +33,8 @@ Paywall scope (separate from the bot wall):
     enough to surface a posting and let the user click through to evaluate.
 
 Maintaining a custom DataDome bypass is not viable (that's the entire point
-of DataDome), so we follow the same delegation pattern as
-``curated_boards.py``: shell out to the ``claude`` CLI with WebSearch +
+of DataDome), so we follow the same delegation pattern as ``un_careers.py``
+and ``curated_boards.py``: shell out to the ``claude`` CLI with WebSearch +
 WebFetch granted, and let it use Google site-search to discover the latest
 DevEx job URLs. WebFetch on individual ``devex.com/jobs/...`` pages is
 ALSO DataDome-blocked, so the prompt tells Claude to extract whatever is
@@ -81,11 +81,10 @@ log = logging.getLogger(__name__)
 
 UA = {"User-Agent": "FindJobs-Bot/1.0 (+https://github.com/; personal job-alert)"}
 
-
 # ---------------------------------------------------------------------------
 # Optional integrations: forensic + instrumented Claude CLI wrapper.
 #
-# Mirrors curated_boards.py's guarding so this module also works in lean
+# Mirrors the un_careers.py guarding so this module also works in lean
 # checkouts (older clones, isolated test envs) without those modules.
 # ---------------------------------------------------------------------------
 
@@ -102,7 +101,6 @@ try:  # wrapped_run_p_with_tools (claude_calls + forensic prompt-head capture)
 except Exception:
     _wrapped_run_p_with_tools = None  # type: ignore[assignment]
     _HAS_WRAPPED = False
-
 
 # Tool grants for the DevEx discovery sub-agent. WebSearch is REQUIRED (the
 # whole point — DataDome blocks direct page loads, so we discover URLs via
@@ -238,6 +236,14 @@ def _extract_employer_from_url(url: str) -> str:
     # `key_details`.
     return " ".join(p.capitalize() for p in raw.split())
 
+# PARALLEL IMPLEMENTATION — keep the posted_at policy below in sync with
+# apify/devex-scraper/src/main.py. BOTH are now HONEST: extract posted_at
+# only when a real date is stated, else null — never guess, never default
+# to today, never infer from job-id/deadline (owner decision — a fabricated
+# date shown to a job-seeker is unfair). This is safe because devex is now
+# gated missing_policy="reject" (see telegram_client._AGE_MISSING_REJECT_SOURCES),
+# so a null-date DevEx posting — often a stale never-closed req — is dropped
+# by the age gate instead of leaking through JOB_AGE_MISSING_POLICY="allow".
 _PROMPT = """You are a job-discovery assistant.
 
 Goal: surface the latest job postings on DevEx (https://www.devex.com/jobs)
@@ -286,27 +292,16 @@ For each unique posting URL, extract:
     otherwise "" (empty string).
   - url: the absolute https://www.devex.com/jobs/<slug>-<id> URL exactly
     as Google indexed it.
-  - posted_at: aggressive extraction REQUIRED. DevEx postings frequently
-    have visible dates in Google's search snippet. Priority:
-      (i)   Explicit date in snippet: "Posted on May 10, 2026",
-            "Published 2 weeks ago", "Posted Jan 15, 2020" — convert
-            to ISO ("YYYY-MM-DD"). "X weeks ago" → today - 7*X days.
-            "X months ago" → today - 30*X days.
-      (ii)  Relative: "Yesterday" → today-1; "Today" → today;
-            "Hours ago" / "Just now" → today.
-      (iii) Deadline mention in snippet ("Deadline: 18 May 2026" /
-            "Apply by 30/06/2026") — use that as a freshness proxy
-            ONLY if no posted date is visible; assume posted_at =
-            deadline - 30 days.
-      (iv)  If none of the above and the URL contains a high job-id
-            (>1000000) → guess "today". If the URL has a LOW job-id
-            (<700000) → guess a date 12+ months ago (these are
-            historical postings DevEx never closed; the downstream
-            age gate should drop them).
-    Always return SOMETHING for posted_at, even if best-guess. NEVER
-    return empty string for DevEx postings — the age gate's
-    missing_policy will let them through and stale 2020 postings
-    will leak. Be conservative: if uncertain, guess OLD, not new.
+  - posted_at: the ACTUAL posting date, ONLY if it is genuinely stated in
+    Google's search snippet — an explicit date ("Posted on May 10, 2026",
+    "Posted Jan 15, 2020" → ISO "YYYY-MM-DD"), or an unambiguous relative
+    phrase ("2 weeks ago" → today-14d, "Yesterday" → today-1, "Today" /
+    "Hours ago" / "Just now" → today). If NO real posted date is visible,
+    return null. Do NOT guess. Do NOT use today's date as a fallback. Do
+    NOT infer it from the job ID or from a deadline. An honest null is
+    correct: DevEx is gated missing_policy="reject", so a dateless posting
+    (often a stale, never-closed 2020 req) is dropped by the age gate —
+    exactly what we want. A fabricated date shown to a job-seeker is unfair.
   - snippet: a one-sentence trimmed version of the Google search snippet.
 
 Return STRICT JSON (no commentary, no markdown fences, no prose before or
@@ -336,10 +331,148 @@ after the JSON object.
 
 
 # ---------------------------------------------------------------------------
+# Shared helpers — raw-dict → Job, detail-body enrichment, tier-4 recording.
+# Used by the "claude" backend (and, for `_jobs_from_raw`, by the
+# chrome-agent fallback tier too — it was previously a near-identical
+# inline copy of the primary loop).
+# ---------------------------------------------------------------------------
+
+def _jobs_from_raw(raw: list[dict], cap: int, *, out: list[Job] | None = None) -> list[Job]:
+    """Build Jobs from raw {title, company, location, url, posted_at,
+    snippet} dicts, deduping by URL and rejecting placeholder employer
+    strings. `out` lets a caller (the chrome-agent fallback) continue
+    appending into an already-partially-filled list up to `cap`.
+    """
+    out = out if out is not None else []
+    seen_urls: set[str] = {j.url for j in out}
+    for r in raw[:cap * 2]:  # over-iterate to allow url-dedupe down to cap
+        if len(out) >= cap:
+            break
+        if not isinstance(r, dict):
+            continue
+        url = (r.get("url") or "").strip()
+        # Some search results come back as https://devex.com/jobs/...
+        # (no "www.") even though the site's own canonical links always
+        # carry it — normalize before validating so a real discovery
+        # doesn't get silently dropped over a cosmetic host mismatch.
+        if url.startswith("https://devex.com/jobs/"):
+            url = "https://www." + url[len("https://"):]
+        if not url or not url.startswith("https://www.devex.com/jobs/"):
+            # Without a valid devex.com job URL we have no stable
+            # external_id (job id is in the URL path) and no link to
+            # send the user. Skip.
+            continue
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+
+        title = fix_mojibake(str(r.get("title") or "")).strip()
+        # Strip trailing " | Devex" if the extractor forgot to.
+        for suffix in (" | Devex", " | DevEx", " - Devex", " - DevEx"):
+            if title.endswith(suffix):
+                title = title[: -len(suffix)].strip()
+        if not title:
+            continue
+
+        # The job-id (numeric tail of the URL path) is our stable
+        # external_id. If we can't recover one we fall back to the URL
+        # itself — still unique, just longer. dedupe.Job hashing handles
+        # both shapes.
+        external_id = url.rstrip("/").rsplit("-", 1)[-1]
+        if not external_id.isdigit():
+            external_id = url
+
+        company = fix_mojibake(str(r.get("company") or "")).strip()
+        # Reject placeholder employer strings the extractor might still
+        # emit despite the prompt — fall back to URL slug extraction so
+        # the user sees a real org name, not "DevEx (...)".
+        if (
+            not company
+            or company.lower().startswith("devex (")
+            or company.lower() == "devex"
+            or "employer not specified" in company.lower()
+        ):
+            company = _extract_employer_from_url(url) or "Unknown employer"
+
+        out.append(Job(
+            "devex",                         # source
+            external_id,                     # external_id
+            title[:140],                     # title
+            company[:120],                   # company
+            fix_mojibake(str(r.get("location") or "")).strip()[:120],  # location
+            url,                              # url
+            str(r.get("posted_at") or ""),   # posted_at
+            fix_mojibake(str(r.get("snippet") or "")).strip()[:400],  # snippet
+            "",                               # salary (DevEx rarely surfaces this)
+        ))
+    return out
+
+
+def _enrich_detail_bodies(out: list[Job]) -> list[Job]:
+    """Algorithm v2.2 — Option 4: search-snippet text stops at ~150 chars
+    and routinely omits the "Required qualifications" block, which is
+    exactly the signal Sonnet needs to rule out senior-only / US-only /
+    Arabic-required postings. Fetch each detail URL inline. (DevEx HTML is
+    DataDome-gated for agentic WebFetch, but a plain requests.get with a
+    browser UA gets through — see `sources._detail_fetch`.)
+
+    This is an intentional, NOT reconcilable, asymmetry with
+    apify/devex-scraper/src/main.py, which caps its snippet at ~400 Google-
+    snippet chars and does no detail-page fetch at all: that standalone
+    BYOK actor has no equivalent to `sources._detail_fetch`'s headless-
+    browser-render fallback tier (enabled by default here via
+    `defaults.DEFAULTS`), so it genuinely cannot get past
+    DataDome the way this adapter sometimes can. Failures here fall back to
+    the original (shorter) snippet via the broad except below — never
+    breaks the fetch, never raises.
+    """
+    if not out:
+        return out
+    try:
+        from sources._detail_fetch import fetch_many_bodies
+        body_map = fetch_many_bodies([j.url for j in out], max_chars=4000, workers=8)
+        enriched = 0
+        for i, j in enumerate(out):
+            body = body_map.get(j.url, "")
+            if body and len(body) > len(j.snippet):
+                out[i] = Job(
+                    j.source, j.external_id, j.title, j.company,
+                    j.location, j.url, j.posted_at, body,
+                    getattr(j, "salary", ""),
+                )
+                enriched += 1
+        log.info("devex: detail-page bodies fetched for %d/%d postings", enriched, len(out))
+    except Exception:
+        log.exception("devex: detail-page fetch raised; continuing")
+    return out
+
+
+def _record_tier4(out: list[Job], db) -> None:
+    """Feed the adaptive source-cooldown FSM. jobs_new counts how many of
+    THIS fetch's postings are not yet in the `jobs` table — computed via
+    the real Job.job_id (sha1 of source+external_id), which is exactly the
+    key `upsert_job` stores. Best-effort: a DB error must never break the
+    fetch.
+    """
+    if db is None:
+        return
+    try:
+        seen_ids = [j.job_id for j in out]
+        existing = db.count_existing_jobs(seen_ids) if seen_ids else 0
+        db.record_fetch(
+            "devex", "devex", 1, "",
+            jobs_seen=len(seen_ids),
+            jobs_new=max(0, len(seen_ids) - existing),
+        )
+    except Exception:
+        log.debug("devex: db.record_fetch raised; continuing", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-def fetch(filters: dict, *, db=None) -> list[Job]:
+def _fetch_claude(filters: dict, *, db=None) -> list[Job]:
     """Aggregate DevEx postings via the Claude CLI delegation pattern.
 
     Parameters mirrored from filters / defaults:
@@ -444,61 +577,7 @@ def fetch(filters: dict, *, db=None) -> list[Job]:
 
         log.info("devex (AI): %d raw postings", len(raw))
 
-        seen_urls: set[str] = set()
-        for r in raw[:cap * 2]:  # over-iterate to allow url-dedupe down to cap
-            if len(out) >= cap:
-                break
-            if not isinstance(r, dict):
-                continue
-            url = (r.get("url") or "").strip()
-            if not url or not url.startswith("https://www.devex.com/jobs/"):
-                # Without a valid devex.com job URL we have no stable
-                # external_id (job id is in the URL path) and no link to
-                # send the user. Skip.
-                continue
-            if url in seen_urls:
-                continue
-            seen_urls.add(url)
-
-            title = fix_mojibake(str(r.get("title") or "")).strip()
-            # Strip trailing " | Devex" if Claude forgot to.
-            for suffix in (" | Devex", " | DevEx", " - Devex", " - DevEx"):
-                if title.endswith(suffix):
-                    title = title[: -len(suffix)].strip()
-            if not title:
-                continue
-
-            # The job-id (numeric tail of the URL path) is our stable
-            # external_id. If we can't recover one we fall back to the URL
-            # itself — still unique, just longer. dedupe.Job hashing handles
-            # both shapes.
-            external_id = url.rstrip("/").rsplit("-", 1)[-1]
-            if not external_id.isdigit():
-                external_id = url
-
-            company = fix_mojibake(str(r.get("company") or "")).strip()
-            # Reject placeholder employer strings the subagent might still
-            # emit despite the prompt update — fall back to URL slug
-            # extraction so user sees a real org name, not "DevEx (...)".
-            if (
-                not company
-                or company.lower().startswith("devex (")
-                or company.lower() == "devex"
-                or "employer not specified" in company.lower()
-            ):
-                company = _extract_employer_from_url(url) or "Unknown employer"
-
-            out.append(Job(
-                "devex",                         # source
-                external_id,                     # external_id
-                title[:140],                     # title
-                company[:120],                   # company
-                fix_mojibake(str(r.get("location") or "")).strip()[:120], # location
-                url,                             # url
-                str(r.get("posted_at") or ""),   # posted_at
-                fix_mojibake(str(r.get("snippet") or "")).strip()[:400],  # snippet
-                "",                              # salary (DevEx rarely surfaces this)
-            ))
+        out = _jobs_from_raw(raw, cap, out=out)
 
         # Chrome-agent fallback (last resort). The WebSearch/WebFetch
         # delegation above is the WORKING primary path — when it surfaces
@@ -530,104 +609,13 @@ def fetch(filters: dict, *, db=None) -> list[Job]:
                 recovered = []
 
             if recovered:
-                seen_urls_fb: set[str] = set()
-                for r in recovered:
-                    if len(out) >= cap:
-                        break
-                    if not isinstance(r, dict):
-                        continue
-                    url = (r.get("url") or "").strip()
-                    if not url or not url.startswith("https://www.devex.com/jobs/"):
-                        continue
-                    if url in seen_urls_fb:
-                        continue
-                    seen_urls_fb.add(url)
-
-                    title = fix_mojibake(str(r.get("title") or "")).strip()
-                    for suffix in (" | Devex", " | DevEx", " - Devex", " - DevEx"):
-                        if title.endswith(suffix):
-                            title = title[: -len(suffix)].strip()
-                    if not title:
-                        continue
-
-                    external_id = url.rstrip("/").rsplit("-", 1)[-1]
-                    if not external_id.isdigit():
-                        external_id = url
-
-                    company = fix_mojibake(str(r.get("company") or "")).strip()
-                    if (
-                        not company
-                        or company.lower().startswith("devex (")
-                        or company.lower() == "devex"
-                        or "employer not specified" in company.lower()
-                    ):
-                        company = _extract_employer_from_url(url) or "Unknown employer"
-
-                    out.append(Job(
-                        "devex",                         # source
-                        external_id,                     # external_id
-                        title[:140],                     # title
-                        company[:120],                   # company
-                        fix_mojibake(str(r.get("location") or "")).strip()[:120],
-                        url,                             # url
-                        str(r.get("posted_at") or ""),   # posted_at
-                        fix_mojibake(str(r.get("snippet") or "")).strip()[:400],
-                        "",                              # salary
-                    ))
+                out = _jobs_from_raw(recovered, cap, out=out)
                 if out:
                     log.info("devex: chrome-agent fallback recovered %d postings", len(out))
 
-        # Algorithm v2.2 — Option 4: DevEx Google-search snippets stop
-        # at ~150 chars and routinely omit the "Required qualifications"
-        # block, which is exactly the signal Sonnet needs to rule out
-        # senior-only / US-only / Arabic-required postings. Fetch each
-        # detail URL inline. (DevEx HTML is DataDome-gated for the
-        # Anthropic WebFetch service, but a plain requests.get with a
-        # browser UA gets through.)
-        if out:
-            try:
-                from sources._detail_fetch import fetch_many_bodies
-                body_map = fetch_many_bodies(
-                    [j.url for j in out], max_chars=4000, workers=8,
-                )
-                enriched = 0
-                for i, j in enumerate(out):
-                    body = body_map.get(j.url, "")
-                    if body and len(body) > len(j.snippet):
-                        out[i] = Job(
-                            j.source, j.external_id, j.title, j.company,
-                            j.location, j.url, j.posted_at, body,
-                            getattr(j, "salary", ""),
-                        )
-                        enriched += 1
-                log.info(
-                    "devex: detail-page bodies fetched for %d/%d postings",
-                    enriched, len(out),
-                )
-            except Exception:
-                log.exception("devex: detail-page fetch raised; continuing")
-
+        out = _enrich_detail_bodies(out)
         sample_titles = [j.title[:80] for j in out[:5]]
-
-        # Tier 4: feed the adaptive source-cooldown FSM. jobs_new counts how
-        # many of THIS fetch's postings are not yet in the `jobs` table —
-        # computed via the real Job.job_id (sha1 of source+external_id), which
-        # is exactly the key `upsert_job` stores, so `count_existing_jobs`
-        # actually finds prior rows. Done before the upsert step downstream,
-        # so a posting we've seen before reads as "not new". Best-effort: a
-        # DB error must never break the fetch.
-        if db is not None:
-            try:
-                seen_ids = [j.job_id for j in out]
-                existing = db.count_existing_jobs(seen_ids) if seen_ids else 0
-                db.record_fetch(
-                    "devex", "devex", 1, "",
-                    jobs_seen=len(seen_ids),
-                    jobs_new=max(0, len(seen_ids) - existing),
-                )
-            except Exception:
-                log.debug("devex: db.record_fetch raised; continuing",
-                          exc_info=True)
+        _record_tier4(out, db)
 
         fctx.set_output({
             "raw_count": len(raw),
@@ -648,3 +636,12 @@ def fetch(filters: dict, *, db=None) -> list[Job]:
     })
 
     return out
+
+
+def fetch(filters: dict, *, db=None) -> list[Job]:
+    """Aggregate DevEx postings.
+
+    Agentic WebSearch subagent backend. See `_fetch_claude`'s docstring
+    for the full parameter/caveat picture. Never raises.
+    """
+    return _fetch_claude(filters, db=db)

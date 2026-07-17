@@ -228,6 +228,18 @@ def _profile_with_multilingual_seeds() -> dict:
     }
 
 
+def _as_v5(profile: dict) -> dict:
+    """Upgrade the shared v3 stub to the v5 envelope the BUILD path enforces
+    (build_profile_sync rejects sv != 5; the validator tests above keep
+    exercising the legacy v3 LOADING shape on purpose)."""
+    profile["schema_version"] = 5
+    profile["remote_locations"] = ["spain", "europe"]
+    profile["hybrid_locations"] = ["bilbao"]
+    for legacy in ("locations", "remote", "remote_regions"):
+        profile.pop(legacy, None)
+    return profile
+
+
 def test_validator_accepts_multilingual_paired_queries():
     errs = pb.profile_schema_validate(_profile_with_multilingual_seeds())
     assert errs == [], f"multilingual paired-shape profile rejected: {errs}"
@@ -317,22 +329,30 @@ def test_default_builder_renders_nonempty_prompt():
     )
 
 
-def test_seeds_builder_short_circuits_because_template_missing():
-    # Documents WHY the default was swapped: build_search_seeds_sync renders
-    # the absent profile_seeds.txt, so it short-circuits to status='exception'
-    # WITHOUT ever calling the model. If someone restores profile_seeds.txt and
-    # this test starts failing, the seeds builder is once again a viable
-    # default and the wiring comment should be revisited.
-    assert not pb._SEEDS_PROMPT_PATH.exists(), (
-        "profile_seeds.txt unexpectedly present — revisit builder defaults"
+def test_seeds_builder_renders_template_and_calls_model():
+    # History: this test used to pin the OPPOSITE (template absent → builder
+    # short-circuits without a model call) and its docstring said to revisit
+    # once profile_seeds.txt came back. It came back on 2026-07-02 with the
+    # source query-enabled search work, so now pin the live contract: the
+    # template renders and the model IS invoked with the user inputs.
+    assert pb._SEEDS_PROMPT_PATH.exists(), (
+        "profile_seeds.txt missing — seeds builder would short-circuit again; "
+        "if that removal is intentional, restore the old short-circuit test"
     )
 
-    def _must_not_run(prompt, **kwargs):  # pragma: no cover - asserts it's unreachable
-        raise AssertionError("model must NOT be called when seeds template missing")
+    calls = {}
 
-    res = pb.build_search_seeds_sync("résumé", "prefs", _run_p=_must_not_run)
-    assert res.status == "exception"
-    assert "seeds prompt template missing" in (res.error or "")
+    def _capture_run(prompt, **kwargs):
+        calls["prompt"] = prompt
+        return ""  # unparseable on purpose — this test pins the render+call step
+
+    res = pb.build_search_seeds_sync("résumé-marker", "prefs-marker", _run_p=_capture_run)
+    assert "prompt" in calls, "model must be called when the template exists"
+    assert "résumé-marker" in calls["prompt"]
+    assert "prefs-marker" in calls["prompt"]
+    # Whatever the (stubbed, empty) model output does downstream, the
+    # template-missing short-circuit must not be the reported error.
+    assert "seeds prompt template missing" not in (res.error or "")
 
 
 def test_rebuild_profile_end_to_end_emits_spanish_with_temp_db(tmp_path):
@@ -358,7 +378,7 @@ def test_rebuild_profile_end_to_end_emits_spanish_with_temp_db(tmp_path):
     )
     database.set_prefs_free_text(chat_id, "Investigadora en ONG. España, remoto UE.")
 
-    profile = _profile_with_multilingual_seeds()
+    profile = _as_v5(_profile_with_multilingual_seeds())
     canned = json.dumps(
         {"type": "result", "result": json.dumps(profile, ensure_ascii=False)},
         ensure_ascii=False,
@@ -386,7 +406,7 @@ def test_rebuild_profile_end_to_end_emits_spanish_with_temp_db(tmp_path):
 
 
 def test_build_profile_sync_accepts_stubbed_multilingual_response():
-    profile = _profile_with_multilingual_seeds()
+    profile = _as_v5(_profile_with_multilingual_seeds())
     canned = json.dumps(
         {"type": "result", "result": json.dumps(profile, ensure_ascii=False)},
         ensure_ascii=False,

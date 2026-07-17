@@ -46,7 +46,7 @@ from claude_cli import (
     parse_json_block,
     run_p,
 )
-from instrumentation.wrappers import wrapped_run_p, wrapped_run_p_with_tools
+from instrumentation.wrappers import wrapped_run_p_with_tools
 from dedupe import Job
 from text_utils import fix_mojibake
 
@@ -144,6 +144,11 @@ _EXCLUDE_DOMAINS = [
     "remocate.app",
     "wantapply.com",
     "remoterocketship.com",
+    # Two noise domains Claude's own WebSearch occasionally surfaces:
+    # Apify actor marketplace listings (scraper products, not job
+    # postings) and a job-aggregator site.
+    "apify.com",
+    "jobsglitch.com",
 ]
 
 
@@ -303,9 +308,17 @@ Rules:
     return {{"jobs": []}}.
 
 === CANDIDATE PROFILE ===
-Role keywords:   {keywords}
-Title must match at least one of: {title_must}
-Title exclude: {title_exclude}
+{ideal_fit_block}Role keywords:   {keywords}
+Typical target titles: {title_must}
+  (search hints, NOT a hard filter — real postings often use different
+  names for the same work. Mix these into your queries but also include
+  equivalent and adjacent role titles; judge each posting by role
+  CONTENT, not by exact title tokens.)
+Title red flags: {title_exclude}
+  (skip a posting only when the whole role clearly mismatches the
+  candidate — a red-flag token alone is NOT a veto. Hybrid titles like
+  "Data Science Manager" that are plainly hands-on can pass; the
+  downstream scoring pass makes the final call.)
 Preferred locations: {locations}
 Remote policy: {remote}
 Seniority: {seniority}
@@ -397,12 +410,19 @@ def _build_prompt(
     filters: dict,
     user_free_text: str | None = None,
     profile_seeds: dict | None = None,
+    ideal_fit: str | None = None,
 ) -> str:
     cap = int(filters.get("max_per_source") or 15)
-    keywords = ", ".join((filters.get("keywords") or [])[:12]) or "frontend, react, typescript"
-    title_must = ", ".join((filters.get("title_must_match") or [])[:10]) or "frontend, react, typescript"
+    # No hardcoded role fallbacks: an empty slot must read as "derive it",
+    # never as a wrong prior (the old "frontend, react, typescript" default
+    # sent non-frontend users' searches to the wrong role family).
+    keywords = ", ".join((filters.get("keywords") or [])[:12]) \
+        or "(none listed — derive from the candidate's own description above)"
+    title_must = ", ".join((filters.get("title_must_match") or [])[:10]) \
+        or "(none listed — derive target titles from the candidate's description above)"
     title_exclude = ", ".join((filters.get("title_exclude") or [])[:10]) or "(none)"
-    locations = ", ".join((filters.get("locations") or [])[:12]) or "remote, Europe, Spain"
+    locations = ", ".join((filters.get("locations") or [])[:12]) \
+        or "(unspecified — infer from the candidate's description)"
     remote = str(filters.get("remote") or "any")
     seniority = str(filters.get("seniority") or "any")
     min_salary = int((filters.get("salary") or {}).get("min_usd") or 0)
@@ -421,8 +441,18 @@ def _build_prompt(
 
     profile_seeds_block = _render_profile_seeds(profile_seeds)
 
+    # One-paragraph "who they are" from the profile builder. Richer signal
+    # than the token lists — the discovery agent can reason about role
+    # equivalence the way the downstream scorer does.
+    fit = " ".join((ideal_fit or "").split())[:600]
+    ideal_fit_block = (
+        f"Ideal fit (from their profile): {_escape_prompt_braces(fit)}\n"
+        if fit else ""
+    )
+
     return _PROMPT.format(
         cap=cap,
+        ideal_fit_block=ideal_fit_block,
         keywords=keywords,
         title_must=title_must,
         title_exclude=title_exclude,
@@ -446,6 +476,49 @@ def _parse_jobs_json(text: str) -> list[dict[str, Any]]:
     return [j for j in jobs if isinstance(j, dict)]
 
 
+_KEENABLE_EXTRACT_PROMPT = """You are checking ONE web page to see if it is a
+single, specific, apply-able job posting worth surfacing to a job-seeking
+candidate.
+
+=== PAGE URL ===
+{url}
+
+=== PAGE CONTENT ===
+{body}
+
+RULES:
+  - If this page is a careers INDEX, a jobs LISTING, a search-results page,
+    an org portal/landing page, a third-party aggregator/repost/"vacancies
+    digest", a discussion forum, or anything other than ONE specific role's
+    canonical apply page — respond with exactly: {{"skip": true}}
+  - If the page itself says the posting is CLOSED, FILLED, EXPIRED, or no
+    longer accepting applications — respond with exactly: {{"skip": true}}.
+  - PREFER the employer's own site or a native ATS (Greenhouse, Lever,
+    Ashby, Workable, BambooHR, Personio, Recruitee, Workday,
+    SmartRecruiters) over a third-party job board that merely reposts
+    other companies' listings (e.g. a "remote jobs" aggregator site). If
+    this page is such a third-party repost board rather than the
+    employer/ATS original, respond with exactly: {{"skip": true}} — even
+    if the posting itself looks otherwise valid.
+  - PREFER FRESH postings. If the page states or implies the posting is
+    old (e.g. explicitly dated more than ~30 days before today,
+    {today}) — respond with exactly: {{"skip": true}}. When no date is
+    stated, do not guess — evaluate freshness only from what the page
+    actually states.
+  - Otherwise extract the posting's fields. Copy `title` CHARACTER-FOR-
+    CHARACTER from the page heading — preserve any seniority prefix
+    (Senior/Staff/Lead/Principal/Junior) exactly, never paraphrase or
+    reorder it.
+  - Extract `posted_at` as an ISO date ("YYYY-MM-DD") ONLY if a posting
+    date is visibly stated on the page. If you cannot find one, return ""
+    for it — do NOT guess or invent a date.
+  - `snippet`: 1-3 sentences summarizing the role.
+
+Return STRICT JSON only, no prose, no markdown fences, this exact shape:
+{{"title": "...", "company": "...", "location": "...", "posted_at": "...", "snippet": "..."}}
+""".strip()
+
+
 # P2 page-memory cursor: web_search doesn't paginate natively — Claude
 # runs WebSearch itself and the "page" is purely a counter of exploration
 # rounds. WEB_SEARCH_MAX_PAGE caps how many distinct exploration rounds
@@ -465,6 +538,7 @@ def fetch(
     user_free_text: str | None = None,
     profile_seeds: dict | None = None,
     *,
+    ideal_fit: str | None = None,
     db=None,
     min_revisit_age_s: int = 21600,
     cursor_key: str = "",
@@ -487,6 +561,11 @@ def fetch(
     than reconstructing queries from scratch. When absent (user hasn't had
     a profile built yet, or the last build failed), the base candidate-profile
     rows at the bottom of the prompt still drive discovery.
+
+    `ideal_fit` is the profile's `ideal_fit_paragraph` — a one-paragraph
+    natural-language summary of who the candidate is. Passed into the
+    prompt so the agent can reason about role equivalence ("Data Science
+    Manager" vs "ML lead") instead of leaning only on title-token lists.
 
     Cursor mode (`db` provided): web_search has no native pagination, so
     each "page" is an exploration round. Page 1 runs the normal prompt.
@@ -543,6 +622,7 @@ def fetch(
         filters,
         user_free_text=user_free_text,
         profile_seeds=profile_seeds,
+        ideal_fit=ideal_fit,
     )
 
     # Cursor mode, page > 1: prepend an exclusion preamble that lists the
@@ -586,8 +666,7 @@ def fetch(
     if not stdout:
         log.warning("web_search: `claude` CLI unavailable or errored; returning []")
         return []
-    body = extract_assistant_text(stdout)
-    raw = _parse_jobs_json(body)
+    raw = _parse_jobs_json(extract_assistant_text(stdout))
     log.info("web_search (AI): %d raw postings", len(raw))
 
     seen_urls: set[str] = set()

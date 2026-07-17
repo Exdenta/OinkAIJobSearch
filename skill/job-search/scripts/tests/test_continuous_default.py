@@ -379,29 +379,56 @@ def test_continuous_mode_enabled_truthy_values() -> None:
 # ---------------------------------------------------------------------------
 
 
-def main() -> int:
-    test_onboarded_chat_ids_filters_correctly()
-    test_resolver_env_override()
-    test_resolver_db_fallback_when_env_unset()
-    test_resolver_db_fallback_when_env_blank()
-    test_resolver_env_garbage_falls_back()
-    test_spawn_dedup_via_registry()
-    test_maybe_start_no_op_when_mode_off()
-    test_maybe_start_uses_resolver_and_dedups_on_replay()
-    test_maybe_start_replay_with_real_spawn_dedups()
-    test_live_spawn_no_op_when_mode_off()
-    test_live_spawn_env_pinned_exclude_and_include()
-    test_live_spawn_idempotent_for_already_running()
-    test_continuous_mode_enabled_truthy_values()
-    test_web_users_negative_chat_ids_are_searchable()
-    test_continuous_searcher_ctor_accepts_negative()
-    test_reconciler_spawns_missing_users()
-    print("\nAll continuous-default tests passed.")
-    return 0
+def _seed_source_run(db: DB, chat_id: int, started_at: float) -> None:
+    with db._conn() as c:
+        c.execute(
+            "INSERT INTO source_runs (pipeline_run_id, source_key, user_chat_id, "
+            "status, started_at, finished_at) VALUES (1, 'linkedin', ?, 'ok', ?, ?)",
+            (chat_id, started_at, started_at + 60),
+        )
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+def test_resume_startup_delay_survives_restart() -> None:
+    section("14. startup delay resumes the user's own cycle across restarts")
+    db = _make_tmpdb()
+    interval = 28800  # 8h, the prod value
+
+    # Never searched → caller's stagger position stands.
+    _assert(db.last_search_started_at(1926270) is None,
+            "last_search_started_at is None with no source_runs rows")
+    _assert(bot._resume_startup_delay(db, 1926270, 0, interval) == 0,
+            "never-searched user keeps its stagger position")
+
+    # Searched 1h ago → wait out the remaining 7h, not fire immediately.
+    # This is the bug: chat_id 1926270 sat at stagger index 0, so every
+    # deploy handed it a free full search (11 of them in two days).
+    _seed_source_run(db, 1926270, time.time() - 3600)
+    delay = bot._resume_startup_delay(db, 1926270, 0, interval)
+    jitter = abs(1926270) % bot._RESUME_JITTER_S
+    _assert(abs(delay - (interval - 3600 + jitter)) <= 2,
+            f"restart resumes the remaining ~7h, got {delay}s")
+
+    # ...and the tail of the stagger list is no longer starved: a user whose
+    # interval already elapsed fires promptly instead of waiting 6.4h again.
+    _seed_source_run(db, 1783830637, time.time() - interval - 500)
+    delay = bot._resume_startup_delay(db, 1783830637, 23040, interval)
+    _assert(delay == abs(1783830637) % bot._RESUME_JITTER_S,
+            f"overdue user fires after jitter only, got {delay}s")
+
+    # Overdue users get distinct jitters so they don't score concurrently.
+    _assert(
+        (abs(1926270) % bot._RESUME_JITTER_S)
+        != (abs(1783830637) % bot._RESUME_JITTER_S),
+        "chat_id-derived jitter spreads the herd",
+    )
+
+    # A broken telemetry read must not stop the searcher from starting.
+    class _Boom:
+        def last_search_started_at(self, _cid):
+            raise RuntimeError("telemetry down")
+
+    _assert(bot._resume_startup_delay(_Boom(), 1, 42, interval) == 42,
+            "lookup failure falls back to the stagger position")
 
 
 def test_web_users_negative_chat_ids_are_searchable() -> None:
@@ -496,3 +523,29 @@ def test_reconciler_spawns_missing_users() -> None:
     finally:
         bot._spawn_continuous_searcher_thread = orig  # type: ignore[assignment]
         _fresh_registry()
+
+
+def main() -> int:
+    test_onboarded_chat_ids_filters_correctly()
+    test_resolver_env_override()
+    test_resolver_db_fallback_when_env_unset()
+    test_resolver_db_fallback_when_env_blank()
+    test_resolver_env_garbage_falls_back()
+    test_spawn_dedup_via_registry()
+    test_maybe_start_no_op_when_mode_off()
+    test_maybe_start_uses_resolver_and_dedups_on_replay()
+    test_maybe_start_replay_with_real_spawn_dedups()
+    test_live_spawn_no_op_when_mode_off()
+    test_live_spawn_env_pinned_exclude_and_include()
+    test_live_spawn_idempotent_for_already_running()
+    test_continuous_mode_enabled_truthy_values()
+    test_web_users_negative_chat_ids_are_searchable()
+    test_continuous_searcher_ctor_accepts_negative()
+    test_reconciler_spawns_missing_users()
+    test_resume_startup_delay_survives_restart()
+    print("\nAll continuous-default tests passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
