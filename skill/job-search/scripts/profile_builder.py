@@ -111,6 +111,11 @@ _MAX_SEED_PHRASE = 120
 # back-compat: old shapes pass `_validate_linkedin_seeds` unchanged.
 _MAX_LINKEDIN_QUERIES = 10
 _MAX_SEED_PHRASES = 12
+# boards.keywords — short AND-matched terms for keyword boards (jobs.ac.uk,
+# workatastartup, EURES). Optional block, added 2026-07-02 for the Apify
+# per-user query path. Prompt asks 3-6; validator allows 6 × 40 chars.
+_MAX_BOARD_KEYWORDS = 6
+_MAX_BOARD_KEYWORD = 40
 
 # Location of the external prompt files.
 #   profile_builder.txt — v3 schema (full structured profile). THE LIVE
@@ -268,6 +273,35 @@ def _validate_linkedin_seeds(li: Any) -> list[str]:
     return errs
 
 
+def _validate_boards_seeds(boards: Any) -> list[str]:
+    """Validate the OPTIONAL search_seeds.boards block. Profiles built
+    before 2026-07-02 don't carry it — the Apify query path falls back to
+    linkedin.queries for the one source proven safe with long UI phrases.
+    """
+    if boards is None:
+        return []
+    if not isinstance(boards, dict):
+        return ["search_seeds.boards must be an object"]
+    kws = boards.get("keywords") or []
+    if not _is_str_list(kws):
+        return ["search_seeds.boards.keywords must be a list of strings"]
+    if len(kws) > _MAX_BOARD_KEYWORDS or not _len_le(kws, _MAX_BOARD_KEYWORD):
+        return [f"boards.keywords length > {_MAX_BOARD_KEYWORDS} "
+                f"or items > {_MAX_BOARD_KEYWORD} chars"]
+    # OPTIONAL native-language block (2026-07-16) — terms for boards
+    # indexed in their market's own language (apify_fetch.BOARD_NATIVE_LANG).
+    nkws = boards.get("native_keywords") or []
+    if not _is_str_list(nkws):
+        return ["search_seeds.boards.native_keywords must be a list of strings"]
+    if len(nkws) > _MAX_BOARD_KEYWORDS or not _len_le(nkws, _MAX_BOARD_KEYWORD):
+        return [f"boards.native_keywords length > {_MAX_BOARD_KEYWORDS} "
+                f"or items > {_MAX_BOARD_KEYWORD} chars"]
+    nlang = boards.get("native_language")
+    if nlang is not None and not _is_str(nlang):
+        return ["search_seeds.boards.native_language must be a string"]
+    return []
+
+
 def seeds_schema_validate(profile: Any) -> list[str]:
     """Validate the algorithm-v2 seeds-only schema (schema_version=4).
 
@@ -322,6 +356,7 @@ def seeds_schema_validate(profile: Any) -> list[str]:
                 bad = [d for d in ats if d not in _ALLOWED_ATS]
                 if bad:
                     errs.append(f"ats_domains contains disallowed entries: {bad}")
+        errs.extend(_validate_boards_seeds(seeds.get("boards")))
     return errs
 
 
@@ -337,14 +372,22 @@ def profile_schema_validate(profile: Any) -> list[str]:
     if not isinstance(profile, dict):
         return ["profile is not a dict"]
 
-    # Required top-level keys. v3 adds `onsite_locations` + `remote_regions`
-    # alongside the legacy `locations` field (kept for back-compat readers).
-    required = {
+    # Required top-level keys. The set depends on schema_version:
+    #   v5 (current, EMITTED by the builder): the three granularity-agnostic
+    #     location lists `remote_locations` / `hybrid_locations` /
+    #     `onsite_locations`. Legacy `locations` / `remote` / `remote_regions`
+    #     are NOT emitted in v5 (downstream derives any coarse enum it needs).
+    #   v3 (legacy, LOADING only): `onsite_locations` + `remote_regions` +
+    #     `locations` + `remote`.
+    #   v2 (legacy, LOADING only): `locations` + `remote`.
+    # The build path (build_profile_sync) additionally enforces sv==5 so a
+    # freshly generated profile can never be a stale v2/v3 shape.
+    base_required = {
         "schema_version", "ideal_fit_paragraph", "primary_role",
         "target_levels", "years_experience",
         "stack_primary", "stack_secondary", "stack_adjacent", "stack_antipatterns",
         "title_must_match", "title_exclude", "exclude_keywords", "exclude_companies",
-        "locations", "remote", "time_zone_band",
+        "time_zone_band",
         "salary_min_usd", "drop_if_salary_unknown", "language",
         "max_age_hours", "min_match_score",
         "search_seeds", "free_text",
@@ -356,14 +399,22 @@ def profile_schema_validate(profile: Any) -> list[str]:
         # checker. Falling through to legacy validation would reject
         # every v4 profile because most fields are intentionally absent.
         return seeds_schema_validate(profile)
-    if sv == 3:
-        required = required | {"onsite_locations", "remote_regions"}
+
+    if sv == 5:
+        required = base_required | {"remote_locations", "hybrid_locations",
+                                    "onsite_locations"}
+    elif sv == 3:
+        required = (base_required | {"locations", "remote",
+                                     "onsite_locations", "remote_regions"})
+    else:  # v2
+        required = base_required | {"locations", "remote"}
+
     missing = sorted(required - set(profile))
     if missing:
         errs.append(f"missing keys: {missing}")
 
-    if sv not in (2, 3):
-        errs.append("schema_version must equal 2, 3, or 4")
+    if sv not in (2, 3, 5):
+        errs.append("schema_version must equal 2, 3, 4, or 5")
 
     for k in ("ideal_fit_paragraph", "primary_role", "time_zone_band",
               "language", "free_text"):
@@ -374,7 +425,9 @@ def profile_schema_validate(profile: Any) -> list[str]:
               "stack_adjacent", "stack_antipatterns",
               "title_must_match", "title_exclude", "exclude_keywords",
               "exclude_companies", "locations",
-              "onsite_locations", "remote_regions"):
+              "onsite_locations", "remote_regions",
+              "remote_locations", "hybrid_locations",
+              "enabled_sources"):
         if k in profile and not _is_str_list(profile[k]):
             errs.append(f"{k} must be a list of strings")
 
@@ -411,6 +464,7 @@ def profile_schema_validate(profile: Any) -> list[str]:
         "stack_adjacent", "stack_antipatterns",
         "title_must_match", "title_exclude", "exclude_keywords",
         "locations", "onsite_locations", "remote_regions",
+        "remote_locations", "hybrid_locations",
     ]
     for k in lower_fields:
         xs = profile.get(k)
@@ -456,6 +510,7 @@ def profile_schema_validate(profile: Any) -> list[str]:
             fn = ws.get("focus_notes")
             if fn is not None and not isinstance(fn, str):
                 errs.append("focus_notes must be a string")
+        errs.extend(_validate_boards_seeds(seeds.get("boards")))
 
     return errs
 
@@ -463,6 +518,93 @@ def profile_schema_validate(profile: Any) -> list[str]:
 # ---------------------------------------------------------------------------
 # Post-processing (normalize + stamp identity fields)
 # ---------------------------------------------------------------------------
+
+# The three v5 location lists. Each accepts city / country / continent /
+# "earth" tokens at any granularity — Haiku reasons about geographic
+# containment (Madrid ⊂ Spain ⊂ Europe ⊂ Earth) at score time, so the
+# builder must NEVER collapse a coarse token into finer ones.
+_V5_LOCATION_FIELDS = ("remote_locations", "hybrid_locations", "onsite_locations")
+
+# Conservative surface-form alias map. Only collapses unambiguous variant
+# spellings of the SAME granularity (so containment reasoning isn't
+# fragmented across "USA" vs "United States"). Regional synonyms such as
+# "euskadi" vs "basque" are INTENTIONALLY NOT aliased — the user named them
+# verbatim and the scorer treats both as the same region via containment, so
+# there is no correctness gain in rewriting the user's tokens. Two-letter
+# ISO codes are deliberately excluded (too ambiguous: "es" = Spain or Spanish?).
+_LOCATION_ALIASES = {
+    "usa": "united states",
+    "u.s.": "united states",
+    "u.s.a.": "united states",
+    "u.s": "united states",
+    "uk": "united kingdom",
+    "u.k.": "united kingdom",
+    "u.k": "united kingdom",
+    "apac": "asia-pacific",
+    "asia pacific": "asia-pacific",
+    "asia-pacific": "asia-pacific",
+    "latam": "latin america",
+    "emea": "emea",
+}
+
+
+def _normalize_location_preferences(profile: dict[str, Any]) -> dict[str, Any]:
+    """Canonicalize the three v5 location lists. Deliberately lightweight.
+
+    Operations:
+      * lowercase + strip whitespace
+      * alias-map unambiguous variant spellings → canonical token
+        (e.g. "USA"/"U.K." → "united states"/"united kingdom")
+      * de-duplicate within each list (preserve first-seen order)
+      * drop empty-string tokens (after strip/lowercase)
+
+    A field is ONLY touched when it is a list of purely string entries.
+    If the value is not a list, or any entry is non-string, the field is
+    left untouched so profile_schema_validate flags it — never silently
+    drop/coerce malformed model output (that would mask a broken shape
+    as a valid empty list).
+
+    NOT done here (by design — these would re-introduce the bug v5 fixes):
+      * country→city expansion — a "spain" hybrid intent MUST stay "spain"
+        so a Madrid hybrid posting passes (Madrid ⊂ Spain).
+      * macro→country enumeration — Haiku reasons about containment, not
+        token equality, so "europe" must stay "europe".
+      * merging or substituting across the three modes — the lists are
+        INDEPENDENT (a city in onsite_locations but not hybrid_locations
+        must hard-veto hybrid postings there; see prompt rule 14).
+
+    Only touches the v5 fields; legacy v2/v3 profiles (which carry
+    remote_regions/locations/remote instead) are passed through unchanged —
+    their canonicalization happens at projection time in user_profile._project.
+    """
+    if not isinstance(profile, dict):
+        # Defensive: a non-dict (list/int from a malformed model response)
+        # is left untouched — profile_schema_validate will reject it.
+        return profile
+    p = dict(profile)
+    for field in _V5_LOCATION_FIELDS:
+        raw = p.get(field)
+        # Only canonicalize when the field is a list of ONLY strings. If it
+        # isn't a list, or any entry is non-string, leave it untouched so the
+        # validator flags it — never silently drop/coerce malformed model
+        # output (that would mask a broken shape as a valid empty list).
+        if not isinstance(raw, list) or not all(
+            isinstance(t, str) for t in raw
+        ):
+            continue
+        seen: set[str] = set()
+        out: list[str] = []
+        for tok in raw:
+            t = tok.strip().lower()
+            if not t:
+                continue
+            t = _LOCATION_ALIASES.get(t, t)
+            if t not in seen:
+                seen.add(t)
+                out.append(t)
+        p[field] = out
+    return p
+
 
 def _stamp_metadata(
     profile: dict[str, Any],
@@ -515,6 +657,12 @@ def _clip_profile(profile: dict[str, Any]) -> dict[str, Any]:
         if isinstance(queries, list) and len(queries) > _MAX_LINKEDIN_QUERIES:
             li["queries"] = queries[:_MAX_LINKEDIN_QUERIES]
             seeds["linkedin"] = li
+            p["search_seeds"] = seeds
+        boards = seeds.get("boards") or {}
+        bkws = boards.get("keywords")
+        if isinstance(bkws, list) and len(bkws) > _MAX_BOARD_KEYWORDS:
+            boards["keywords"] = bkws[:_MAX_BOARD_KEYWORDS]
+            seeds["boards"] = boards
             p["search_seeds"] = seeds
     return p
 
@@ -616,7 +764,22 @@ def build_profile_sync(
                 model=model,
             )
 
-        errs = profile_schema_validate(parsed)
+        # Canonicalize the three v5 location lists (lowercase/dedupe/alias,
+        # NO country→city expansion — Haiku does containment reasoning)
+        # BEFORE validating: the validator's all-lowercase check would
+        # otherwise reject messy model output ("Europe"/"USA") that the
+        # canonicalizer is specifically meant to clean up.
+        normalized = _normalize_location_preferences(parsed)
+        errs = profile_schema_validate(normalized)
+        # A freshly generated profile MUST be v5. profile_schema_validate
+        # still accepts legacy v2/v3 for LOADING persisted profiles, but a
+        # model that emits a stale shape here ignored the schema — reject
+        # rather than persisting v3 location fields.
+        if normalized.get("schema_version") != 5:
+            errs.append(
+                "newly built profile must have schema_version=5 "
+                f"(got {normalized.get('schema_version')!r})"
+            )
         if errs:
             fctx.set_output({
                 "status": "validation_error",
@@ -633,7 +796,7 @@ def build_profile_sync(
             )
 
         stamped = _stamp_metadata(
-            _clip_profile(parsed),
+            _clip_profile(normalized),
             resume_sha1=resume_sha1,
             prefs_sha1=prefs_sha1,
             model=model,

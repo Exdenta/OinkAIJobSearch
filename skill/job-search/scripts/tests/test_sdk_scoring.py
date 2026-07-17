@@ -32,6 +32,7 @@ Pins:
 from __future__ import annotations
 
 import json
+import re
 import sys
 import types
 from dataclasses import dataclass
@@ -76,10 +77,15 @@ def _brief(j) -> dict:
     return {"external_id": j.external_id, "title": j.title}
 
 
-def _results_json(present) -> str:
-    """The model's assistant text: strict-JSON {"results":[...]}."""
+def _results_json(present_ids) -> str:
+    """The model's assistant text: strict-JSON {"results":[...]}.
+
+    `present_ids` are the ids the PROMPT handed us — since the id-mismatch fix
+    those are opaque per-batch keys ("j1"…"jN"), not external_ids. A real model
+    echoes back what it was given, so the fake does too.
+    """
     items = [{
-        "id": j.external_id,
+        "id": jid,
         "match_score": 4,
         "why_match": "react + ts match",
         "why_mismatch": "",
@@ -89,7 +95,7 @@ def _results_json(present) -> str:
             "salary": "", "visa_support": "",
             "language": "", "standout": "",
         },
-    } for j in present]
+    } for jid in present_ids]
     return json.dumps({"results": items})
 
 
@@ -127,7 +133,9 @@ class _FakeMessages:
         msgs = kwargs.get("messages") or []
         blocks = (msgs[0].get("content") if msgs else []) or []
         suffix_text = blocks[1]["text"] if len(blocks) > 1 else ""
-        present = [j for j in self._parent.all_jobs if j.external_id in suffix_text]
+        # Echo back the ids the prompt actually carried (opaque "j1"…"jN"),
+        # exactly as the model would.
+        present = re.findall(r'"external_id":\s*"([^"]+)"', suffix_text)
         usage = _FakeUsage(
             input_tokens=120,                  # uncached remainder
             output_tokens=80,

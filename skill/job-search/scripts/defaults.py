@@ -33,8 +33,9 @@ DEFAULTS: dict = {
         # Humanitarian + research/academic sources (added 2026-04-30).
         "reliefweb":        True,    # public API — humanitarian sector
         "euraxess":         True,    # EU researcher mobility portal — public API
+        "un_careers":       True,    # public JSON API (filteredV2) + chrome fallback
         "math_ku_phd":      True,    # KU employment RSS — math department
-        "ub_doctoral":      True,    # Univ Barcelona — Claude CLI
+        "ub_doctoral":      True,    # Univ Barcelona — plain HTTP (seu.ub.edu board)
         # Wave 2 sources (added 2026-05-01). 10 live + 3 blocked-stubs.
         # All flipped ON 2026-05-01 per operator request — blocked stubs
         # return [] gracefully so they're cheap to keep enabled (forensic
@@ -44,14 +45,14 @@ DEFAULTS: dict = {
         "tecnoempleo":       True,   # Spain tech RSS
         "ai_jobs_net":       True,   # Curated AI/ML HTML scrape
         "jobs_ac_uk":        True,   # UK/EU academic — HTML search (RSS retired by portal 2026-06; keyword fan-in)
-        "academicpositions": True,   # BLOCKED: Cloudflare BFM (stub returns [])
+        "academicpositions": True,   # apify=proxy+browser actor VERIFIED 2026-07-01 (smoke 5/5, full title/company/url/postedAt via JSON-LD). local backend = Cloudflare-BFM stub ([]). See apify/academicpositions-scraper/README.md
         "ikerbasque":        True,   # Basque research foundation
-        "wellfound":         True,   # BLOCKED: DataDome (stub returns [])
+        "wellfound":         True,   # apify Camoufox actor VERIFIED 2026-07-01 (smoke: 50 listing links + 3/5 detail records w/ full title/company/url/postedAt via JSON-LD — Camoufox anti-fingerprint Firefox beats DataDome where plain Chromium got 0). local backend = DataDome stub ([]). See apify/wellfound-scraper/README.md
         "ycombinator_was":   True,   # YC startup JSON API
         "wttj":              True,   # Welcome to the Jungle — Algolia
         "builtin":           True,   # US-heavy tech HTML scrape
         "impactpool":        True,   # UN/NGO HTML — researcher-friendly
-        "devex":             True,   # International dev — Claude CLI (paywall workaround)
+        "devex":             True,   # International dev — Claude CLI (site-block workaround)
         "justjoinit":        True,   # Polish/CEE tech JSON API — frontend-heavy
         "nofluffjobs":       True,   # Polish/CEE tech JSON API — salary-mandatory
     },
@@ -114,9 +115,13 @@ DEFAULTS: dict = {
     # where Haiku alone was noisy.
     #   ai_two_pass:        master toggle. False → single-pass Sonnet.
     #                       True  → Haiku triage + Sonnet rescore.
-    #   ai_triage_floor:    Haiku score threshold for promotion to Sonnet.
-    #                       2 keeps anything plausibly relevant; raise to
-    #                       3 for an even tighter funnel if cost still high.
+    #   ai_triage_floor:    Triage score threshold for promotion to rescore.
+    #                       Lowered 2→1 on 2026-07-05. A/B on chat 1926270
+    #                       (591 postings, gt=large-rescore>=4): haiku's
+    #                       score-1 band is populated (~16%), so floor=1
+    #                       lifts send-recall .88→.95 (drops ~5% of real sends
+    #                       vs ~12%) for +12pp rescore forwards. Raise to 2/3
+    #                       for a tighter funnel if rescore cost climbs.
     #   ai_triage_ceiling:  Haiku score AT OR ABOVE which the Sonnet rescore
     #                       is SKIPPED — Haiku's verdict is trusted as-is.
     #                       Default 5: Haiku's 5/5 verdicts pass through
@@ -144,8 +149,13 @@ DEFAULTS: dict = {
     #                       call; this knob only controls WHICH Haiku
     #                       verdicts are routed to Sonnet at all.
     "ai_two_pass":        True,
-    "ai_triage_floor":    2,
-    "ai_triage_ceiling":  5,
+    "ai_triage_floor":    1,
+    # Was 5 (trust triage's own 5/5, skip rescore). Raised to 6 (disable the
+    # skip) on 2026-06-27: inflated triage-5s were shipping with NO rescore
+    # second opinion. Ceiling=6 routes EVERY promoted job (incl. 5s) through
+    # the rescore so over-promoted 5s get re-judged. Not a heuristic cap —
+    # the full scoring doctrine still runs on every rescore call.
+    "ai_triage_ceiling":  6,
 
     # Per-batch chunk size. Separate knobs per pass because Haiku and
     # Sonnet have very different latency profiles on this prompt template
@@ -335,8 +345,8 @@ DEFAULTS: dict = {
     # the operator's desktop browser, so it is strictly opt-in and OFF by
     # default — when OFF, every adapter behaves EXACTLY as today (the helper
     # returns []/"" immediately, with NO subprocess spawned).
-    "chrome_agent_fallback_enabled": True,    # ENABLED 2026-06-07. Drives the OPERATOR desktop Chrome via claude -p --chrome; fires only when a source's primary path returns 0 (blocked). Requires the pinned browser below to be running + extension-connected at run time, else degrades to []/"".
-    "chrome_agent_device_id": "3754ee86-8ead-4dd0-9d27-15464be31649",  # pinned to the Windows Chrome used for recon. REQUIRED here because 2 browsers are connected — with "" the agent can't disambiguate and the fallback no-ops. Change to the macOS deviceId (25b32046-d703-4515-911b-dabafb410967) if that one is the always-on machine.
+    "chrome_agent_fallback_enabled": False,   # Production-safe default: do not prompt for operator Chrome access in unattended runs. Enable manually only for interactive recovery.
+    "chrome_agent_device_id": "",             # Empty means use the active connected Chrome; set only when a stable deviceId is known.
     "chrome_agent_timeout_s": 240,            # per-call cap for the agentic browser fetch.
 
     # Per-scrape timeout for Claude-CLI-backed adapters (curated_boards).
@@ -383,6 +393,79 @@ DEFAULTS: dict = {
     "continuous_interval_seconds": 28800,
     "continuous_min_sleep_seconds":  60,
 
+    # ---- Apify fetch backend (apify_fetch.py / apify_compare.py) ------
+    # DEFAULT production fetch backend (FETCH_BACKEND=apify): calls the
+    # project's published Apify actors instead of the in-process
+    # sources/*.py scrapers (that path is now the deprecated fallback,
+    # FETCH_BACKEND=local). apify_compare.py reuses the same module for its
+    # side-by-side A/B report against a throwaway DB.
+    #
+    #   apify_actor_owner    — Apify account that owns the actors. The REST
+    #     actor ref is "<owner>~<actor-name>". Env APIFY_ACTOR_OWNER wins.
+    #   apify_cache_ttl_s    — cacheTtlSeconds passed to every actor, i.e.
+    #     the ACTOR's own internal cache (scoped to that one actor run —
+    #     doesn't span separate scheduled cycles). 1800s matches the
+    #     actor's own default; only apify_compare.py's A/B report should
+    #     override to 0 (cache-bust) since a stale-but-identical cached set
+    #     would bias a repeated comparison.
+    #   apify_result_cache_s — CLIENT-side result cache (search_fetches in
+    #     the local DB), separate from the actor-side one above: it's the
+    #     one that actually spans different runs/callers (staggered users,
+    #     manual /checknow, ...). A dispatch whose (source, query) was
+    #     fetched within this window is replayed from the stored job list
+    #     instead of hitting the actor/site again — the real rate-limit
+    #     relief. 3600s (1h) — shorter than the tightest inter-user stagger
+    #     gap (2h) so no user's cycle gets starved of a source, but still
+    #     absorbs the close-together repeats (overlapping manual triggers,
+    #     retries) that were hammering upstream sites. 0 disables it
+    #     (apify_compare.py's default — a cache hit would bias the A/B).
+    #   apify_run_timeout_s  — per-actor server-side run cap (run-sync).
+    #   apify_workers        — actor calls fanned out in parallel.
+    "apify_actor_owner":     "nomad-agent",
+    "apify_cache_ttl_s":     1800,
+    "apify_result_cache_s":  3600,
+    "apify_run_timeout_s":   600,
+    "apify_workers":         6,
+    #   apify_user_queries — feed the user's per-source queries (from
+    #     profile.search_seeds: boards.keywords, linkedin fallback where
+    #     proven — see apify_fetch.profile_source_queries) into the
+    #     query-array actors on per-user runs (run(only_chat=...), i.e.
+    #     every continuous-searcher cycle). Zero extra actor-starts — the
+    #     array fans out inside one actor run. Off → broad everywhere
+    #     (actor default seeds). Rollback knob for the 2026-07-02 rollout.
+    "apify_user_queries":  True,
+    #   apify_query_sources — single-keyword actors (apify_fetch.
+    #     QUERY_SINGLE_PARAM: un_careers/euraxess/impactpool/infojobs/wttj/
+    #     reliefweb/devex) opted in to per-user query fan-out. DIFFERENT cost
+    #     model from the array actors: each query = one extra actor-start.
+    #     Enable one source at a time only after an apify_compare.py
+    #     --query-ab probe shows a relevance gain for it.
+    #
+    #     PROBED 2026-07-02 (chat 433775883, frontend/react keywords,
+    #     apify_query_fanout_cap=2):
+    #       wttj      — 69/69 title-relevant (Algolia `query` field works
+    #                   cleanly); broad returns generic recent postings. ON.
+    #       infojobs  — BROAD is off-topic noise (drivers/mechanics/sales,
+    #                   Spain HTML board has no keyword filter in the local
+    #                   adapter's broad mode); QUERIES gave 3/6 clearly
+    #                   relevant (front-end/typescript/react titles). ON.
+    #       impactpool — `?q=` param DOES change the response (verified via
+    #                   direct HTTP: different byte length per query), but
+    #                   for an off-domain query ("react" on a UN/NGO board)
+    #                   neither the title NOR the snippet mentions the term —
+    #                   inconclusive with a mismatched profile, NOT a
+    #                   confirmed actor bug like eures was. Needs re-probing
+    #                   with an NGO/policy-domain candidate's boards.keywords
+    #                   (e.g. chat 385675637 after profile rebuild) before a
+    #                   real verdict. Left OFF pending that probe.
+    #       un_careers, euraxess, reliefweb, devex — same NGO/academic
+    #                   domain-mismatch as impactpool (only frontend keywords
+    #                   tested so far); left OFF pending an on-domain probe.
+    #   apify_query_fanout_cap — max queries (= actor-starts) per opted-in
+    #     single-keyword source per cycle.
+    "apify_query_sources": ["wttj", "infojobs"],
+    "apify_query_fanout_cap": 2,
+
     # Adaptive source cooldown (algorithm v2.8, P4 pipeline overhaul).
     # `fetch_all` reads each source's 24h novelty ratio (jobs_new /
     # jobs_seen across the last 24h of `search_fetches` rows) and, when
@@ -406,6 +489,18 @@ DEFAULTS: dict = {
     # threshold. Reset to 0 only on a SUCCESSFUL rebuild so transient
     # CLI / parse failures don't silently consume K events.
     "auto_rebuild_skip_threshold": 5,
+
+    # Feedback-digest loop (feedback_digest.py). Every 👍/👎 tap writes a
+    # `job_feedback` row; `maybe_run_feedback_digest` fires once this many
+    # NEW rows have accumulated since the last digest and asks a cheap
+    # model to rewrite the user's short "preference & veto notes" summary
+    # from scratch (explicit feedback weighed heavily, implicit signals —
+    # applied/skipped/ignored counts — weighed lightly; see
+    # prompts/feedback_digest.txt for the full weighing rules). The notes
+    # are injected into prefs_text at scoring time (search_jobs.py, where
+    # `user_files.read_prefs` is read) via `feedback_digest.
+    # augment_prefs_text`. Kill switch: env FEEDBACK_DIGEST_ENABLED=0.
+    "feedback_digest_threshold": 5,
 
     # ---- M2: closed-loop query optimiser ------------------------------
     # A multi-armed-bandit-style tuner over the user's search_seeds queries.
@@ -448,4 +543,5 @@ DEFAULTS: dict = {
     "query_optimizer_explore_quota": 0.3,
     # Opus call timeout for the mutation step.
     "query_optimizer_timeout_s":   180,
+
 }

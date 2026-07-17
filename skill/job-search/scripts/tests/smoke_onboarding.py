@@ -10,6 +10,14 @@ step:
   • the finalize step stamps onboarding_completed_at and writes
     prefs_free_text + min_match_score into the profile
 
+Flow under test (welcome merged into question 1, CV last + skippable):
+  /start → pitch+seniority → role → remote → location →
+  resume (upload / keep / skip) → done.
+
+Min-score is no longer a wizard step (a new user can't rate matches they
+haven't seen). It defaults to 3 in _finalize; STEP_MINSCORE / CB_MIN_SCORE
+survive only for in-flight legacy wizards, covered by a dedicated case below.
+
 Run:  python skill/job-search/scripts/tests/smoke_onboarding.py
 """
 from __future__ import annotations
@@ -18,6 +26,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -106,6 +115,26 @@ def _assert(cond: bool, msg: str) -> None:
         sys.exit(1)
 
 
+class _CaptureBuilds:
+    """Swap bot._enqueue_profile_rebuild for a recorder around a finalize."""
+
+    def __init__(self) -> None:
+        self.builds: list[tuple[int, str]] = []
+
+    def __enter__(self):
+        import bot as _bot
+        self._bot = _bot
+        self._orig = _bot._enqueue_profile_rebuild
+        _bot._enqueue_profile_rebuild = (
+            lambda tg_, db_, cid_, *, trigger: self.builds.append((cid_, trigger))
+        )
+        return self
+
+    def __exit__(self, *exc):
+        self._bot._enqueue_profile_rebuild = self._orig
+        return False
+
+
 # ---------- The walk ----------
 
 def main() -> int:
@@ -113,9 +142,7 @@ def main() -> int:
     # STICKER_FILE_IDS is populated (as it is post-paste), start() would
     # send a WAVE sticker instead of the Unicode 🐷 — which is correct
     # behavior in prod but makes these assertions flaky depending on
-    # ambient state. The Unicode-fallback path we exercise here still
-    # asserts the core state-machine guarantees; the sticker path has
-    # its own coverage in smoke_pig_stickers.py.
+    # ambient state.
     import pig_stickers as _ps
     _ps.STICKER_FILE_IDS.clear()
 
@@ -125,75 +152,43 @@ def main() -> int:
         tg = FakeTelegramClient()
         chat_id = 777_123
 
-        # Register the user so set_prefs_free_text et al. find a row.
         db.upsert_user(chat_id, username="alex", first_name="Alex", last_name="S")
 
-        # ---- 1. start() with a fresh user sends the animated pig + welcome ----
+        # ---- 1. start(): pig + ONE merged message = pitch + question 1 ----
         ob.start(tg, db, chat_id, first_name="Alex")
-        # Expected: a lone "🐷" first (Telegram auto-animates single-emoji
-        # messages), then the welcome bubble with inline keyboard.
         _assert(len(tg.sent) == 2,
                 f"welcome should send exactly two messages (animated pig + bubble), got {len(tg.sent)}")
         _assert(tg.sent[0]["text"] == "🐷",
                 "first message should be a lone pig for auto-animation")
         welcome = tg.sent[1]
         _assert("Welcome, Alex" in welcome["text"], "welcome should greet by first name")
-        _assert(welcome["reply_markup"] is not None, "welcome should carry inline keyboard")
+        _assert("Seniority" in welcome["text"],
+                "welcome must contain question 1 — no 'Get started' interstitial")
         kb = welcome["reply_markup"]["inline_keyboard"]
-        _assert(any("Get started" in b["text"] for row in kb for b in row),
-                "welcome keyboard should have 'Get started'")
-        state_raw = db.get_onboarding_state(chat_id)
-        state = json.loads(state_raw)
-        _assert(state["step"] == ob.STEP_WELCOME, "step should be 'welcome' after start()")
+        n_sen_buttons = sum(1 for row in kb for b in row
+                            if b.get("callback_data", "").startswith(f"ob:{ob.CB_SENIORITY}"))
+        _assert(n_sen_buttons == 5, f"expected 5 seniority buttons on welcome, got {n_sen_buttons}")
+        _assert(_progress_dot_count(welcome["text"]) == 1,
+                "welcome should show progress step 1 of 5")
+        state = json.loads(db.get_onboarding_state(chat_id))
+        _assert(state["step"] == ob.STEP_SENIORITY,
+                "state should start at 'seniority' — welcome is not a step anymore")
 
-        # ---- 2. tap 'Get started' → advances to STEP_RESUME ----
+        # ---- 2. tap 'Senior' → advances to STEP_ROLE ----
         tg.reset()
         ob.handle_callback(
-            tg, db, _make_cb("cb-1", f"ob:{ob.CB_START}", chat_id, welcome["message_id"]),
-            chat_id, welcome["message_id"], ob.CB_START,
-        )
-        # Expected: 1 edit_reply_markup (clear welcome buttons) + 1 send_message (resume prompt)
-        _assert(len(tg.sent) == 1, f"expected 1 message after 'start' tap, got {len(tg.sent)}")
-        resume_prompt = tg.sent[0]
-        _assert("Upload your CV" in resume_prompt["text"],
-                "should prompt for CV upload")
-        _assert(_progress_dot_count(resume_prompt["text"]) == 1,
-                "progress should show step 1 of 6")
-        state = json.loads(db.get_onboarding_state(chat_id))
-        _assert(state["step"] == ob.STEP_RESUME, "step should advance to 'resume'")
-
-        # ---- 3. simulate CV upload side-effect ----
-        db.set_resume(chat_id, f"{td}/resume.pdf", "Alex is a Senior React Engineer...")
-        tg.reset()
-        advanced = ob.handle_resume_uploaded(tg, db, chat_id)
-        _assert(advanced, "handle_resume_uploaded should advance the wizard")
-        _assert(len(tg.sent) == 2, "should send 'got your CV' + seniority prompt")
-        _assert("Got your CV" in tg.sent[0]["text"], "first message should confirm CV")
-        _assert("Seniority" in tg.sent[1]["text"], "second message should ask seniority")
-        state = json.loads(db.get_onboarding_state(chat_id))
-        _assert(state["step"] == ob.STEP_SENIORITY, "step should be 'seniority'")
-        # Seniority keyboard should have 5 choices (4 buckets + any) + cancel
-        sk = tg.sent[1]["reply_markup"]["inline_keyboard"]
-        n_sen_buttons = sum(1 for row in sk for b in row if b.get("callback_data", "").startswith(f"ob:{ob.CB_SENIORITY}"))
-        _assert(n_sen_buttons == 5, f"expected 5 seniority buttons, got {n_sen_buttons}")
-
-        # ---- 4. tap 'Senior' → advances to STEP_ROLE ----
-        tg.reset()
-        sen_msg_id = 9001  # synthetic
-        ob.handle_callback(
-            tg, db, _make_cb("cb-2", f"ob:{ob.CB_SENIORITY}:senior", chat_id, sen_msg_id),
-            chat_id, sen_msg_id, f"{ob.CB_SENIORITY}:senior",
+            tg, db, _make_cb("cb-2", f"ob:{ob.CB_SENIORITY}:senior", chat_id, welcome["message_id"]),
+            chat_id, welcome["message_id"], f"{ob.CB_SENIORITY}:senior",
         )
         _assert(len(tg.sent) == 1 and "Target role" in tg.sent[0]["text"],
                 "should send role prompt after seniority pick")
         state = json.loads(db.get_onboarding_state(chat_id))
         _assert(state["answers"]["seniority"] == "senior", "seniority stored")
         _assert(state["step"] == ob.STEP_ROLE, "step should be 'role'")
-        # awaiting_state should be set so free-text lands here
         _assert(db.get_awaiting_state(chat_id) == ob.AWAIT_ONBOARDING_ROLE,
                 "awaiting_state should be onboarding_role")
 
-        # ---- 5. send free-text role 'React Engineer' → advances to STEP_REMOTE ----
+        # ---- 3. free-text role → STEP_REMOTE ----
         tg.reset()
         consumed = ob.handle_text_role(tg, db, chat_id, "React Engineer")
         _assert(consumed, "handle_text_role should consume the text")
@@ -203,63 +198,67 @@ def main() -> int:
         _assert(state["step"] == ob.STEP_REMOTE, "step should be 'remote'")
         _assert(db.get_awaiting_state(chat_id) is None, "awaiting_state should clear")
 
-        # ---- 6. tap 'Remote' → advances to STEP_LOCATION ----
+        # ---- 4. tap 'Remote' → STEP_LOCATION ----
         tg.reset()
-        rmt_msg_id = 9002
         ob.handle_callback(
-            tg, db, _make_cb("cb-3", f"ob:{ob.CB_REMOTE}:remote", chat_id, rmt_msg_id),
-            chat_id, rmt_msg_id, f"{ob.CB_REMOTE}:remote",
+            tg, db, _make_cb("cb-3", f"ob:{ob.CB_REMOTE}:remote", chat_id, 9002),
+            chat_id, 9002, f"{ob.CB_REMOTE}:remote",
         )
         _assert("Location" in tg.sent[0]["text"], "should send location prompt")
         state = json.loads(db.get_onboarding_state(chat_id))
         _assert(state["answers"]["remote"] == "remote", "remote stored")
         _assert(state["step"] == ob.STEP_LOCATION, "step should be 'location'")
-        _assert(db.get_awaiting_state(chat_id) == ob.AWAIT_ONBOARDING_LOCATION,
-                "awaiting_state should be onboarding_location")
 
-        # ---- 7. free-text location → advances to STEP_MINSCORE ----
+        # ---- 5. free-text location → STEP_RESUME (min-score is no longer a step) ----
         tg.reset()
         consumed = ob.handle_text_location(tg, db, chat_id, "Remote EU")
         _assert(consumed, "location text consumed")
-        _assert("Minimum match score" in tg.sent[0]["text"], "should send minscore prompt")
+        _assert(len(tg.sent) == 1, "location should send the resume prompt directly")
+        resume_prompt = tg.sent[0]
+        _assert("upload your CV" in resume_prompt["text"],
+                "location must advance straight to the CV upload (last) step")
+        labels = [b["text"] for row in resume_prompt["reply_markup"]["inline_keyboard"] for b in row]
+        _assert("Skip for now" in labels, "resume step must be skippable")
+        _assert(_progress_dot_count(resume_prompt["text"]) == 5,
+                "resume prompt should show step 5 of 5")
         state = json.loads(db.get_onboarding_state(chat_id))
         _assert(state["answers"]["location"] == "Remote EU", "location stored")
-        _assert(state["step"] == ob.STEP_MINSCORE, "step should be 'minscore'")
+        _assert("min_score" not in state["answers"],
+                "fresh flow must NOT collect a min_score answer")
+        _assert(state["step"] == ob.STEP_RESUME, "step should be 'resume' (last)")
+        # Funnel breadcrumb: every step the user landed on is logged in order,
+        # with no duplicate consecutive entries, for the ops problems report.
+        hist_steps = [h["step"] for h in state.get("history", [])]
+        _assert(hist_steps == [ob.STEP_WELCOME, ob.STEP_SENIORITY, ob.STEP_ROLE,
+                               ob.STEP_REMOTE, ob.STEP_LOCATION, ob.STEP_RESUME],
+                f"history should record each step transition in order, got {hist_steps}")
 
-        # ---- 8. tap 'ms:3' → finalizes the wizard ----
+        # ---- 6. CV upload finalizes the wizard (no min_score answer → default 3) ----
+        db.set_resume(chat_id, f"{td}/resume.pdf", "Alex is a Senior React Engineer...")
         tg.reset()
-        ms_msg_id = 9003
-        on_complete_called = []
-        on_run_search_called = []
-        # Capture the deferred Opus build enqueue instead of running a real
-        # one. finalize MUST kick this — the wizard defers the resume_upload
-        # build to its final step, and a regression where finalize forgot to
-        # do it left every onboarded user with a seed-less skeleton profile.
-        import bot as _bot
-        enqueued_builds: list[tuple[int, str]] = []
-        _orig_enqueue = _bot._enqueue_profile_rebuild
-        _bot._enqueue_profile_rebuild = (
-            lambda tg_, db_, cid_, *, trigger: enqueued_builds.append((cid_, trigger))
-        )
-        ob.handle_callback(
-            tg, db, _make_cb("cb-4", f"ob:{ob.CB_MIN_SCORE}:3", chat_id, ms_msg_id),
-            chat_id, ms_msg_id, f"{ob.CB_MIN_SCORE}:3",
-            on_complete=lambda cid: on_complete_called.append(cid),
-            on_run_search=lambda cid: on_run_search_called.append(cid),
-        )
-        _bot._enqueue_profile_rebuild = _orig_enqueue
-        # Expected: 1 summary message with the two-button final keyboard
+        on_complete_called: list[int] = []
+        on_run_search_called: list[int] = []
+        with _CaptureBuilds() as cap:
+            advanced = ob.handle_resume_uploaded(
+                tg, db, chat_id,
+                on_complete=lambda cid: on_complete_called.append(cid),
+                on_run_search=lambda cid: on_run_search_called.append(cid),
+            )
+        _assert(advanced, "handle_resume_uploaded should consume the upload")
+        _assert(any("Got your CV" in s["text"] for s in tg.sent),
+                "should confirm the CV")
         summaries = [s for s in tg.sent if "Setup complete" in s["text"]]
         _assert(summaries, f"no summary found; sent={[s['text'][:40] for s in tg.sent]}")
         summary = summaries[0]
-        kb = summary["reply_markup"]["inline_keyboard"]
-        labels = [b["text"] for row in kb for b in row]
-        _assert("Run a search now" in labels, "summary should have 'Run a search now'")
-        _assert("I'll wait for tomorrow" in labels, "summary should have wait option")
+        _assert(summary["reply_markup"] is None,
+                "summary must have NO inline buttons — the search auto-runs now")
         _assert(on_complete_called == [chat_id], "on_complete should fire with chat_id")
+        # The whole point of task 2: finalize auto-fires the first search, once,
+        # without the user tapping anything.
+        _assert(on_run_search_called == [chat_id],
+                f"finalize should auto-fire on_run_search exactly once, got {on_run_search_called}")
 
-        # DB side-effects: prefs_free_text populated, profile has min_match_score,
-        # onboarding_completed_at stamped, onboarding_state cleared.
+        # DB side-effects.
         prefs = db.get_prefs_free_text(chat_id)
         _assert(prefs and "React Engineer" in prefs and "senior" in prefs,
                 f"prefs should mention role+seniority, got: {prefs!r}")
@@ -269,49 +268,41 @@ def main() -> int:
         _assert(int(profile.get("min_match_score") or 0) == 3,
                 f"min_match_score should be 3, got {profile.get('min_match_score')}")
         # The AUTHORITATIVE ⭐ gate is the DB column, not the profile JSON.
-        # This is the fix: onboarding must write it there or the user's
-        # chosen floor silently never applies (gate falls back to default).
         _assert(db.get_min_match_score(chat_id) == 3,
-                f"DB min_match_score column should be 3 (the gate the search "
-                f"reads), got {db.get_min_match_score(chat_id)}")
-        # And finalize must have kicked the deferred Opus build, exactly once,
-        # with the 'onboarding' trigger — otherwise the user is stuck with the
-        # seed-less skeleton and LinkedIn/seeded web_search never run for them.
-        _assert(enqueued_builds == [(chat_id, "onboarding")],
-                f"finalize must enqueue one 'onboarding' profile build, "
-                f"got {enqueued_builds}")
+                f"DB min_match_score column should be 3, got {db.get_min_match_score(chat_id)}")
+        # finalize must kick the deferred Opus build, exactly once.
+        _assert(cap.builds == [(chat_id, "onboarding")],
+                f"finalize must enqueue one 'onboarding' profile build, got {cap.builds}")
         _assert(db.get_onboarding_completed_at(chat_id) is not None,
                 "onboarding_completed_at should be set")
         _assert(db.get_onboarding_state(chat_id) is None,
                 "onboarding_state should be cleared post-finalize")
 
-        # ---- 9. tap 'Run a search now' → on_run_search fires ----
+        # ---- 8. legacy summary card: an old 'ob:runsearch' button still fires ----
+        # New summaries carry no buttons, but cards already on users' screens do.
+        # The handler must keep working past finalize (state is cleared by now).
         tg.reset()
-        on_run_search_called.clear()
-        summary_msg_id = summary["message_id"]
+        legacy_run_called: list[int] = []
         ob.handle_callback(
-            tg, db, _make_cb("cb-5", f"ob:{ob.CB_RUN_SEARCH}", chat_id, summary_msg_id),
-            chat_id, summary_msg_id, ob.CB_RUN_SEARCH,
-            on_complete=lambda cid: on_complete_called.append(cid),
-            on_run_search=lambda cid: on_run_search_called.append(cid),
+            tg, db, _make_cb("cb-5", f"ob:{ob.CB_RUN_SEARCH}", chat_id, summary["message_id"]),
+            chat_id, summary["message_id"], ob.CB_RUN_SEARCH,
+            on_run_search=lambda cid: legacy_run_called.append(cid),
         )
-        _assert(on_run_search_called == [chat_id], "on_run_search should fire")
+        _assert(legacy_run_called == [chat_id],
+                "legacy ob:runsearch callback must still fire on_run_search")
 
-        # ---- 10. second /start does NOT restart the wizard for a completed user ----
+        # ---- 9. second /start does NOT restart the wizard for a completed user ----
         tg.reset()
         ob.start(tg, db, chat_id, first_name="Alex")
         _assert(len(tg.sent) == 0,
-                "completed user should get no welcome from onboarding.start() "
-                "(the bot handler shows welcome-back itself)")
+                "completed user should get no welcome from onboarding.start()")
 
-        # ---- 11. cancel path: fresh user, start, then cancel ----
+        # ---- 10. cancel path: fresh user, start, then cancel from welcome ----
         tg.reset()
         chat2 = 777_999
         db.upsert_user(chat2, first_name="Pat")
         ob.start(tg, db, chat2, first_name="Pat")
-        # start() now emits the animated pig first (tg.sent[0]); the welcome
-        # bubble is at index 1.
-        welcome2 = tg.sent[1]
+        welcome2 = tg.sent[1]   # sent[0] is the animated-pig preface
         tg.reset()
         ob.handle_callback(
             tg, db, _make_cb("cb-cancel", f"ob:{ob.CB_CANCEL}", chat2, welcome2["message_id"]),
@@ -321,11 +312,10 @@ def main() -> int:
         _assert(db.get_onboarding_completed_at(chat2) is None,
                 "cancel should NOT mark complete")
 
-        # ---- 12. maybe_resume: stale state gets replayed ----
+        # ---- 11. maybe_resume: stale state gets replayed ----
         tg.reset()
         chat3 = 777_555
         db.upsert_user(chat3)
-        # Fake a stale mid-wizard state
         stale = {
             "step": ob.STEP_SENIORITY,
             "answers": {},
@@ -335,82 +325,216 @@ def main() -> int:
         db.set_onboarding_state(chat3, json.dumps(stale))
         resumed = ob.maybe_resume(tg, db, chat3)
         _assert(resumed, "maybe_resume should fire on stale state")
-        # Should send the ping + re-send the seniority prompt.
         _assert(any("Seniority" in s["text"] for s in tg.sent),
                 "maybe_resume should re-send the seniority prompt")
 
-        # ---- 13. returning user with CV on file: resume step shows Keep/Upload-new ----
+        # ---- 12. legacy 'Get started' button routes to question 1 ----
         tg.reset()
         chat4 = 777_111
         db.upsert_user(chat4, first_name="Jamie")
-        # Simulate a user who uploaded a CV under the old bot but never
-        # completed onboarding — exactly the case the original bug hit.
-        db.set_resume(chat4, f"{td}/old_resume.pdf",
-                      "Jamie has 4 years of Python experience...")
-        ob.start(tg, db, chat4, first_name="Jamie")
-        welcome4 = tg.sent[1]   # sent[0] is the animated-pig preface
-        tg.reset()
+        legacy = {"step": ob.STEP_WELCOME, "answers": {},
+                  "started_at": time.time(), "last_step_at": time.time()}
+        db.set_onboarding_state(chat4, json.dumps(legacy))
         ob.handle_callback(
-            tg, db, _make_cb("cb-13a", f"ob:{ob.CB_START}", chat4, welcome4["message_id"]),
-            chat4, welcome4["message_id"], ob.CB_START,
-        )
-        _assert(len(tg.sent) == 1, "should send exactly one message after 'start' tap")
-        resume_review = tg.sent[0]
-        _assert("Your CV" in resume_review["text"], "should render resume-review heading")
-        # The filename renders through mdv2_escape, which backslash-escapes
-        # both '_' and '.', so the raw "old_resume.pdf" won't appear
-        # literally — match on the MDv2-escaped form.
-        _assert("old\\_resume\\.pdf" in resume_review["text"],
-                f"review prompt should name the existing CV, got: {resume_review['text']!r}")
-        kb = resume_review["reply_markup"]["inline_keyboard"]
-        labels = [b["text"] for row in kb for b in row]
-        _assert("Keep this CV" in labels, "should offer 'Keep this CV' button")
-        state = json.loads(db.get_onboarding_state(chat4))
-        _assert(state["step"] == ob.STEP_RESUME,
-                "step should be RESUME (no silent skip)")
-
-        # Tap "Keep this CV" → advances to seniority without a new upload.
-        tg.reset()
-        ob.handle_callback(
-            tg, db, _make_cb("cb-13b", f"ob:{ob.CB_KEEP_CV}", chat4, resume_review["message_id"]),
-            chat4, resume_review["message_id"], ob.CB_KEEP_CV,
+            tg, db, _make_cb("cb-legacy", f"ob:{ob.CB_START}", chat4, 9010),
+            chat4, 9010, ob.CB_START,
         )
         _assert(any("Seniority" in s["text"] for s in tg.sent),
-                "Keep-CV should advance to seniority")
+                "legacy Get-started should land on the seniority question")
         state = json.loads(db.get_onboarding_state(chat4))
-        _assert(state["step"] == ob.STEP_SENIORITY, "step should be SENIORITY after keep")
+        _assert(state["step"] == ob.STEP_SENIORITY, "legacy start routes to seniority")
 
-        # ---- 14. returning user who uploads a replacement advances normally ----
+        # ---- 13. skip-CV path finalizes without a resume ----
+        tg.reset()
+        skip_state = {"step": ob.STEP_RESUME,
+                      "answers": {"seniority": "mid", "role": "", "remote": "any",
+                                  "location": "", "min_score": 2},
+                      "started_at": time.time(), "last_step_at": time.time()}
+        db.set_onboarding_state(chat4, json.dumps(skip_state))
+        with _CaptureBuilds() as cap:
+            ob.handle_callback(
+                tg, db, _make_cb("cb-skipcv", f"ob:{ob.CB_SKIP_CV}", chat4, 9011),
+                chat4, 9011, ob.CB_SKIP_CV,
+            )
+        _assert(any("Setup complete" in s["text"] for s in tg.sent),
+                "Skip-CV should finalize with the summary")
+        _assert(cap.builds == [(chat4, "onboarding")],
+                "Skip-CV finalize must still enqueue the profile build")
+        _assert(db.get_onboarding_completed_at(chat4) is not None,
+                "Skip-CV should stamp completion")
+
+        # ---- 14. returning user with CV on file: last step shows Keep/Replace ----
         tg.reset()
         chat5 = 777_222
         db.upsert_user(chat5, first_name="Sam")
-        db.set_resume(chat5, f"{td}/sam_old.pdf", "Sam old...")
-        ob.start(tg, db, chat5, first_name="Sam")
-        welcome5 = tg.sent[1]   # sent[0] is the animated-pig preface
+        db.set_resume(chat5, f"{td}/old_resume.pdf",
+                      "Sam has 4 years of Python experience...")
+        review_state = {"step": ob.STEP_RESUME,
+                        "answers": {"seniority": "mid", "min_score": 3},
+                        "started_at": time.time(), "last_step_at": time.time()}
+        db.set_onboarding_state(chat5, json.dumps(review_state))
+        ob.start(tg, db, chat5, first_name="Sam")   # resumes at the resume step
+        review = tg.sent[-1]
+        _assert("Your CV" in review["text"], "should render resume-review heading")
+        # mdv2_escape backslash-escapes '_' and '.', so match the escaped form.
+        _assert("old\\_resume\\.pdf" in review["text"],
+                f"review prompt should name the existing CV, got: {review['text']!r}")
+        labels = [b["text"] for row in review["reply_markup"]["inline_keyboard"] for b in row]
+        _assert("Keep this CV" in labels, "should offer 'Keep this CV' button")
+
+        # Tap "Keep this CV" → finalizes (resume is the last step now).
+        tg.reset()
+        with _CaptureBuilds() as cap:
+            ob.handle_callback(
+                tg, db, _make_cb("cb-keepcv", f"ob:{ob.CB_KEEP_CV}", chat5, review["message_id"]),
+                chat5, review["message_id"], ob.CB_KEEP_CV,
+            )
+        _assert(any("Setup complete" in s["text"] for s in tg.sent),
+                "Keep-CV should finalize with the summary")
+        _assert(db.get_onboarding_completed_at(chat5) is not None,
+                "Keep-CV should stamp completion")
+
+        # ---- 14b. legacy in-flight wizard parked at STEP_MINSCORE still works ----
+        # New users never reach this step, but wizards started before the
+        # min-score question was removed may be parked here, with old 'ms:'
+        # pickers live on screen. Both must keep working: a replay must not
+        # crash, and an old picker tap must store the score and move on.
+        tg.reset()
+        chatL = 778_000
+        db.upsert_user(chatL, first_name="Lee")
+        legacy_ms = {"step": ob.STEP_MINSCORE,
+                     "answers": {"seniority": "mid", "role": "Dev",
+                                 "remote": "any", "location": "Berlin"},
+                     "started_at": time.time(), "last_step_at": time.time()}
+        db.set_onboarding_state(chatL, json.dumps(legacy_ms))
+        # (a) replaying the prompt for a parked STEP_MINSCORE must not crash.
+        ob._send_step_prompt(tg, db, chatL, ob.STEP_MINSCORE)
+        _assert(any("Minimum match score" in s["text"] for s in tg.sent),
+                "legacy STEP_MINSCORE replay should re-render the picker, not crash")
+        # (b) tapping an old 'ms:4' picker stores the score and advances to resume.
         tg.reset()
         ob.handle_callback(
-            tg, db, _make_cb("cb-14a", f"ob:{ob.CB_START}", chat5, welcome5["message_id"]),
-            chat5, welcome5["message_id"], ob.CB_START,
+            tg, db, _make_cb("cb-legms", f"ob:{ob.CB_MIN_SCORE}:4", chatL, 9020),
+            chatL, 9020, f"{ob.CB_MIN_SCORE}:4",
         )
-        # Simulate a fresh upload overwriting the file
-        db.set_resume(chat5, f"{td}/sam_new.pdf", "Sam newly rewrote everything...")
-        tg.reset()
-        advanced = ob.handle_resume_uploaded(tg, db, chat5)
-        _assert(advanced, "replacement upload should advance the wizard")
-        state = json.loads(db.get_onboarding_state(chat5))
-        _assert(state["step"] == ob.STEP_SENIORITY,
-                "step should advance to SENIORITY after replacement upload")
+        _assert(any("upload your CV" in s["text"] for s in tg.sent),
+                "legacy ms pick should advance to the resume step")
+        state = json.loads(db.get_onboarding_state(chatL))
+        _assert(state["answers"]["min_score"] == 4, "legacy ms pick stored")
+        _assert(state["step"] == ob.STEP_RESUME, "legacy ms pick advances to resume")
 
-        print("PASS  — 17 assertions across fresh flow, re-entry, cancel, resume, "
-              "and existing-CV review")
+        # ---- 15. proactive nudge: one ping per stalled wizard, then silence ----
+        tg.reset()
+        chat6 = 777_333
+        db.upsert_user(chat6, first_name="Kim")
+        stalled = {"step": ob.STEP_WELCOME, "answers": {},   # legacy welcome-stuck user
+                   "started_at": time.time() - 5 * 3600,
+                   "last_step_at": time.time() - 5 * 3600}   # inside the nudge window
+        db.set_onboarding_state(chat6, json.dumps(stalled))
+        n = ob.nudge_stalled(tg, db)
+        _assert(n == 1, f"exactly one user should be nudged, got {n}")
+        _assert(any("Still with me" in s["text"] for s in tg.sent),
+                "nudge should send the re-engagement ping")
+        _assert(any("Seniority" in s["text"] for s in tg.sent),
+                "nudge should replay the pending question (welcome→seniority)")
+        state = json.loads(db.get_onboarding_state(chat6))
+        _assert(state.get("nudged") is True, "nudged flag should persist")
+        tg.reset()
+        n = ob.nudge_stalled(tg, db)
+        _assert(n == 0, f"second pass must not re-nudge, got {n}")
+        # Too-fresh and too-old wizards are both left alone.
+        chat7 = 777_444
+        db.upsert_user(chat7)
+        fresh = {"step": ob.STEP_ROLE, "answers": {},
+                 "started_at": time.time(), "last_step_at": time.time()}
+        db.set_onboarding_state(chat7, json.dumps(fresh))
+        chat8 = 777_666
+        db.upsert_user(chat8)
+        ancient = {"step": ob.STEP_ROLE, "answers": {},
+                   "started_at": 0.0, "last_step_at": 0.0}
+        db.set_onboarding_state(chat8, json.dumps(ancient))
+        tg.reset()
+        n = ob.nudge_stalled(tg, db)
+        _assert(n == 0, f"fresh + ancient wizards must not be nudged, got {n}")
+
+        # ---- 18. localization: 'es' user gets translated welcome + button labels,
+        # callback_data untouched; 'en'/None byte-identical; failure → English;
+        # cache means a repeat send calls the translator zero extra times. ----
+        _orig_llm_tr = ob._llm_translate
+        tr_calls: list[tuple[str, str]] = []
+
+        # Marker uses letters only — MarkdownV2 escapes '[]', so a bracketed
+        # marker would survive in plain button labels but appear as '\[..\]' in
+        # escaped prose. 'XXesXX' has no MDv2-special chars and reads identically
+        # in both places.
+        def _fake_llm_tr(text, lang):
+            tr_calls.append((text, lang))
+            return f"XX{lang}XX{text}"        # deterministic fake translation
+
+        # (a) 'es' user: welcome copy + button labels translated, callback_data intact.
+        ob._llm_translate = _fake_llm_tr
+        chatES = 780_000
+        db.upsert_user(chatES, first_name="Eva", language_code="es")
+        tg.reset()
+        ob.start(tg, db, chatES, first_name="Eva")
+        welcome_es = tg.sent[1]
+        _assert("XXesXX" in welcome_es["text"],
+                "es welcome copy should be translated")
+        # First name is user data — never sent through the translator.
+        _assert("Eva" in welcome_es["text"], "es welcome must keep the untranslated name")
+        es_labels = [b["text"] for row in welcome_es["reply_markup"]["inline_keyboard"] for b in row]
+        _assert(all(l.startswith("XXesXX") for l in es_labels),
+                f"es button labels should be translated, got {es_labels}")
+        es_cbs = [b["callback_data"] for row in welcome_es["reply_markup"]["inline_keyboard"] for b in row]
+        _assert(all(c.startswith("ob:") and "XXesXX" not in c for c in es_cbs),
+                f"callback_data must stay untouched, got {es_cbs}")
+        calls_after_first = len(tr_calls)
+        _assert(calls_after_first > 0, "es welcome should have hit the translator")
+
+        # (b) cache: re-sending the same step calls the translator ZERO extra times.
+        tg.reset()
+        ob._send_step_prompt(tg, db, chatES, ob.STEP_SENIORITY)
+        _assert(len(tr_calls) == calls_after_first,
+                f"cached strings must not re-hit the translator, "
+                f"grew {calls_after_first}->{len(tr_calls)}")
+        _assert(any("XXesXX" in s["text"] for s in tg.sent),
+                "cached re-send must still render translated copy")
+
+        # (c) 'en' and None users are byte-identical to no-translator output.
+        for lang in ("en", "en-GB", None):
+            chatEn = 780_100 + (hash(str(lang)) % 500)
+            db.upsert_user(chatEn, first_name="Ed", language_code=lang)
+            tg.reset()
+            ob.start(tg, db, chatEn, first_name="Ed")
+            got = tg.sent[1]["text"]
+            expected = ob._welcome_mdv2("Ed")          # no tr → today's English
+            _assert(got == expected,
+                    f"lang={lang!r} welcome must be byte-identical to English")
+            en_calls = len(tr_calls)
+            _assert(en_calls == calls_after_first,
+                    f"lang={lang!r} must make zero translator calls")
+
+        # (d) translator failure → English exactly as today (fail-open, no cache write).
+        ob._llm_translate = lambda text, lang: (_ for _ in ()).throw(RuntimeError("boom"))
+        chatBoom = 781_000
+        db.upsert_user(chatBoom, first_name="Bo", language_code="ru")
+        tg.reset()
+        ob.start(tg, db, chatBoom, first_name="Bo")
+        boom_txt = tg.sent[1]["text"]
+        _assert(boom_txt == ob._welcome_mdv2("Bo"),
+                "translator exception → English welcome, byte-identical to today")
+
+        ob._llm_translate = _orig_llm_tr
+
+        print("PASS  — fresh flow (welcome=Q1, no min-score step, CV last), "
+              "legacy min-score wizard, skip-CV, keep-CV, legacy start, "
+              "cancel, resume, and proactive nudge")
         return 0
 
 
 def _progress_dot_count(text: str) -> int:
     """Count filled dots in the rendered progress indicator. Uses the
     same '●' char the onboarding module emits."""
-    # The indicator renders inside a monospace code block; we just count
-    # occurrences in the whole text which is unique enough.
     return text.count("●")
 
 

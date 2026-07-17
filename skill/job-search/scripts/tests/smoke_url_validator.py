@@ -170,10 +170,10 @@ def test_end_to_end_digest_gating() -> None:
     # Isolated forensic dir so we can read back what was logged.
     td = tempfile.mkdtemp()
     os.environ["STATE_DIR"] = td
+os.environ["HIRING_CONTACT_OFF"] = "1"
     os.environ.pop("FORENSIC_OFF", None)
     os.environ.pop("FORENSIC_FULL", None)
     os.environ.pop("URL_VALIDATION_OFF", None)
-    os.environ["HIRING_CONTACT_OFF"] = "1"
     # Reload forensic so the env override takes effect.
     for mod in ("forensic", "telegram_client"):
         if mod in sys.modules:

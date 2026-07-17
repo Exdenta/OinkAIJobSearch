@@ -63,8 +63,6 @@ spawning anything, so this adapter's observable behavior is byte-for-byte
 identical to the historic DataDome stub — it still probes, logs the block
 reason, and returns ``[]``. Zero regression.
 
-Module key: wellfound  (default OFF — do not enable in filters.yaml)
-
 Apify fallback (opt-in, default OFF)
 -------------------------------------
 When the operator sets the `APIFY_TOKEN` env var, `fetch()` tries the
@@ -73,6 +71,8 @@ residential proxy, already clears DataDome — see
 https://apify.com/nomad-agent/wellfound-scraper). Its dataset items are
 mapped straight to `Job`. With `APIFY_TOKEN` unset, this path is never
 invoked and behavior is byte-for-byte the historic stub.
+
+Module key: wellfound  (default OFF — do not enable in filters.yaml)
 """
 from __future__ import annotations
 

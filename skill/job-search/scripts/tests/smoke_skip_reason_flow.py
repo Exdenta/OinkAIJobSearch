@@ -387,29 +387,34 @@ def test_safety_block_rejects_and_clears_state() -> None:
         os.environ.pop("SKIP_FEEDBACK_ENABLED", None)
 
 
-def test_default_disabled_keeps_original_skip_behavior() -> None:
-    section("5. SKIP_FEEDBACK_ENABLED=0 (default) → no prompt, no state, original skip flow only")
-    os.environ.pop("SKIP_FEEDBACK_ENABLED", None)  # default = off
-    bot = _import_bot_fresh()
-    _patch_error_capture(bot)
+def test_kill_switch_disables_followup() -> None:
+    section("5. SKIP_FEEDBACK_ENABLED=0 (explicit kill switch) → no prompt, no state, original skip flow only")
+    # SKIP_FEEDBACK_ENABLED now defaults to ON (👍/👎 rollout) — this test
+    # exercises the explicit kill switch, not the implicit default.
+    os.environ["SKIP_FEEDBACK_ENABLED"] = "0"
+    try:
+        bot = _import_bot_fresh()
+        _patch_error_capture(bot)
 
-    tg = FakeTG(delete_returns=True)
-    db = FakeDB()
-    cb = _make_cb(chat_id=123, msg_id=456, kind="n", job_id="job-5")
+        tg = FakeTG(delete_returns=True)
+        db = FakeDB()
+        cb = _make_cb(chat_id=123, msg_id=456, kind="n", job_id="job-5")
 
-    bot.handle_callback(tg, db, cb)
+        bot.handle_callback(tg, db, cb)
 
-    _assert(db.status_writes == [(123, "job-5", "skipped")],
-            "DB wrote skipped status")
-    _assert(tg.delete_calls == [(123, 456)],
-            "delete_message was called (existing behaviour preserved)")
-    _assert(tg.send_messages == [],
-            f"NO prompt message sent (got {tg.send_messages!r})")
-    _assert(db.get_awaiting_state(123) is None,
-            f"NO awaiting state set (got {db.get_awaiting_state(123)!r})")
-    _assert(len(tg.callback_answers) == 1
-            and tg.callback_answers[0][1] == "✕ Removed",
-            f"toast unchanged (got {tg.callback_answers!r})")
+        _assert(db.status_writes == [(123, "job-5", "skipped")],
+                "DB wrote skipped status")
+        _assert(tg.delete_calls == [(123, 456)],
+                "delete_message was called (existing behaviour preserved)")
+        _assert(tg.send_messages == [],
+                f"NO prompt message sent (got {tg.send_messages!r})")
+        _assert(db.get_awaiting_state(123) is None,
+                f"NO awaiting state set (got {db.get_awaiting_state(123)!r})")
+        _assert(len(tg.callback_answers) == 1
+                and tg.callback_answers[0][1] == "✕ Removed",
+                f"toast unchanged (got {tg.callback_answers!r})")
+    finally:
+        os.environ.pop("SKIP_FEEDBACK_ENABLED", None)
 
 
 def main() -> int:
@@ -418,7 +423,7 @@ def main() -> int:
     test_free_text_reply_calls_skip_feedback()
     test_skip_reply_does_not_call_skip_feedback()
     test_safety_block_rejects_and_clears_state()
-    test_default_disabled_keeps_original_skip_behavior()
+    test_kill_switch_disables_followup()
     print("\nALL OK")
     return 0
 

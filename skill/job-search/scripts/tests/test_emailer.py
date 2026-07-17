@@ -39,8 +39,18 @@ class _FakeSMTP:
     def send_message(self, msg):
         if type(self).raise_on_send:
             raise RuntimeError("relay refused")
+        # Messages may be multipart (plain + HTML alternative) — record
+        # both parts so tests can assert on either.
+        plain_part = msg.get_body(preferencelist=("plain",))
+        html_part = msg.get_body(preferencelist=("html",))
+        plain = plain_part.get_content() if plain_part is not None else ""
+        html = (
+            html_part.get_content()
+            if html_part is not None and html_part is not plain_part
+            else None
+        )
         type(self).calls.append(
-            ("send", msg["From"], msg["To"], msg["Subject"], msg.get_content())
+            ("send", msg["From"], msg["To"], msg["Subject"], plain, html)
         )
 
     def quit(self):
@@ -90,12 +100,12 @@ def test_send_starttls_happy_path(monkeypatch):
 
 
 def test_send_ssl_skips_starttls(monkeypatch):
-    _configure(monkeypatch, OINK_SMTP_SECURITY="ssl", OINK_SMTP_FROM="hi@oink.app")
+    _configure(monkeypatch, OINK_SMTP_SECURITY="ssl", OINK_SMTP_FROM="hi@hryu.app")
     assert emailer.send_email("user@example.com", "S", "B") is True
     kinds = [c[0] for c in _FakeSMTP.calls]
     assert "starttls" not in kinds
     send = next(c for c in _FakeSMTP.calls if c[0] == "send")
-    assert send[1] == "hi@oink.app"
+    assert send[1] == "hi@hryu.app"
 
 
 def test_send_failure_returns_false(monkeypatch):
@@ -132,14 +142,14 @@ def _enrichments():
 
 def test_digest_email_happy_path_and_rate_limit(monkeypatch, tmp_path):
     _configure(monkeypatch)
-    monkeypatch.setenv("OINK_PUBLIC_URL", "https://oink.app")
+    monkeypatch.setenv("OINK_PUBLIC_URL", "https://hryu.app")
     db, chat_id = _web_user(tmp_path)
 
     assert emailer.maybe_send_web_digest_email(db, chat_id, _jobs(), _enrichments()) is True
     send = next(c for c in _FakeSMTP.calls if c[0] == "send")
     assert "2" in send[3]                       # subject mentions the count
     assert "React Engineer" in send[4]
-    assert "https://oink.app/" in send[4]
+    assert "https://hryu.app/" in send[4]
     assert db.get_last_email_notified_at(chat_id) is not None
 
     # Second run inside the min interval → suppressed.
@@ -175,3 +185,100 @@ def test_digest_email_gates(monkeypatch, tmp_path):
 
     # Happy path still works after all that.
     assert emailer.maybe_send_web_digest_email(db, chat_id, _jobs(), _enrichments()) is True
+
+
+# ---------------------------------------------------------------------------
+# Digest content — full cards for every job, plain + HTML
+# ---------------------------------------------------------------------------
+
+def _full_job(i: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        job_id=f"j{i}",
+        title=f"Backend Engineer {i}",
+        company=f"Corp{i}",
+        location="Berlin, Germany",
+        salary="",
+        url=f"https://jobs.example.com/{i}",
+        snippet=f"Snippet for role {i} with plenty of context.",
+        source="linkedin",
+    )
+
+
+def _full_enrichment(i: int, score: int) -> dict:
+    return {
+        "match_score": score,
+        "why_match": f"Strong Python overlap for role {i}",
+        "why_mismatch": "Salary unstated",
+        "key_details": {
+            "stack": "Python, FastAPI",
+            "seniority": "Senior",
+            "remote_policy": "remote (EU)",
+            "location": "Berlin",
+            "salary": "€80–95k",
+            "visa_support": "yes",
+            "language": "English",
+            "standout": "4-day work week",
+        },
+    }
+
+
+def test_digest_email_includes_all_jobs_full_cards(monkeypatch, tmp_path):
+    """No top-N cap: every job of the run lands in the email with its
+    full card — rationale, chips, snippet, link, source."""
+    _configure(monkeypatch)
+    monkeypatch.setenv("OINK_PUBLIC_URL", "https://oink.test")
+    db, chat_id = _web_user(tmp_path)
+
+    jobs = [_full_job(i) for i in range(1, 8)]  # 7 jobs — past the old cap of 5
+    enrichments = {f"j{i}": _full_enrichment(i, score=(i % 5) + 1) for i in range(1, 8)}
+
+    assert emailer.maybe_send_web_digest_email(db, chat_id, jobs, enrichments) is True
+    send = next(c for c in _FakeSMTP.calls if c[0] == "send")
+    subject, plain, html = send[3], send[4], send[5]
+
+    assert "7" in subject
+    for i in range(1, 8):
+        assert f"Backend Engineer {i}" in plain
+        assert f"Backend Engineer {i}" in html
+        assert f"https://jobs.example.com/{i}" in plain
+        assert f"https://jobs.example.com/{i}" in html
+    # Card details present in both parts.
+    assert "Strong Python overlap" in plain and "Strong Python overlap" in html
+    assert "Salary unstated" in plain and "Salary unstated" in html
+    assert "Python, FastAPI" in plain and "Python, FastAPI" in html
+    assert "visa support" in plain
+    assert "4-day work week" in plain and "4-day work week" in html
+    assert "Snippet for role 3" in plain and "Snippet for role 3" in html
+    assert "via linkedin" in plain
+    assert "https://oink.test/" in plain and "https://oink.test/" in html
+    # Sorted best-fit first: a 5/5 job precedes a 1/5 job in the body.
+    five = plain.index("5/5 match")
+    one = plain.index("1/5 match")
+    assert five < one
+
+
+def test_digest_email_html_escapes_job_fields(monkeypatch, tmp_path):
+    _configure(monkeypatch)
+    db, chat_id = _web_user(tmp_path)
+    jobs = [SimpleNamespace(
+        job_id="jx", title="C++ <script>alert(1)</script> Dev", company="A&B",
+    )]
+    assert emailer.maybe_send_web_digest_email(db, chat_id, jobs, {}) is True
+    send = next(c for c in _FakeSMTP.calls if c[0] == "send")
+    html = send[5]
+    assert "<script>" not in html
+    assert "&lt;script&gt;" in html
+    assert "A&amp;B" in html
+
+
+# ---------------------------------------------------------------------------
+# Sign-in email template
+# ---------------------------------------------------------------------------
+
+def test_render_sign_in_email():
+    link = "https://oink.test/api/auth/verify?t=tok123"
+    subject, text, html = emailer.render_sign_in_email(link, "042137")
+    assert "042137" in subject
+    assert "042137" in text and link in text
+    assert "042137" in html and link in html
+    assert "15 minutes" in text and "15 minutes" in html

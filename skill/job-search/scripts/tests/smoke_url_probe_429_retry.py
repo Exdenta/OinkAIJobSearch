@@ -3,12 +3,15 @@
 
 Today's cron run (2026-05-02) silently dropped Alena's only score-3 candidate
 when news.ycombinator.com 429'd our HEAD probe once. The fix is to retry on
-429 with exponential backoff before declaring the URL dead. This file pins
-that behavior down so it cannot regress.
+429 with exponential backoff; and (2026-07-04) when the retries still exhaust,
+treat 429 as ALIVE — a 429 means the host is up and rate-limiting our probe
+IP, not that the page is gone. This file pins that behavior down so it cannot
+regress.
 
 Covers:
   1. First 429, second 200 → alive=True after one retry.
-  2. Three 429s → alive=False with reason ``http_429_after_retries``.
+  2. Three 429s → alive=True with reason ``http_429_rate_limited`` (host is
+     up, just throttling us; never drop a live posting for a rate-limit).
   3. 404 → no retry; alive=False with reason ``404``.
   4. Retry-After header (3s, 11s, malformed) → respected within the cap.
   5. Other 5xx → no retry; single attempt.
@@ -104,8 +107,8 @@ def test_one_429_then_200_recovers() -> None:
             f"one sleep at backoff base (got {sleeps})")
 
 
-def test_three_429s_gives_up() -> None:
-    section("2. 429 x3 → http_429_after_retries")
+def test_three_429s_kept_alive() -> None:
+    section("2. 429 x3 → alive (http_429_rate_limited)")
     sleeps: list[float] = []
     seq, restore = _patch(
         [_FakeResp(429), _FakeResp(429), _FakeResp(429)], sleeps,
@@ -116,10 +119,12 @@ def test_three_429s_gives_up() -> None:
         )
     finally:
         restore()
-    _assert(alive is False, f"alive=False after exhausting retries (got {alive})")
-    _assert(reason == "http_429_after_retries",
-            f"reason marks exhausted retries (got {reason!r})")
+    _assert(alive is True,
+            f"alive=True: a 429 host is up, just throttling us (got {alive})")
+    _assert(reason == "http_429_rate_limited",
+            f"reason marks rate-limited-but-kept (got {reason!r})")
     _assert(len(seq.calls) == 3, f"exactly 3 HEAD attempts (got {len(seq.calls)})")
+    # Retry logic unchanged — still backs off before the final verdict.
     # Backoff schedule: base * 4^0, base * 4^1 → 1.0s, 4.0s.
     _assert(sleeps == [1.0, 4.0],
             f"exponential backoff 1.0s then 4.0s (got {sleeps})")
@@ -202,13 +207,43 @@ def test_other_5xx_no_retry() -> None:
         _assert(sleeps == [], f"{code} → no sleeps (got {sleeps})")
 
 
+def test_host_throttle_spaces_repeated_probes() -> None:
+    section("6. per-host throttle spaces repeat HN probes, skips others")
+    orig_mono = tc.time.monotonic
+    orig_sleep = tc.time.sleep
+    sleeps: list[float] = []
+    clock = {"t": 1000.0}
+    tc.time.monotonic = lambda: clock["t"]
+    tc.time.sleep = lambda s: sleeps.append(float(s))
+    tc._HOST_LAST_REQUEST_AT.clear()  # order-independent
+    hn_interval = tc._HOST_MIN_INTERVAL_S["news.ycombinator.com"]
+    try:
+        # First HN probe: no prior timestamp → immediate, no wait.
+        tc._throttle_host("https://news.ycombinator.com/item?id=1")
+        _assert(sleeps == [], f"first HN probe no wait (got {sleeps})")
+        # Immediate second HN probe (clock unchanged) → waits full interval.
+        tc._throttle_host("https://news.ycombinator.com/item?id=2")
+        _assert(sleeps == [hn_interval],
+                f"second HN probe waits the interval (got {sleeps})")
+        # Untracked host → never throttled, even back-to-back.
+        sleeps.clear()
+        tc._throttle_host("https://example.com/job/1")
+        tc._throttle_host("https://example.com/job/2")
+        _assert(sleeps == [], f"untracked host never throttled (got {sleeps})")
+    finally:
+        tc.time.monotonic = orig_mono
+        tc.time.sleep = orig_sleep
+        tc._HOST_LAST_REQUEST_AT.clear()
+
+
 def main() -> int:
     test_one_429_then_200_recovers()
-    test_three_429s_gives_up()
+    test_three_429s_kept_alive()
     test_404_no_retry()
     test_retry_after_header_respected_with_cap()
     test_other_5xx_no_retry()
-    print("\nAll 429-retry smoke tests passed.")
+    test_host_throttle_spaces_repeated_probes()
+    print("\nAll 429-retry + throttle smoke tests passed.")
     return 0
 
 

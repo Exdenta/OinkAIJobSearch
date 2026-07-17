@@ -36,25 +36,29 @@ from typing import Iterable
 log = logging.getLogger(__name__)
 
 
-# Toggle parity with WEB_SEARCH_VERIFY_OFF — same env name so operators
-# disable both at once when claude CLI is down.
-PRE_ENRICH_LIVENESS_OFF: bool = os.environ.get("PRE_ENRICH_LIVENESS_OFF", "").strip() not in (
+# Toggle for the older pre-enrichment verifier. Disabled by default while
+# send-time liveness is disabled; set PRE_ENRICH_LIVENESS_OFF=0 to re-enable.
+PRE_ENRICH_LIVENESS_OFF: bool = os.environ.get("PRE_ENRICH_LIVENESS_OFF", "1").strip() not in (
     "", "0", "false", "False",
 )
 
 
-def verify_listing_open(job, timeout_s: int = 90) -> tuple[bool | None, str]:
+def verify_listing_open(
+    job, timeout_s: int = 90, *, chat_id: int | None = None,
+) -> tuple[bool | None, str]:
     """Decide whether `job.url` still accepts applications.
 
     Delegates to the long-standing helper in `telegram_client` so we
-    keep one source of truth for the prompt + WebFetch tool wiring.
+    keep one source of truth for the prompt + fetch/backend wiring.
+    `chat_id` threads through to the `LIVENESS_CLAUDE_CHAT_IDS` rollback
+    lever (see `telegram_client._liveness_forced_to_claude`).
     """
     try:
         from telegram_client import _web_search_listing_still_open as _check
     except ImportError:
         return (None, "unknown:telegram_client_import")
     try:
-        return _check(job, timeout_s=timeout_s)
+        return _check(job, timeout_s=timeout_s, chat_id=chat_id)
     except Exception as e:
         log.warning("liveness: verifier raised on %s: %s", job.url, e)
         return (None, f"unknown:exception:{type(e).__name__}")
@@ -87,7 +91,7 @@ def filter_alive_jobs(
     dead: list[tuple[object, str]] = []
 
     def _one(j):
-        return j, verify_listing_open(j, timeout_s=timeout_s)
+        return j, verify_listing_open(j, timeout_s=timeout_s, chat_id=chat_id)
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = [pool.submit(_one, j) for j in jobs]

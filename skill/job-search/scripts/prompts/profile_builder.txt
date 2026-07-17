@@ -50,9 +50,10 @@ the factual content (skills, experience, stated preferences) only.
 OUTPUT SCHEMA (every field MUST be present, even when empty)
 ============================================================
 {{
-  "schema_version": 3,
+  "schema_version": 5,
   "ideal_fit_paragraph":   "<2-4 sentences, plain text, no markdown>",
   "primary_role":          "<lowercase role family, e.g. 'frontend engineer'>",
+  "enabled_sources":       ["<source-key from rule 24b>", "..."],
   "target_levels":         ["<any of: junior, mid, middle, senior, lead, staff, principal>"],
   "years_experience":      <integer, 0 if unclear>,
 
@@ -61,15 +62,14 @@ OUTPUT SCHEMA (every field MUST be present, even when empty)
   "stack_adjacent":        ["<lowercase>"],
   "stack_antipatterns":    ["<lowercase>"],
 
-  "title_must_match":      ["<lowercase substring that MUST appear in a job title>"],
-  "title_exclude":         ["<lowercase substring that DISQUALIFIES a job title>"],
+  "title_must_match":      ["<lowercase title token — steers discovery searches; NOT a hard filter>"],
+  "title_exclude":         ["<lowercase title token to steer discovery AWAY from; NOT a hard filter>"],
   "exclude_keywords":      ["<lowercase substring veto anywhere in body>"],
   "exclude_companies":     ["<company name, case preserved>"],
 
-  "onsite_locations":      ["<lowercase city/region — STRICT: onsite/hybrid OK only here>"],
-  "remote_regions":        ["<lowercase country/macro-region — remote OK in these>"],
-  "locations":             ["<lowercase — union of the two above, kept for back-compat>"],
-  "remote":                "any" | "remote" | "hybrid" | "onsite",
+  "remote_locations":      ["<lowercase city/country/continent/earth — FULLY-REMOTE OK here>"],
+  "hybrid_locations":      ["<lowercase city/country/continent/earth — HYBRID OK here>"],
+  "onsite_locations":      ["<lowercase city/country/continent/earth — fully ONSITE OK here>"],
   "time_zone_band":        "<e.g. 'UTC-1..UTC+3', empty string if unclear>",
 
   "salary_min_usd":        <integer, 0 if unspecified>,
@@ -88,6 +88,11 @@ OUTPUT SCHEMA (every field MUST be present, even when empty)
       "seed_phrases": ["<short search-engine query>"],
       "ats_domains":  ["<one of: greenhouse.io, lever.co, ashbyhq.com, workable.com, personio.de, recruitee.com, myworkday.com, bamboohr.com, teamtailor.com, smartrecruiters.com>"],
       "focus_notes":  "<1-2 sentences, plain text, no markdown>"
+    }},
+    "boards": {{
+      "keywords": ["<short ENGLISH board keyword>", "..."],
+      "native_keywords": ["<short keyword in native_language>", "..."],
+      "native_language": "<lowercase language of native_keywords, '' when none>"
     }}
   }},
 
@@ -130,10 +135,13 @@ DERIVATION RULES
        typically are)
    4-10 items. Err on the side of fewer.
 
-7. `title_must_match` — at least one of these substrings must appear in a
-   job's TITLE for it to pass. Build this from primary_role's common
-   variants AND one or two top stack_primary names that frequently appear
-   in titles (e.g. "react", "vue", "python"). Lowercase. 5-15 items.
+7. `title_must_match` — title tokens that STEER web-search discovery
+   queries. NOT a hard filter: the AI scorer judges every posting
+   holistically, so a missing token never disqualifies a job — but a
+   narrow list makes discovery search for too few role names. Build this
+   from primary_role's common variants AND one or two top stack_primary
+   names that frequently appear in titles (e.g. "react", "vue",
+   "python"). Lowercase. 8-15 items — err toward BROAD.
 
    IMPORTANT — broaden by role family. Real postings rarely echo CV
    jargon; build the gate from the role NAMES recruiters actually write,
@@ -144,6 +152,17 @@ DERIVATION RULES
      - Tech/engineering:  primary_role variants + 1-2 stack tokens.
        e.g. ["frontend","front-end","front end","react","vue",
              "ui engineer","ui developer","web developer"]
+
+     - ML/Data/AI: this family has MANY interchangeable role nouns —
+       always include the umbrella set, not just the specialty the
+       resume names. Example for an MLOps / ML-platform candidate:
+       ["mlops","machine learning","ml engineer","ml platform",
+        "ml infrastructure","ai engineer","applied scientist",
+        "data scientist","data science","research engineer",
+        "data engineer","platform engineer","backend","python"]
+       A role titled "AI Engineer" or "Applied Scientist, Serving
+       Infra" is usually the same job as "ML Engineer" — discovery
+       must search for all of them.
 
      - Research/academic: include UMBRELLA TITLES that recruiters use,
        not just resume jargon. Example for a qualitative researcher:
@@ -167,7 +186,10 @@ DERIVATION RULES
    passes for an anthropology researcher even though the title doesn't say
    "researcher".
 
-8. `title_exclude` — title VETO. Build from:
+8. `title_exclude` — title tokens to steer discovery AWAY from. Like
+   `title_must_match` this is a discovery hint, not a hard veto — the
+   scorer derives its own vetoes from the user's verbatim words only.
+   Build from:
      - Role-family antonyms. Adjacent role families the candidate is NOT
        targeting (for a frontend dev: backend/data/devops/sre/qa/security/
        ios/android/mobile).
@@ -177,7 +199,12 @@ DERIVATION RULES
        "chief"]. Add "manager" only if the role family treats "manager"
        as people-management (engineering, design, ops). For NGO/research,
        "Programme Manager" / "Research Manager" are typically hands-on IC
-       leads — DO NOT blanket-exclude "manager" there.
+       leads — DO NOT blanket-exclude "manager" there. For ML/Data,
+       "Data Science Manager" / "ML Manager" are often hands-on
+       tech-lead hybrids — exclude the unambiguous forms
+       ["engineering manager","people manager"] instead of the bare
+       token "manager", and let the scorer downgrade pure
+       people-management roles.
 
      - Seniority-level filtering — DO NOT blanket-exclude "senior" /
        "staff" / "principal" / "lead". These tokens have role-family-
@@ -218,51 +245,86 @@ DERIVATION RULES
 10. `exclude_companies` — ONLY names the user_description explicitly lists.
     Do NOT invent. If the user didn't name any, emit [].
 
-11. `onsite_locations` — STRICT list of cities/regions where the user is
-    willing to work onsite or hybrid. Include ONLY tokens the user
-    explicitly named OR clearly implied as their physical residence area.
-    Do NOT add macro-regions ("europe", "eu", "emea") here — those belong
-    in `remote_regions` only. Examples:
-      - User says "Bilbao or Basque" → ["bilbao", "basque", "euskadi"]
-      - User says "London onsite" → ["london"]
-      - User says "Berlin or hybrid Munich" → ["berlin", "munich"]
-      - User says "remote only" → []  (no onsite OK)
-    Typical list size: 0-5 items. Keep tight.
-
-12. `remote_regions` — countries / macro-regions where remote work is
-    acceptable. Use macro-region tokens to express "anywhere within X":
-      - EU member states + UK + Norway + Switzerland + Iceland + Liechtenstein → "europe", "eu"
-      - Europe + Middle East + Africa → "emea"
-      - US + Canada + Mexico → "north america"
-      - Mexico + Central + South America → "latam"
-      - Asia-Pacific → "apac"
-      - Truly any TZ → "anywhere"
+11. `remote_locations` — locations where the candidate accepts FULLY-REMOTE
+    work. Each entry may be a city, country, continent, or the literal
+    token "earth" (anywhere on the planet). The AI scorer reasons about
+    geographic containment (Madrid ⊂ Spain ⊂ Europe ⊂ Earth), so prefer
+    the COARSEST token that faithfully captures intent: "earth" if truly
+    anywhere, "europe" if EU-only, "spain" if country-only, "bilbao" if
+    city-only. Do NOT invent an exclusion list — if the user wrote "except
+    Russia/Ukraine/Belarus", emit the broad inclusion (e.g. ["earth"]) and
+    let the scorer read the verbatim exclusions from the raw prefs text to
+    hard-veto those at score time. Include the home country verbatim alongside
+    a macro token so country-specific remote strings ("Remote · Spain") match.
     Examples:
-      - User says "remote in EU" → ["europe", "eu", "spain", ...]
-        (include the home country verbatim too so country-specific remote
-        like "Remote · Spain" matches.)
-      - User says "remote US only" → ["united states", "us", "usa",
-        "remote-us", "north america"]
-      - User says "onsite Bilbao only, no remote" → []
-    Typical list size: 1-8 items.
+      - "remote everywhere except Russia/Ukraine/Belarus" → ["earth"]
+      - "remote in EU" → ["europe", "eu", "spain"]
+      - "remote US only" → ["united states", "us", "usa", "north america"]
+      - "onsite Bilbao only, no remote" → []
+    Typical size: 0-8 items.
 
-13. `locations` — UNION of `onsite_locations` and `remote_regions`,
-    de-duplicated. Kept for back-compat with v2 readers; downstream code
-    prefers the two split fields above when present.
+12. `hybrid_locations` — locations where the candidate accepts HYBRID
+    (partly onsite) work. Same granularity freedom as `remote_locations`
+    (city / country / continent / earth). THIS IS THE FIELD THAT CAPTURES
+    INTRA-COUNTRY MOBILITY: if the user says "hybrid in Spain" while living
+    in Bilbao, emit ["spain"] (NOT ["bilbao"]) — the scorer then passes
+    hybrid postings in Madrid, Barcelona, Seville, etc. because Madrid ⊂
+    Spain. Downgrading a country-level hybrid intent to a single city is
+    the exact bug this schema fixes — do NOT do it. If the user only named
+    a city for hybrid, emit that city.
+    THE MIRROR-IMAGE BUG IS JUST AS REAL: hybrid means commuting part of
+    the week, so the list must stay within commutable range of where the
+    candidate lives UNLESS they EXPLICITLY accepted country-wide hybrid
+    (said "hybrid in Spain", "willing to relocate", or similar). Never
+    copy a remote-mode country into `hybrid_locations` just because it
+    appears in `remote_locations` — "hybrid OK" + "remote within Spain"
+    from a Bilbao resident means hybrid NEAR BILBAO and remote Spain-wide;
+    emitting hybrid=["...","spain"] would make the scorer pass hybrid
+    postings in Barcelona the candidate can never commute to.
+    Examples:
+      - "hybrid and remote in Spain" → ["spain"]
+      - "hybrid in Bilbao or Madrid" → ["bilbao", "madrid"]
+      - "hybrid anywhere in Europe" → ["europe"]
+      - "hybrid OK; lives in Bilbao; remote within Spain" →
+        ["bilbao", "basque", "euskadi"] (the country stays ONLY in
+        `remote_locations`)
+      - "no hybrid" → []
+    Typical size: 0-6 items.
 
-14. `remote`:
-      - "remote only"/"fully remote"/"anywhere" → "remote"
-      - "hybrid" → "hybrid"
-      - "on-site"/"in-office" → "onsite"
-      - if user says BOTH "onsite in X" AND "remote elsewhere" → "any"
-      - else → "any"
+13. `onsite_locations` — locations where the candidate accepts fully ONSITE
+    work. Same granularity freedom (city / country / continent / earth).
+    Reuses the v3 field name but with RELAXED semantics: v3 was city-only
+    strict; v5 accepts any granularity, so a user willing to relocate onsite
+    anywhere in Germany emits ["germany"] and a user willing to go onsite
+    anywhere on Earth emits ["earth"]. Usually the TIGHTEST of the three
+    lists — onsite willingness is typically narrower than remote/hybrid.
+    Examples:
+      - "onsite in Bilbao" → ["bilbao", "basque", "euskadi"]
+      - "willing to relocate onsite anywhere in Germany" → ["germany"]
+      - "onsite anywhere in Europe" → ["europe"]
+      - "no onsite" → []
+    Typical size: 0-5 items.
 
-15. `time_zone_band` — infer from `remote_regions` and the candidate's
+14. MODE SEMANTICS & LIST INDEPENDENCE — the three lists are INDEPENDENT:
+    never substitute one list's entries into another mode's check. If a city
+    appears in `onsite_locations` but NOT in `hybrid_locations`, a hybrid
+    posting in that city is HARD-VETOED (score 0) by the scorer even though
+    an onsite posting there would pass. When the user's intent clearly covers
+    a location for multiple modes, list it under EACH mode it applies to
+    (e.g. "hybrid or onsite in Bilbao" → put "bilbao" in BOTH
+    `hybrid_locations` and `onsite_locations`). There is NO `remote` enum and
+    NO `locations` union in v5 — the three lists ARE the single source of
+    truth for location intent; downstream code derives any coarse enum it
+    needs from which lists are non-empty. Do NOT emit `remote`, `locations`,
+    or `remote_regions` — those are v3 legacy fields, no longer produced.
+
+15. `time_zone_band` — infer from `remote_locations` and the candidate's
     home location. EU = "UTC-1..UTC+3", UK = "UTC..UTC+1", US East =
-    "UTC-5..UTC-4", US West = "UTC-8..UTC-7". This field is consumed by
-    the AI scorer to penalize remote postings outside the band, so keep
-    it tight to the user's actual TZ tolerance. Empty string only if
-    user explicitly accepts any TZ.
+    "UTC-5..UTC+4", US West = "UTC-8..UTC-7". If `remote_locations` contains
+    "earth"/"anywhere" AND the user explicitly accepts any TZ, emit empty
+    string; otherwise keep it tight to the user's actual TZ tolerance. This
+    field is consumed by the AI scorer to penalize remote postings outside
+    the band.
 
 16. `salary_min_usd` — if user_description says a number, convert EUR/GBP/
     CAD ~1:1 to USD for our purposes. 0 otherwise. Never infer a floor
@@ -297,9 +359,21 @@ DERIVATION RULES
     for. English is workable for essentially every candidate in this
     pipeline (assume >= B2 unless the resume clearly says otherwise).
 
+    CV-LESS / EVIDENCE-FREE CASE: when there is NO resume and the
+    user_description carries no proficiency signal, do NOT collapse to
+    English-only. If the candidate lives in — or targets onsite/hybrid
+    work in — a market whose dominant language is non-English, treat that
+    language as WORKABLE: local onsite roles require it anyway, their own
+    vocabulary often betrays it (a Bilbao user writing "Interiorista" is
+    telling you they operate in Spanish), and the scorer still vetoes any
+    real language mismatch at match time. This applies ONLY to the
+    GEO-DOMINANT language of markets they physically target — never
+    assume proficiency for remote-market or community languages without
+    evidence.
+
     STEP 3 — infer the DOMINANT working language(s) of each target market
-    (the geos you will use in rule 21, derived from onsite_locations /
-    remote_regions / home country). Use your own knowledge of which
+    (the geos you will use in rule 21, derived from remote_locations /
+    hybrid_locations / onsite_locations / home country). Use your own knowledge of which
     language postings are written in for that market. A non-exhaustive
     illustration of the kind of inference expected (NOT a closed list —
     apply the same reasoning to any country): Spain → Spanish; France →
@@ -351,7 +425,7 @@ DERIVATION RULES
         NOT dominant in Spain/EU (GEO-DOMINANT branch would drop it) but is
         explicitly named (PREFERRED-COMMUNITY branch keeps it). Per rule 21
         the Russian `q` values are paired with the candidate's REMOTE geo
-        ("European Union" / their remote_regions), NEVER "Russia" — the
+        ("European Union" / their remote_locations), NEVER "Russia" — the
         candidate wants REMOTE work, not relocation to the language's home
         country.
     Record the chosen language string in field 18 (`language`) as the
@@ -400,12 +474,12 @@ DERIVATION RULES
           * PREFERRED-COMMUNITY language (workable + explicitly desired, but
             NOT geo-dominant in any target market): pair each native-language
             `q` with the candidate's REMOTE geo(s) — "European Union" or their
-            remote_regions — NEVER the language's HOME COUNTRY. The candidate
+            remote_locations — NEVER the language's HOME COUNTRY. The candidate
             wants REMOTE / remote-first / relocated-community work in that
             language, not relocation to where it is spoken onsite. Example:
             Russian-native, Bilbao-based, EU-remote target, prefs name
             "Russian-speaking environments" → emit idiomatic Russian role
-            queries paired with geo "European Union" (or their remote_regions),
+            queries paired with geo "European Union" (or their remote_locations),
             NEVER "Russia". Sending a Bilbao-based candidate Russia-onsite
             roles would be wrong — they explicitly want remote.
       - Rough split when one extra language is in play: keep ~60% of the
@@ -457,13 +531,14 @@ DERIVATION RULES
 
     GEO RESTRICTION — pick `geo` values ONLY from regions the candidate
     has actually OK'd. Specifically:
-      * countries / macro-regions in `onsite_locations` or `remote_regions`,
+      * countries / macro-regions in `remote_locations`, `hybrid_locations`,
+        or `onsite_locations`,
       * AND the LinkedIn-canonical name covering the candidate's home
         country (e.g. user residence = Bilbao → "Spain" allowed; "European
         Union" allowed because the user listed "europe").
     DO NOT add Germany / Poland / Netherlands etc. unless those countries
     are explicitly in `onsite_locations` or fall inside a macro-region
-    listed in `remote_regions` AND the user's free_text suggests they're
+    listed in `remote_locations` AND the user's free_text suggests they're
     open to roles based there. When the user only wants "remote in EU",
     prefer `geo="European Union"` over individual member states — fewer
     queries, less off-locale noise.
@@ -628,6 +703,99 @@ DERIVATION RULES
     (e.g. "Prefer EU-timezone-friendly remote roles. De-prioritize mobile-
     first companies and Ruby shops."). No markdown.
 
+24a. `search_seeds.boards.keywords` — 3-6 SHORT keyword terms for classic
+    job-board keyword search (jobs.ac.uk, Work at a Startup, EURES-style
+    boards). These boards AND every word of one term together, so long
+    phrases return zero results.
+      - Each term 1-2 words, standalone (e.g. "react", "frontend",
+        "machine learning", "psychology", "migration research").
+      - Role-family nouns + top specialties recruiters post under.
+      - `keywords` stays ENGLISH regardless of `language` — even when
+        rule 18a emits native-language LinkedIn/web_search variants
+        (e.g. Example D's Spanish "investigador migraciones"),
+        `keywords` stays English ("migration research", "cooperation")
+        because the boards it feeds index English postings and AND-match
+        kills mixed-language multi-word phrases.
+      - NO location words, NO "remote", NO seniority prefixes — boards
+        filter those separately; the scorer handles fit.
+    Distinct from `linkedin.queries` (longer UI phrases) and
+    `web_search.seed_phrases` (search-engine queries).
+
+24a-bis. `search_seeds.boards.native_keywords` + `native_language` —
+    NATIVE-LANGUAGE board terms. Some boards index postings in their
+    market's own language, not English (infojobs → Spanish, Welcome to
+    the Jungle → French, EURES carries every member-state language); an
+    English keyword there starves the candidate's single best local
+    source. When rule 18a's EMIT LANGUAGES contains a non-English
+    GEO-DOMINANT language (dominant in a market the candidate targets
+    onsite/hybrid/remote):
+      - Emit 2-4 short terms in THAT language under `native_keywords` —
+        idiomatic job-title nouns recruiters actually post under
+        ("interiorista", "diseñador de interiores", "investigador"),
+        MOST-POSTED FIRST: dispatch may forward only the first 1-2.
+      - Multi-word phrases up to 4 words are fine here (these boards do
+        free-text search, not strict AND).
+      - Set `native_language` to that language (lowercase, e.g.
+        "spanish").
+      - Same bans as `keywords`: no locations, no "remote", no seniority.
+    When EMIT LANGUAGES is English-only: `native_keywords`: [] and
+    `native_language`: "".
+    PREFERRED-COMMUNITY languages do NOT belong here. Worked example
+    (same candidate as rule 18a's Russian case): Russian-NATIVE,
+    Bilbao-based, targets Spain + EU-remote, prefs name Russian-speaking
+    environments → Russian is PREFERRED-COMMUNITY, not geo-dominant in
+    any target market, and no board in the fleet indexes Russian →
+    `native_keywords`: [], `native_language`: "". The Russian variants
+    belong in `linkedin.queries` / `web_search.seed_phrases` (rules 21
+    and 22), which is where that branch already routes them. Emitting
+    them here only dilutes the multi-language boards' query budget.
+
+24b. `enabled_sources` — the subset of the bot's job-source adapters
+    worth fetching for THIS candidate. Every source you leave on is
+    ~36 postings fetched AND scored per run, so a non-tech candidate
+    with tech boards enabled burns ~90% of the scoring budget on
+    postings that can never match. Source keys, by domain family:
+
+      # tech / startup / generalist developer
+      hackernews, remoteok, remotive, weworkremotely, ycombinator_was,
+      builtin, justjoinit, nofluffjobs, linkedin, web_search,
+      curated_boards
+      # AI / ML / data
+      ai_jobs_net
+      # Spain / EU local + generalist
+      infojobs, tecnoempleo, ikerbasque, wttj, eures, wellfound
+      # international development / NGO / humanitarian
+      reliefweb, impactpool, devex, un_careers
+      # academic / research / postdoc
+      euraxess, jobs_ac_uk, math_ku_phd, ub_doctoral, academicpositions
+
+    Picking rules:
+      * Always include `web_search` + `linkedin` — role-agnostic,
+        per-user query driven.
+      * Tech candidates (frontend / backend / mobile / data / devops /
+        full-stack): TECH family + `curated_boards` + Spain/EU locals
+        when the candidate is in Spain; `ai_jobs_net` only with ML/AI/
+        data work on the resume.
+      * Researchers / academics: ACADEMIC family + `euraxess` + locals
+        when in Spain. SKIP pure-tech boards (`remoteok`,
+        `weworkremotely`, `justjoinit`, `nofluffjobs`, `builtin`,
+        `ai_jobs_net`, `hackernews`, `ycombinator_was`) — they swamp
+        the pool with engineering jobs.
+      * NGO / international development / policy: INTL DEV family +
+        ACADEMIC family + locals when in Spain.
+      * Designers / UX / product (digital): tech/startup family without
+        the AI boards.
+      * NON-TECH, NON-ACADEMIC, NON-NGO roles (trades, architecture /
+        interior design, hospitality, retail, healthcare, sales,
+        logistics, ...): generalist + local boards ONLY — `linkedin`,
+        `web_search`, `infojobs` (Spain), `wttj`, `eures` (EU),
+        `tecnoempleo` only for tech-adjacent. Tech, academic, and NGO
+        boards can never carry these roles.
+      * When genuinely in doubt about a family, include it — false
+        positives cost scoring budget, missing a whole category costs
+        the user real jobs.
+    Output: lowercase source keys, no duplicates.
+
 25. `ideal_fit_paragraph` — 2-4 plain sentences describing the ideal job
     fit ("Mid-level frontend engineer role working primarily in Vue 2 or
     React, on a European-timezone remote team or in Bilbao, building
@@ -643,10 +811,12 @@ HARD CONSTRAINTS (the parser checks these)
  - Output MUST `json.loads()` without modification.
  - Every top-level key in the schema MUST be present.
  - Every list field MUST be an array (even if empty).
- - `remote` MUST be one of: "any", "remote", "hybrid", "onsite".
- - `schema_version` MUST be the integer 3.
- - `onsite_locations` and `remote_regions` MUST both be present (arrays;
-   may be empty).
+ - `schema_version` MUST be the integer 5.
+ - `remote_locations`, `hybrid_locations`, and `onsite_locations` MUST all
+   be present (arrays; may be empty). Each accepts city / country /
+   continent / "earth" tokens.
+ - Do NOT emit `remote`, `locations`, or `remote_regions` — they are v3
+   legacy fields superseded by the three lists above.
  - All strings in list fields other than `exclude_companies` MUST be
    lowercase.
  - `title_must_match` and `title_exclude` strings must be ≤ 40 chars each.
@@ -657,6 +827,14 @@ HARD CONSTRAINTS (the parser checks these)
  - `search_seeds.web_search.seed_phrases` length ≤ 12, each ≤ 120 chars.
  - `search_seeds.web_search.ats_domains` MUST be a subset of the allowlist
    in rule 21.
+ - `search_seeds.boards.keywords` length ≤ 6, each ≤ 40 chars, each at
+   most 2 words, ENGLISH regardless of `language` (rule 24a).
+ - `search_seeds.boards.native_keywords` length ≤ 6, each ≤ 40 chars,
+   each at most 4 words; empty array when EMIT LANGUAGES is
+   English-only. `native_language` MUST be a lowercase string (may be
+   empty).
+ - `enabled_sources` MUST be a non-empty array of lowercase source keys
+   from rule 24b.
  - Do NOT invent companies in `exclude_companies`.
  - Do NOT invent skills the resume doesn't show.
  - Do NOT include URLs anywhere.
@@ -674,9 +852,10 @@ no Solidity, no senior/staff roles."
 
 Output:
 {{
-  "schema_version": 3,
+  "schema_version": 5,
   "ideal_fit_paragraph": "Mid-level frontend engineer working primarily in Vue 2 or React with TypeScript, preferring a European-timezone remote team or an on-site role in Bilbao. Focus on production user interfaces for end-user apps rather than heavy internal tooling.",
   "primary_role": "frontend engineer",
+  "enabled_sources": ["linkedin", "web_search", "curated_boards", "hackernews", "remoteok", "remotive", "weworkremotely", "ycombinator_was", "builtin", "justjoinit", "nofluffjobs", "infojobs", "tecnoempleo", "wttj", "eures", "wellfound"],
   "target_levels": ["mid", "middle"],
   "years_experience": 5,
   "stack_primary": ["vue", "vuex", "typescript", "javascript"],
@@ -688,9 +867,8 @@ Output:
   "exclude_keywords": ["wordpress", "drupal", "solidity", "salesforce", "bootcamp", "unpaid"],
   "exclude_companies": [],
   "onsite_locations": ["bilbao", "basque", "euskadi"],
-  "remote_regions": ["spain", "europe", "eu", "emea"],
-  "locations": ["bilbao", "basque", "euskadi", "spain", "europe", "eu", "emea"],
-  "remote": "any",
+  "remote_locations": ["europe", "eu", "emea", "spain"],
+  "hybrid_locations": ["bilbao", "basque", "euskadi"],
   "time_zone_band": "UTC-1..UTC+3",
   "salary_min_usd": 0,
   "drop_if_salary_unknown": false,
@@ -722,6 +900,11 @@ Output:
       ],
       "ats_domains": ["greenhouse.io", "lever.co", "ashbyhq.com", "personio.de", "workable.com"],
       "focus_notes": "Prefer EU-timezone-friendly remote roles. De-prioritize mobile-first companies and Ruby shops."
+    }},
+    "boards": {{
+      "keywords": ["vue", "react", "frontend", "typescript", "javascript"],
+      "native_keywords": [],
+      "native_language": ""
     }}
   }},
   "free_text": "remote EU preferred, or Bilbao. Vue or React. No wordpress, no Solidity, no senior/staff roles."
@@ -736,9 +919,10 @@ Must list salary."
 
 Output:
 {{
-  "schema_version": 3,
+  "schema_version": 5,
   "ideal_fit_paragraph": "Senior backend engineer role working primarily in Python with Django or FastAPI, on a US-timezone remote team building production services backed by Postgres and AWS infrastructure. Individual-contributor track, not people management.",
   "primary_role": "backend engineer",
+  "enabled_sources": ["linkedin", "web_search", "curated_boards", "hackernews", "remoteok", "remotive", "weworkremotely", "ycombinator_was", "builtin", "wellfound"],
   "target_levels": ["senior"],
   "years_experience": 8,
   "stack_primary": ["python", "django", "fastapi", "postgres"],
@@ -749,10 +933,9 @@ Output:
   "title_exclude": ["staff", "principal", "lead", "head", "director", "vp", "manager", "em ", "engineering manager", "frontend", "front-end", "front end", "data engineer", "ios", "android", "mobile", "devops", "sre", "qa engineer", "security engineer"],
   "exclude_keywords": ["php", "wordpress", "drupal", "salesforce developer"],
   "exclude_companies": [],
-  "onsite_locations": ["austin", "texas"],
-  "remote_regions": ["united states", "us", "usa", "remote-us", "north america"],
-  "locations": ["united states", "us", "usa", "remote-us", "austin", "texas", "north america"],
-  "remote": "remote",
+  "onsite_locations": [],
+  "remote_locations": ["united states", "us", "usa", "north america"],
+  "hybrid_locations": [],
   "time_zone_band": "UTC-8..UTC-4",
   "salary_min_usd": 0,
   "drop_if_salary_unknown": true,
@@ -785,6 +968,11 @@ Output:
       ],
       "ats_domains": ["greenhouse.io", "lever.co", "ashbyhq.com", "workable.com", "smartrecruiters.com"],
       "focus_notes": "Prefer individual-contributor backend roles over people management. Only US-timezone remote."
+    }},
+    "boards": {{
+      "keywords": ["python", "backend", "django", "fastapi", "go"],
+      "native_keywords": [],
+      "native_language": ""
     }}
   }},
   "free_text": "remote US only. Backend Python. No EM or director roles. Must list salary."
@@ -803,9 +991,10 @@ titles. EU/EMEA, remote OK. Prefer English-language roles."
 
 Output:
 {{
-  "schema_version": 3,
+  "schema_version": 5,
   "ideal_fit_paragraph": "Mid-level qualitative researcher role in an NGO, academic, or policy organisation working on migration, peace and conflict, or sustainability themes. Open to programme officer, project officer, M&E specialist, postdoctoral fellow, lecturer, or consultant titles in any EU country including remote, with English as the working language.",
   "primary_role": "qualitative researcher",
+  "enabled_sources": ["linkedin", "web_search", "curated_boards", "reliefweb", "impactpool", "devex", "un_careers", "euraxess", "jobs_ac_uk", "academicpositions", "ikerbasque", "infojobs", "eures", "wttj"],
   "target_levels": ["mid", "middle"],
   "years_experience": 5,
   "stack_primary": ["qualitative research", "ethnography", "interviews", "fieldwork", "migration studies", "peace and conflict studies", "mixed methods"],
@@ -817,9 +1006,8 @@ Output:
   "exclude_keywords": ["quantitative finance", "market research", "ux research", "user research", "bootcamp", "unpaid"],
   "exclude_companies": [],
   "onsite_locations": ["bilbao", "basque", "euskadi"],
-  "remote_regions": ["spain", "europe", "eu", "emea"],
-  "locations": ["bilbao", "basque", "euskadi", "spain", "europe", "eu", "emea"],
-  "remote": "any",
+  "remote_locations": ["europe", "eu", "emea", "spain"],
+  "hybrid_locations": ["bilbao", "basque", "euskadi"],
   "time_zone_band": "UTC-1..UTC+3",
   "salary_min_usd": 0,
   "drop_if_salary_unknown": false,
@@ -853,6 +1041,11 @@ Output:
       ],
       "ats_domains": ["greenhouse.io", "lever.co", "workable.com", "teamtailor.com", "smartrecruiters.com"],
       "focus_notes": "Prefer NGO, academic, and policy research roles in EU timezones touching migration, peace, conflict, or sustainability. Open to programme/project officer, M&E, postdoc, fellow, lecturer, consultant titles. De-prioritize UX/user/market research and quantitative finance roles. Senior IC titles (senior researcher, senior fellow) are acceptable — only management-track titles (director, head, VP) should be skipped."
+    }},
+    "boards": {{
+      "keywords": ["migration research", "researcher", "policy analyst", "programme officer"],
+      "native_keywords": [],
+      "native_language": ""
     }}
   }},
   "free_text": "Mid-level researcher in NGO, academic, or policy contexts. Migration, peace, conflict, sustainability themes. Open to programme officer, field officer, M&E, postdoc, lecturer, consultant titles. EU/EMEA, remote OK. Prefer English-language roles."
@@ -877,9 +1070,10 @@ nothing else workable is explicitly desired). EMIT LANGUAGES =
 
 Output:
 {{
-  "schema_version": 3,
+  "schema_version": 5,
   "ideal_fit_paragraph": "Mid-level qualitative researcher role in an NGO, university, or public-sector organisation working on migration, cooperation, and human-rights themes. Open to investigador, técnico de proyectos, programme officer, and M&E titles in Spain or EU-timezone remote, working in Spanish or English.",
   "primary_role": "qualitative researcher",
+  "enabled_sources": ["linkedin", "web_search", "curated_boards", "reliefweb", "impactpool", "devex", "un_careers", "euraxess", "jobs_ac_uk", "academicpositions", "ikerbasque", "infojobs", "eures", "wttj"],
   "target_levels": ["mid", "middle"],
   "years_experience": 5,
   "stack_primary": ["qualitative research", "ethnography", "interviews", "fieldwork", "migration studies", "mixed methods"],
@@ -891,9 +1085,8 @@ Output:
   "exclude_keywords": ["quantitative finance", "market research", "ux research", "user research", "bootcamp", "unpaid"],
   "exclude_companies": [],
   "onsite_locations": ["bilbao", "basque", "euskadi"],
-  "remote_regions": ["spain", "europe", "eu", "emea"],
-  "locations": ["bilbao", "basque", "euskadi", "spain", "europe", "eu", "emea"],
-  "remote": "any",
+  "remote_locations": ["europe", "eu", "emea", "spain"],
+  "hybrid_locations": ["bilbao", "basque", "euskadi"],
   "time_zone_band": "UTC-1..UTC+3",
   "salary_min_usd": 0,
   "drop_if_salary_unknown": false,
@@ -926,6 +1119,11 @@ Output:
       ],
       "ats_domains": ["greenhouse.io", "lever.co", "workable.com", "teamtailor.com", "smartrecruiters.com"],
       "focus_notes": "Prefer NGO, university, and public-sector research roles in Spain and EU-timezone remote, touching migration, cooperation, or human rights. Spanish-language and English-language postings both welcome. De-prioritize UX/user/market research and quantitative finance."
+    }},
+    "boards": {{
+      "keywords": ["migration research", "researcher", "cooperation", "human rights"],
+      "native_keywords": ["investigador", "técnico de proyectos", "cooperación internacional"],
+      "native_language": "spanish"
     }}
   }},
   "free_text": "Investigadora / técnica de proyectos en ONG, universidad o sector público. Migración, cooperación, derechos humanos. España, remoto en la UE también. Abierta a roles en español o inglés."

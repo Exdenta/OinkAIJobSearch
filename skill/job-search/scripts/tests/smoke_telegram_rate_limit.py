@@ -171,6 +171,36 @@ def test_opt_out() -> None:
     _assert(tc.TG_RATE_LIMIT_OFF is True, "TG_RATE_LIMIT_OFF flag should be True")
 
 
+def test_button_taps_not_per_chat_throttled() -> None:
+    section("5. button taps — ack/edit/delete skip the per-chat bucket")
+    tc = _fresh_import({
+        "TG_RATE_LIMIT_OFF": None,
+        "TG_GLOBAL_RPS": "1000",
+        "TG_BURST_GLOBAL": "1000",
+        "TG_PER_CHAT_RPS": "1",      # prod value: 1 rps...
+        "TG_BURST_PER_CHAT": "1",    # ...and a burst of 1 so any charge blocks
+        "FORENSIC_OFF": "1",
+    })
+    import requests as _r
+    _r.post = _ok_post  # type: ignore[assignment]
+
+    client = tc.TelegramClient(token="x" * 8, timeout=5)
+    # Drain the chat's bucket first (a digest send would do this), then fire
+    # the three calls a 👎 → reason tap makes. None may sleep.
+    client._call("sendMessage", {"chat_id": 7, "text": "digest"})
+    t0 = time.monotonic()
+    client._call("answerCallbackQuery", {"callback_query_id": "q1"})
+    client._call("editMessageText", {"chat_id": 7, "message_id": 1, "text": "why?"})
+    client._call("deleteMessage", {"chat_id": 7, "message_id": 1})
+    dur = time.monotonic() - t0
+    _assert(dur < 0.2, f"button-tap calls must not throttle, slept {dur:.2f}s")
+
+    # ...but a real send into the same chat still is throttled.
+    t0 = time.monotonic()
+    client._call("sendMessage", {"chat_id": 7, "text": "next card"})
+    _assert(time.monotonic() - t0 > 0.5, "sendMessage must still be per-chat throttled")
+
+
 def main() -> None:
     # Pin a tempdir for STATE_DIR so any forensic files we accidentally
     # produce don't end up in the repo root.
@@ -179,6 +209,7 @@ def main() -> None:
     test_global_bucket()
     test_429_retry()
     test_opt_out()
+    test_button_taps_not_per_chat_throttled()
     print("\nAll telegram rate-limit smoke tests passed.")
 
 

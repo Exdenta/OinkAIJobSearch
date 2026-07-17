@@ -32,6 +32,14 @@ import logging
 import time
 from typing import Any, Callable, Optional
 
+# feedback_digest is lightweight (claude_cli + instrumentation.wrappers +
+# forensic — none of which import the source adapters or search_jobs
+# itself), so unlike `search_jobs.run` below it is safe to import eagerly
+# at module scope without dragging the whole pipeline into every test that
+# imports this module.
+import feedback_digest
+from chat_lock import lock_for
+
 # Lazy import so importing this module doesn't drag the whole pipeline in.
 # Tests inject `search_run_callable` and never trigger the import.
 _DEFAULT_SEARCH_RUN: Optional[Callable[..., Any]] = None
@@ -77,6 +85,8 @@ class ContinuousSearcher:
         search_run_callable: Optional[Callable[..., Any]] = None,
         clock: Optional[Callable[[], float]] = None,
         min_sleep_seconds: Optional[int] = None,
+        fetch_backend: str = "apify",
+        error_sink: Optional[Callable[[BaseException, int], None]] = None,
     ) -> None:
         # Positive = Telegram chat, negative = web-only account (the
         # search pipeline skips Telegram delivery for those and serves
@@ -92,7 +102,18 @@ class ContinuousSearcher:
         self._chat_id = int(chat_id)
         self._interval = int(interval_seconds)
         self._search_run = search_run_callable or _default_search_run
+        # Best-effort operator alert on an iteration that raised. Injected so
+        # this module stays pipeline-free (owns nothing); bot.py wires it to
+        # the same error_capture -> deliver_alert path the rest of the bot
+        # uses. Called `(exc, iteration)`; must never raise. None disables it
+        # (unit tests, daily-cron path).
+        self._error_sink = error_sink
         self._clock = clock or time.time
+        # Which global-fetch backend this user's loop drives. "apify" (DEFAULT)
+        # = published Apify actors; "local" = DEPRECATED legacy in-process
+        # scrapers (rollback only). bot.py sets this per-user via
+        # `_backend_for_chat`; the default here keeps Apify the standard path.
+        self._fetch_backend = str(fetch_backend or "apify")
 
         # Pull the floor from defaults when the caller leaves it unset.
         # Lazy import keeps the module test-friendly (defaults pulls in
@@ -150,6 +171,77 @@ class ContinuousSearcher:
                 started = self._clock()
                 self._iterations += 1
                 iteration = self._iterations
+                # Per-user auto-search opt-out: if the user toggled it OFF
+                # (bottom-bar button), skip this run entirely and sleep. The
+                # thread stays alive and re-checks each cycle, so toggling ON
+                # resumes searches without a respawn. Default ON for unknown
+                # users / NULL flag, so this never silences a user who never
+                # opted out.
+                try:
+                    auto_on = self._db.get_auto_search_enabled(self._chat_id)
+                except Exception:
+                    auto_on = True  # never let a flag-read error wedge the loop
+                if not auto_on:
+                    log.info(
+                        "continuous_searcher iter=%d chat_id=%d: auto-search OFF "
+                        "— skipping run",
+                        iteration, self._chat_id,
+                    )
+                    await asyncio.sleep(self._next_sleep(0.0))
+                    continue
+
+                # Bot-blocked tombstone: if the user blocked the bot / deleted
+                # their account, sending is impossible, so skip the whole run
+                # (no fetch, no LLM spend) and sleep. Their data is retained;
+                # an inbound message clears the flag (bot._maybe_resume_blocked)
+                # and searches resume without a respawn.
+                try:
+                    blocked = self._db.is_blocked(self._chat_id)
+                except Exception:
+                    blocked = False  # never let a flag-read error wedge the loop
+                if blocked:
+                    log.info(
+                        "continuous_searcher iter=%d chat_id=%d: user blocked bot "
+                        "— skipping run (data retained; resumes on return)",
+                        iteration, self._chat_id,
+                    )
+                    await asyncio.sleep(self._next_sleep(0.0))
+                    continue
+
+                # Feedback-digest loop: refresh this user's LLM-distilled
+                # 👍/👎 preference notes (if enough new feedback has
+                # accumulated) BEFORE this iteration's search/scoring runs,
+                # so a just-crossed threshold shows up in THIS run's
+                # prefs_text rather than the next one. Best-effort — the
+                # module itself never raises, but this try/except is a
+                # second line of defense: a digest problem must never
+                # cancel the user's actual search iteration.
+                try:
+                    feedback_digest.maybe_run_feedback_digest(self._db, self._chat_id)
+                except Exception:
+                    log.exception(
+                        "continuous_searcher iter=%d chat_id=%d: "
+                        "feedback digest raised — continuing search anyway",
+                        iteration, self._chat_id,
+                    )
+
+                # Shared with `bot.trigger_job_check` — a manual "Check Now"
+                # firing mid-iteration used to race this scheduled run, both
+                # calling `search_jobs.run` for the same chat concurrently.
+                # `sent_messages` dedupe is check-then-act, so both saw
+                # "not sent yet" and both delivered — duplicate messages to
+                # the user. Skip this iteration rather than block/queue: the
+                # next tick picks up whatever the manual check didn't cover.
+                lock = lock_for(self._chat_id)
+                if not lock.acquire(blocking=False):
+                    log.info(
+                        "continuous_searcher iter=%d chat_id=%d: manual check "
+                        "in progress — skipping this iteration",
+                        iteration, self._chat_id,
+                    )
+                    await asyncio.sleep(self._next_sleep(0.0))
+                    continue
+
                 log.info(
                     "continuous_searcher iter=%d chat_id=%d: starting search",
                     iteration, self._chat_id,
@@ -172,6 +264,8 @@ class ContinuousSearcher:
                         "continuous_searcher iter=%d: search raised %s",
                         iteration, type(e).__name__,
                     )
+                finally:
+                    lock.release()
 
                 elapsed = max(0.0, self._clock() - started)
                 if error is None:
@@ -184,6 +278,19 @@ class ContinuousSearcher:
                         "continuous_searcher iter=%d: failed after %.1fs (%s)",
                         iteration, elapsed, type(error).__name__,
                     )
+                    # Alert the operator. Only for `Exception` (KeyboardInterrupt/
+                    # SystemExit are not operational faults). If the error already
+                    # went through search_jobs.run's own error_capture, the shared
+                    # fingerprint+hour dedup suppresses the duplicate here, so this
+                    # only fires for faults outside that inner capture.
+                    if self._error_sink is not None and isinstance(error, Exception):
+                        try:
+                            self._error_sink(error, iteration)
+                        except Exception:
+                            log.exception(
+                                "continuous_searcher iter=%d: error_sink raised",
+                                iteration,
+                            )
 
                 sleep_for = self._next_sleep(elapsed)
                 log.debug(
@@ -220,6 +327,7 @@ class ContinuousSearcher:
         return self._search_run(
             only_chat=self._chat_id,
             cycle_index=self._iterations,
+            fetch_backend=self._fetch_backend,
         )
 
     def _next_sleep(self, elapsed: float) -> float:
