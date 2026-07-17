@@ -23,8 +23,10 @@ Usage:
 from __future__ import annotations
 
 import os
+import sqlite3
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -161,6 +163,40 @@ class FakeStore:
 
     def mark_alert_delivered(self, event_id: int) -> None:
         self.delivered_event_ids.append(event_id)
+
+
+class TinySummaryDB:
+    def __init__(self) -> None:
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.row_factory = sqlite3.Row
+        self.conn.executescript(
+            """
+            CREATE TABLE claude_calls (
+                finished_at REAL, cost_actual_us INTEGER, cost_estimate_us INTEGER,
+                input_tokens INTEGER, output_tokens INTEGER,
+                cache_read_tokens INTEGER, cache_creation_tokens INTEGER
+            );
+            CREATE TABLE sent_messages (chat_id INTEGER, message_id INTEGER, job_id TEXT, sent_at REAL);
+            CREATE TABLE jobs (
+                job_id TEXT PRIMARY KEY, source TEXT, title TEXT, company TEXT, url TEXT
+            );
+            CREATE TABLE job_scores (
+                chat_id INTEGER, job_id TEXT, profile_hash TEXT,
+                match_score INTEGER, scored_at REAL
+            );
+            CREATE TABLE digest_run_jobs (
+                chat_id INTEGER, run_id INTEGER, job_id TEXT, match_score INTEGER,
+                enrichment_json TEXT, sent_floor INTEGER, recorded_at REAL
+            );
+            """
+        )
+
+    @contextmanager
+    def _conn(self):
+        yield self.conn
+
+    def get_min_match_score(self, chat_id: int) -> int:
+        return 4
 
 
 def _now_minus(seconds: float) -> float:
@@ -391,7 +427,13 @@ _seed_default(store)
 summary = build_daily_summary(store, 2031, db=None)
 check("<pre>" not in summary and "│" not in summary,
       "no table / box-drawing formatting")
-check("👤 100 — 31 positions sent" in summary, "user-id + positions headline")
+# Sources span two chats (100 + 200) → multi-user flush render: fleet
+# headline + one 👤 section per user (db=None so the per-user lists are
+# empty and the headline falls back to the run's jobs_sent tally).
+check("🌊 Digest flush — 2 users, 31 positions sent" in summary,
+      "multi-user flush headline")
+check("👤 100 — 0 positions" in summary and "👤 200 — 0 positions" in summary,
+      "one section per user chat")
 check("💵 $" in summary, "total_cost_usd row present")
 check("cache-read" in summary and "total)" in summary, "token usage line present")
 
@@ -435,6 +477,56 @@ check(out.count("👤") == 1, "exactly one run rendered")
 
 
 # ---------------------------------------------------------------------------
+# 7b. build_daily_summary — source block includes cached + buffered sources
+# ---------------------------------------------------------------------------
+print("\n7b. build_daily_summary — source block includes cached + buffered sources")
+
+store3b = FakeStore()
+db3b = TinySummaryDB()
+run = {
+    "id": 200, "kind": "daily_digest", "status": "ok", "exit_code": 0,
+    "users_total": 1, "jobs_raw": 10, "jobs_sent": 1, "error_count": 0,
+    "started_at": now - 100, "finished_at": now,
+    "extra_json": None,
+}
+store3b.run_with_sources[200] = (run, [
+    {"source_key": "linkedin", "status": "ok", "raw_count": 10, "user_chat_id": 111},
+])
+db3b.conn.executemany(
+    "INSERT INTO jobs (job_id, source, title, company, url) VALUES (?, ?, ?, ?, ?)",
+    [
+        ("li1", "linkedin", "LinkedIn role", "A", "https://linkedin.example/1"),
+        ("hn1", "hackernews", "HN role", "B", "https://news.ycombinator.com/item?id=1"),
+        ("buf1", "builtin", "Buffered role", "C", "https://builtin.example/1"),
+    ],
+)
+db3b.conn.executemany(
+    "INSERT INTO job_scores (chat_id, job_id, match_score, scored_at) VALUES (?, ?, ?, ?)",
+    [
+        (111, "li1", 4, now - 50),
+        (111, "hn1", 5, now - 50),
+        (111, "buf1", 4, now - 1000),
+    ],
+)
+db3b.conn.executemany(
+    "INSERT INTO digest_run_jobs (chat_id, run_id, job_id, match_score, enrichment_json, sent_floor, recorded_at) VALUES (?, ?, ?, ?, '{}', ?, ?)",
+    [
+        (111, 200, "li1", 4, None, now - 50),
+        (111, 200, "hn1", 5, None, now - 50),
+    ],
+)
+db3b.conn.execute(
+    "INSERT INTO sent_messages (chat_id, message_id, job_id, sent_at) VALUES (?, ?, ?, ?)",
+    (111, 1, "buf1", now - 10),
+)
+out = build_daily_summary(store3b, 200, db=db3b)
+check("📊 By source (seen · cleared ≥4 · sent):" in out, "new source header visible")
+check("• linkedin: 10 · 1 · 0" in out, "instrumented source still renders")
+check("• hackernews: 1 · 1 · 0" in out, "digest-run source without source_run renders")
+check("• builtin: 0 · 0 · 1" in out, "buffered sent-only source renders")
+
+
+# ---------------------------------------------------------------------------
 # 8. build_daily_summary — only the requested run is rendered (single row)
 # ---------------------------------------------------------------------------
 # Per 2026-05-26 operator request, the body shows ONLY the iter that just
@@ -461,9 +553,52 @@ check(out.count("👤") == 1,
 
 
 # ---------------------------------------------------------------------------
-# 9. deliver_daily_summary — quiet_alerts=on → no send
+# 9. build_daily_summary — duplicate historical scores do not duplicate sent jobs
 # ---------------------------------------------------------------------------
-print("\n9. deliver_daily_summary — quiet_alerts gating")
+print("\n9. build_daily_summary — duplicate score rows")
+
+store_scores = FakeStore()
+db_scores = TinySummaryDB()
+now = time.time()
+run_scores = {
+    "id": 150, "kind": "daily_digest", "status": "ok", "exit_code": 0,
+    "users_total": 1, "jobs_raw": 1, "jobs_sent": 1, "error_count": 0,
+    "started_at": now - 120, "finished_at": now,
+    "extra_json": None,
+}
+store_scores.run_with_sources[150] = (run_scores, [
+    {"source_key": "linkedin", "status": "ok", "raw_count": 1, "user_chat_id": 100},
+])
+with db_scores._conn() as c:
+    c.execute(
+        "INSERT INTO jobs (job_id, source, title, company, url) VALUES (?, ?, ?, ?, ?)",
+        ("job-1", "linkedin", "Duplicate Candidate", "Acme", "https://example.test/job-1"),
+    )
+    c.execute(
+        "INSERT INTO sent_messages (chat_id, message_id, job_id, sent_at) VALUES (?, ?, ?, ?)",
+        (100, 10, "job-1", now - 10),
+    )
+    c.executemany(
+        """
+        INSERT INTO job_scores (chat_id, job_id, profile_hash, match_score, scored_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        [
+            (100, "job-1", "old-profile", 0, now - 100),
+            (100, "job-1", "send-profile", 4, now - 20),
+        ],
+    )
+
+out = build_daily_summary(store_scores, 150, db=db_scores)
+check("👤 100 — 1 position sent" in out, "headline counts one sent message")
+check(out.count("Duplicate Candidate") == 1, "sent job rendered once")
+check("[4]" in out and "[0]" not in out, "latest send-time score selected")
+
+
+# ---------------------------------------------------------------------------
+# 10. deliver_daily_summary — quiet_alerts=on → no send
+# ---------------------------------------------------------------------------
+print("\n10. deliver_daily_summary — quiet_alerts gating")
 
 store = FakeStore()
 _seed_default(store)
@@ -501,9 +636,9 @@ check(ok, "broken store → deliver_daily_summary swallows")
 
 
 # ---------------------------------------------------------------------------
-# 10. cmd_health — output anchors
+# 11. cmd_health — output anchors
 # ---------------------------------------------------------------------------
-print("\n10. cmd_health — render anchors")
+print("\n11. cmd_health — render anchors")
 
 store = FakeStore()
 _seed_default(store)
@@ -530,9 +665,9 @@ check(contains_all(text, [
 
 
 # ---------------------------------------------------------------------------
-# 11. cmd_stats — both windows render with key sections
+# 12. cmd_stats — both windows render with key sections
 # ---------------------------------------------------------------------------
-print("\n11. cmd_stats — render anchors")
+print("\n12. cmd_stats — render anchors")
 
 store = FakeStore()
 _seed_default(store)
@@ -566,9 +701,9 @@ check("last 7d" not in text, "/stats 24h omits last 7d column")
 
 
 # ---------------------------------------------------------------------------
-# 12. cmd_alerts — toggle behavior
+# 13. cmd_alerts — toggle behavior
 # ---------------------------------------------------------------------------
-print("\n12. cmd_alerts — toggle behavior")
+print("\n13. cmd_alerts — toggle behavior")
 
 store = FakeStore()
 tg = FakeTG()
@@ -605,9 +740,9 @@ check("usage:" in tg.sends[-1]["text"], "unknown arg shows usage")
 
 
 # ---------------------------------------------------------------------------
-# 13. cmd_runlog — N clamping + render anchors
+# 14. cmd_runlog — N clamping + render anchors
 # ---------------------------------------------------------------------------
-print("\n13. cmd_runlog — clamping and anchors")
+print("\n14. cmd_runlog — clamping and anchors")
 
 store = FakeStore()
 _seed_default(store)
@@ -648,9 +783,9 @@ check("no pipeline runs" in tg.sends[0]["text"], "empty store shows friendly mes
 
 
 # ---------------------------------------------------------------------------
-# 14. handle_operator_command — dispatch + ghosting
+# 15. handle_operator_command — dispatch + ghosting
 # ---------------------------------------------------------------------------
-print("\n14. handle_operator_command — dispatch and ghosting")
+print("\n15. handle_operator_command — dispatch and ghosting")
 
 store = FakeStore()
 _seed_default(store)

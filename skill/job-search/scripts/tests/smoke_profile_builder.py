@@ -4,12 +4,16 @@
 Covers every piece that doesn't need the real `claude` CLI:
 
   1. profile_schema_validate — good fixture passes
-  2. profile_schema_validate — 10 hand-written bad profiles each surface
-     a specific error
-  3. build_profile_sync — fixture-backed Opus stub returns OK
+  2. profile_schema_validate — bad profiles each surface a specific error
+  2b. profile_schema_validate — v5 location patterns pass (hybrid-Spain /
+      remote-EU / onsite-Bilbao / remote-earth-except / country-level onsite)
+  2c. profile_schema_validate — legacy v3/v2 profiles still LOAD (back-compat)
+  3. build_profile_sync — fixture-backed Opus stub returns OK (v5)
+  3b. build_profile_sync — location canonicalizer (lowercase/dedupe/alias,
+      no country→city expansion)
   4. build_profile_sync — stub that returns malformed text → parse_error
-  5. build_profile_sync — stub that returns a schema-invalid profile →
-     validation_error
+  5. build_profile_sync — stub missing a v5 location field → validation_error
+  5b. build_profile_sync — stale v3 shape rejected (build path requires sv=5)
   6. build_profile_sync — stub that simulates CLI missing → cli_missing_or_timeout
   7. ProfileBuilderQueue — 5 rapid prefs_change enqueues debounce into 1 call
   8. ProfileBuilderQueue — resume_upload runs immediately (no debounce)
@@ -62,7 +66,7 @@ def check(cond: bool, label: str) -> None:
 
 def _good_profile() -> dict:
     return {
-        "schema_version": 2,
+        "schema_version": 5,
         "ideal_fit_paragraph": "Mid-level frontend engineer.",
         "primary_role": "frontend engineer",
         "target_levels": ["mid", "middle"],
@@ -75,8 +79,10 @@ def _good_profile() -> dict:
         "title_exclude": ["senior", "staff", "backend"],
         "exclude_keywords": ["wordpress", "drupal"],
         "exclude_companies": ["Crossover"],
-        "locations": ["bilbao", "spain", "europe"],
-        "remote": "remote",
+        # v5 — three granularity-agnostic location lists.
+        "remote_locations": ["europe", "eu", "spain"],
+        "hybrid_locations": ["bilbao", "basque", "euskadi"],
+        "onsite_locations": ["bilbao", "basque", "euskadi"],
         "time_zone_band": "UTC-1..UTC+3",
         "salary_min_usd": 0,
         "drop_if_salary_unknown": False,
@@ -129,9 +135,21 @@ bad_cases = [
     ("schema_version wrong",
      lambda: _with(schema_version=1),
      "schema_version"),
-    ("remote not in enum",
-     lambda: _with(remote="sometimes"),
-     "remote must be one of"),
+    ("remote_locations wrong type",
+     lambda: _with(remote_locations="bilbao"),
+     "remote_locations must be a list of strings"),
+    ("hybrid_locations missing",
+     lambda: _with(hybrid_locations=pb),
+     "missing keys"),
+    ("remote_locations not lowercase",
+     lambda: _with(remote_locations=["Bilbao"]),
+     "remote_locations must be all-lowercase"),
+    ("remote_locations mixed string/non-string not silently dropped",
+     lambda: _with(remote_locations=["europe", 42]),
+     "remote_locations must be a list of strings"),
+    ("remote_locations mixed string/non-string not silently dropped",
+     lambda: _with(remote_locations=["europe", 42]),
+     "remote_locations must be a list of strings"),
     ("title_must_match not lowercase",
      lambda: _with(title_must_match=["Frontend"]),
      "must be all-lowercase"),
@@ -181,6 +199,80 @@ for label, mutate, expect_sub in bad_cases:
 
 
 # ---------------------------------------------------------------------------
+# 2b. v5 location patterns pass validation (containment-friendly shapes)
+# ---------------------------------------------------------------------------
+print("\n2b. profile_schema_validate — v5 location patterns pass")
+
+
+def _v5_loc(**loc) -> dict:
+    """Build a minimal v5 profile with the given location lists."""
+    p = _good_profile()
+    p.pop("remote_locations", None)
+    p.pop("hybrid_locations", None)
+    p.pop("onsite_locations", None)
+    p.update(loc)
+    return p
+
+
+v5_patterns = [
+    # (label, location-fields dict)
+    ("hybrid-Spain + remote-EU + onsite-Bilbao",
+     {"remote_locations": ["europe", "eu", "spain"],
+      "hybrid_locations": ["spain"],
+      "onsite_locations": ["bilbao", "basque", "euskadi"]}),
+    ("remote-EU only (no hybrid, no onsite)",
+     {"remote_locations": ["europe", "eu", "spain"],
+      "hybrid_locations": [],
+      "onsite_locations": []}),
+    ("onsite-Bilbao only (no remote, no hybrid)",
+     {"remote_locations": [],
+      "hybrid_locations": [],
+      "onsite_locations": ["bilbao", "basque", "euskadi"]}),
+    # The user's actual case: remote everywhere except RU/UA/BY (expressed as
+    # "earth" — the scorer reads the verbatim exclusions from prefs_text),
+    # hybrid + remote in Spain, onsite in Bilbao.
+    ("remote-earth-except + hybrid-Spain + onsite-Bilbao",
+     {"remote_locations": ["earth"],
+      "hybrid_locations": ["spain"],
+      "onsite_locations": ["bilbao", "basque", "euskadi"]}),
+    ("country-level onsite (relocate anywhere in Germany)",
+     {"remote_locations": [],
+      "hybrid_locations": [],
+      "onsite_locations": ["germany"]}),
+]
+for label, loc in v5_patterns:
+    errs = profile_schema_validate(_v5_loc(**loc))
+    check(errs == [], f"{label} is valid (got errs={errs})")
+
+
+# ---------------------------------------------------------------------------
+# 2c. Legacy v3/v2 profiles still LOAD (back-compat — no v5 fields)
+# ---------------------------------------------------------------------------
+print("\n2c. profile_schema_validate — legacy v3/v2 profiles still load")
+
+legacy_v3 = _good_profile()
+legacy_v3["schema_version"] = 3
+legacy_v3.pop("remote_locations", None)
+legacy_v3.pop("hybrid_locations", None)
+legacy_v3["onsite_locations"] = ["bilbao", "basque", "euskadi"]
+legacy_v3["remote_regions"] = ["spain", "europe", "eu", "emea"]
+legacy_v3["locations"] = ["bilbao", "basque", "euskadi", "spain", "europe", "eu", "emea"]
+legacy_v3["remote"] = "any"
+errs = profile_schema_validate(legacy_v3)
+check(errs == [], f"legacy v3 profile loads (got errs={errs})")
+
+legacy_v2 = _good_profile()
+legacy_v2["schema_version"] = 2
+legacy_v2.pop("remote_locations", None)
+legacy_v2.pop("hybrid_locations", None)
+legacy_v2.pop("onsite_locations", None)
+legacy_v2["locations"] = ["bilbao", "spain", "europe"]
+legacy_v2["remote"] = "remote"
+errs = profile_schema_validate(legacy_v2)
+check(errs == [], f"legacy v2 profile loads (got errs={errs})")
+
+
+# ---------------------------------------------------------------------------
 # 3. build_profile_sync — happy path with stubbed run_p
 # ---------------------------------------------------------------------------
 print("\n3. build_profile_sync — happy-path stub")
@@ -200,12 +292,46 @@ res = build_profile_sync(
 check(res.status == "ok", f"status is ok (got {res.status!r})")
 check(res.profile is not None, "profile is present")
 if res.profile is not None:
-    check(res.profile.get("schema_version") == 2, "schema_version stamped")
+    check(res.profile.get("schema_version") == 5, "schema_version stamped as 5")
     check("built_at" in res.profile, "built_at stamped")
     check(res.profile.get("built_from", {}).get("resume_sha1") == sha1_hex(
         "Candidate — 5y Vue/React/TS frontend dev, remote EU."
     ), "resume_sha1 stamped by us, not the model")
     check(res.profile.get("built_from", {}).get("model") == "opus", "model stamped")
+    # v5 location lists survive the build path.
+    check(res.profile.get("remote_locations") == ["europe", "eu", "spain"],
+          "remote_locations preserved through build")
+    check(res.profile.get("hybrid_locations") == ["bilbao", "basque", "euskadi"],
+          "hybrid_locations preserved through build")
+    check(res.profile.get("onsite_locations") == ["bilbao", "basque", "euskadi"],
+          "onsite_locations preserved through build")
+
+
+# ---------------------------------------------------------------------------
+# 3b. build_profile_sync — location canonicalizer (lowercase/dedupe/alias)
+# ---------------------------------------------------------------------------
+print("\n3b. build_profile_sync — location canonicalizer")
+
+
+def _fake_run_p_messy_loc(prompt: str, timeout_s: int, model: str | None = None) -> str:
+    messy = _good_profile()
+    # Mixed-case, duplicate, and aliased tokens — the canonicalizer must
+    # lowercase, dedupe, and alias-map WITHOUT expanding country→city.
+    messy["remote_locations"] = ["Europe", "europe", "USA", "U.K."]
+    messy["hybrid_locations"] = ["Spain", "spain", ""]
+    messy["onsite_locations"] = ["Bilbao", "bilbao"]
+    return json.dumps({"result": json.dumps(messy, ensure_ascii=False)})
+
+
+res = build_profile_sync("resume", "prefs", _run_p=_fake_run_p_messy_loc)
+check(res.status == "ok", f"messy-loc build ok (got {res.status!r}, {res.error!r})")
+if res.status == "ok" and res.profile is not None:
+    check(res.profile["remote_locations"] == ["europe", "united states", "united kingdom"],
+          f"remote_locations canonicalized (got {res.profile['remote_locations']})")
+    check(res.profile["hybrid_locations"] == ["spain"],
+          f"hybrid_locations deduped + lowered (got {res.profile['hybrid_locations']})")
+    check(res.profile["onsite_locations"] == ["bilbao"],
+          f"onsite_locations deduped + lowered (got {res.profile['onsite_locations']})")
 
 
 # ---------------------------------------------------------------------------
@@ -231,13 +357,40 @@ print("\n5. build_profile_sync — schema-invalid response → validation_error"
 
 def _fake_run_p_bad_schema(prompt: str, timeout_s: int, model: str | None = None) -> str:
     bad = _good_profile()
-    bad["remote"] = "sometimes"
+    # v5 requires all three location lists — drop one.
+    bad.pop("hybrid_locations", None)
     return json.dumps({"result": json.dumps(bad)})
 
 
 res = build_profile_sync("resume", "prefs", _run_p=_fake_run_p_bad_schema)
 check(res.status == "validation_error", f"status validation_error (got {res.status!r})")
-check(res.error and "remote" in res.error, f"error surfaces 'remote' (got {res.error!r})")
+check(res.error and "hybrid_locations" in res.error,
+      f"error surfaces 'hybrid_locations' (got {res.error!r})")
+
+
+# ---------------------------------------------------------------------------
+# 5b. build_profile_sync — a stale v3 shape is REJECTED (build path requires v5)
+# ---------------------------------------------------------------------------
+print("\n5b. build_profile_sync — stale v3 shape rejected (build requires sv=5)")
+
+
+def _fake_run_p_v3(prompt: str, timeout_s: int, model: str | None = None) -> str:
+    # A model that ignored the v5 schema and emitted the old v3 shape.
+    v3 = _good_profile()
+    v3["schema_version"] = 3
+    v3.pop("remote_locations", None)
+    v3.pop("hybrid_locations", None)
+    v3["onsite_locations"] = ["bilbao", "basque", "euskadi"]
+    v3["remote_regions"] = ["spain", "europe", "eu", "emea"]
+    v3["locations"] = ["bilbao", "spain", "europe"]
+    v3["remote"] = "any"
+    return json.dumps({"result": json.dumps(v3)})
+
+
+res = build_profile_sync("resume", "prefs", _run_p=_fake_run_p_v3)
+check(res.status == "validation_error", f"v3 stub rejected (got {res.status!r})")
+check(res.error and "schema_version=5" in res.error,
+      f"error mentions schema_version=5 (got {res.error!r})")
 
 
 # ---------------------------------------------------------------------------

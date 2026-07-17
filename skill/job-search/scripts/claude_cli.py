@@ -25,9 +25,96 @@ import logging
 import os
 import shutil
 import subprocess
+import threading
 from typing import Any
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Structured failure channel.
+#
+# `run_p` / `run_p_with_tools` return a bare `str | None` — `None` on ANY
+# failure. That collapses five distinct causes (binary absent, timeout,
+# subprocess start error, non-zero exit with an empty envelope, non-zero exit
+# whose stdout envelope actually carried an API error like a rate limit) into
+# one indistinguishable value. Downstream, `instrumentation.wrappers` then
+# labelled every `None` as `cli_missing`, so the DB read "CLI missing" even
+# when the binary was present and the real cause was an API error mid-run.
+#
+# We keep the `str | None` return contract (raw callers are unchanged) and
+# publish the *reason* for the most recent failure out-of-band via a
+# thread-local. The instrumented wrapper pops it right after a `None` return to
+# record an honest status + exit_code. Thread-local (not a module global) so
+# parallel liveness verifiers don't clobber each other's reason.
+_last_failure = threading.local()
+
+# Reason tags (also the DB `status` values the wrapper maps them to):
+#   cli_absent   — `claude` not on PATH (the ONLY true "missing CLI" case)
+#   timeout      — subprocess.TimeoutExpired
+#   start_error  — subprocess failed to start (OSError etc.)
+#   nonzero_exit — exit != 0 with no parseable error envelope on stdout
+#   api_error    — exit != 0 but stdout envelope carried is_error/api_error_status
+#                  (rate limit, overloaded, usage limit — the real culprit)
+
+
+def _set_failure(
+    reason: str,
+    *,
+    exit_code: int | None = None,
+    stderr_head: str = "",
+    stdout_head: str = "",
+    api_error_status: str | None = None,
+) -> None:
+    _last_failure.detail = {
+        "reason": reason,
+        "exit_code": exit_code,
+        "stderr_head": stderr_head,
+        "stdout_head": stdout_head,
+        "api_error_status": api_error_status,
+    }
+
+
+def pop_last_failure() -> dict[str, Any] | None:
+    """Return + clear the structured detail of the most recent CLI failure on
+    this thread, or None if the last call succeeded / nothing ran. Consumed by
+    `instrumentation.wrappers` to label the `claude_calls` row honestly."""
+    detail = getattr(_last_failure, "detail", None)
+    _last_failure.detail = None
+    return detail
+
+
+def _classify_nonzero(exit_code: int, stdout: str, stderr: str) -> None:
+    """Record a non-zero-exit failure, mining the (otherwise discarded) stdout
+    JSON envelope for the real cause. `claude -p --output-format json` prints
+    its result/error envelope to stdout and often leaves stderr EMPTY, so
+    logging only stderr produced the useless `err=` blank lines in prod."""
+    stdout_head = (stdout or "")[:600]
+    api_error_status = None
+    is_error = False
+    result_head = ""
+    try:
+        env = json.loads(stdout) if stdout.strip() else {}
+        if isinstance(env, dict):
+            api_error_status = env.get("api_error_status")
+            is_error = bool(env.get("is_error"))
+            result_head = str(env.get("result") or "")[:200]
+    except (json.JSONDecodeError, ValueError):
+        pass
+    reason = "api_error" if (api_error_status or is_error) else "nonzero_exit"
+    _set_failure(
+        reason,
+        exit_code=exit_code,
+        stderr_head=(stderr or "")[:200],
+        stdout_head=stdout_head,
+        api_error_status=api_error_status,
+    )
+    # Surface the REAL diagnostic: envelope api_error_status + result text, not
+    # the (usually empty) stderr that made prod logs read `err=`.
+    log.warning(
+        "claude_cli: exit=%s api_error_status=%s is_error=%s result=%r stderr=%r",
+        exit_code, api_error_status, is_error, result_head, (stderr or "")[:200],
+    )
 
 
 # The smallest / cheapest Claude model we use for high-volume matching calls
@@ -97,10 +184,10 @@ MID_MODEL = os.environ.get("CLAUDE_MID_MODEL", "sonnet")
 TOOLS_WEB_BOTH = "WebSearch,WebFetch"
 
 #: Allow ONLY WebFetch (no search). Used by callers that load a known URL
-#: directly (no discovery step) — currently ``sources/curated_boards.py``,
-#: which points Claude at a specific landing page and parses what it
-#: returns. Keeping the allow list minimal narrows the prompt-injection
-#: attack surface.
+#: directly (no discovery step) — currently ``sources/un_careers.py`` and
+#: ``sources/curated_boards.py``, both of which point Claude at a specific
+#: landing page and parse what it returns. Keeping the allow list minimal
+#: narrows the prompt-injection attack surface.
 TOOLS_WEB_FETCH_ONLY = "WebFetch"
 
 #: Deny shell + filesystem read/write. Use as the canonical
@@ -114,6 +201,29 @@ TOOLS_DENY_SHELL_FS = "Bash,Edit,Write,Read"
 #: filesystem. Equivalent to `TOOLS_WEB_BOTH + "," + TOOLS_DENY_SHELL_FS`
 #: but spelled out so the wire format is grep-able.
 TOOLS_DENY_WEB_AND_SHELL_FS = "WebSearch,WebFetch,Bash,Edit,Write,Read"
+
+
+#: Env vars the `claude` CLI honours as an auth source *in preference to* the
+#: subscription OAuth token in ~/.claude/.credentials.json. We authenticate as a
+#: subscription, so any of these shadow the login and 401 every call. Verified
+#: against the CLI on prod 2026-07-09: a bad ANTHROPIC_AUTH_TOKEN yields "401
+#: Invalid bearer token", and the CLI itself warns that ANTHROPIC_API_KEY "takes
+#: precedence over your claude.ai login". (CLAUDE_CODE_OAUTH_TOKEN is ignored by
+#: the CLI, so it is not worth stripping.)
+_SHADOWING_AUTH_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+
+
+def _subscription_env() -> dict[str, str]:
+    """The process env minus any API-key auth source.
+
+    Every `claude` invocation in this codebase must authenticate as the
+    subscription, so this is unconditional rather than a per-call flag. It used
+    to be an opt-in `subscription_auth_only=True` that only `prewarm_token`
+    passed — which meant the health check stripped the key and reported `ok`
+    while the enrich/liveness fan-out inherited it and 401'd. Strip once, here,
+    where every call site routes through.
+    """
+    return {k: v for k, v in os.environ.items() if k not in _SHADOWING_AUTH_VARS}
 
 
 def run_p(
@@ -135,27 +245,32 @@ def run_p(
     """
     if not shutil.which("claude"):
         log.warning("claude_cli: `claude` CLI not found on PATH")
+        _set_failure("cli_absent")
         return None
     cmd = ["claude", "-p", prompt, "--output-format", output_format]
     if model:
         cmd += ["--model", model]
+    env = _subscription_env()
     try:
         proc = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             timeout=timeout_s,
-            env=dict(os.environ),
+            env=env,
         )
     except subprocess.TimeoutExpired:
         log.error("claude_cli: timed out after %ds", timeout_s)
+        _set_failure("timeout", stderr_head=f"timeout after {timeout_s}s")
         return None
     except Exception as e:
         log.error("claude_cli: failed to start: %s", e)
+        _set_failure("start_error", stderr_head=str(e)[:200])
         return None
     if proc.returncode != 0:
-        log.error("claude_cli: exit=%s err=%s", proc.returncode, (proc.stderr or "")[:200])
+        _classify_nonzero(proc.returncode, proc.stdout or "", proc.stderr or "")
         return None
+    _last_failure.detail = None
     return proc.stdout or ""
 
 
@@ -180,6 +295,7 @@ def run_p_with_tools(
     """
     if not shutil.which("claude"):
         log.warning("claude_cli: `claude` CLI not found on PATH")
+        _set_failure("cli_absent")
         return None
 
     def _build_cmd(with_tool_flags: bool) -> list[str]:
@@ -217,23 +333,26 @@ def run_p_with_tools(
                 capture_output=True,
                 text=True,
                 timeout=timeout_s,
-                env=dict(os.environ),
+                env=_subscription_env(),
                 cwd=cwd,
             )
         except subprocess.TimeoutExpired:
             log.error("claude_cli: run_p_with_tools timed out after %ds", timeout_s)
+            _set_failure("timeout", stderr_head=f"timeout after {timeout_s}s")
             return None
         except Exception as e:
             log.error("claude_cli: run_p_with_tools failed to start: %s", e)
+            _set_failure("start_error", stderr_head=str(e)[:200])
             return None
         return proc.returncode, proc.stdout or "", proc.stderr or ""
 
     cmd = _build_cmd(with_tool_flags=True)
     result = _invoke(cmd)
     if result is None:
-        return None
+        return None  # _invoke already set the failure detail (timeout/start_error)
     rc, stdout, stderr = result
     if rc == 0:
+        _last_failure.detail = None
         return stdout
 
     # Non-zero: decide whether to retry without the tool flags.
@@ -244,9 +363,12 @@ def run_p_with_tools(
         and (allowed_tools or disallowed_tools)
     )
     if not needs_fallback:
+        # Mine the stdout envelope for the real cause (api_error_status) — the
+        # dominant prod failure is exit=1 with EMPTY stderr and the error
+        # hiding in the JSON envelope we used to discard.
+        _classify_nonzero(rc, stdout, stderr)
         log.warning(
-            "claude_cli: run_p_with_tools exit=%s argv=%s err=%s",
-            rc, _argv_summary(cmd), err_head[:200],
+            "claude_cli: run_p_with_tools exit=%s argv=%s", rc, _argv_summary(cmd),
         )
         return None
 
@@ -254,15 +376,86 @@ def run_p_with_tools(
     cmd2 = _build_cmd(with_tool_flags=False)
     result2 = _invoke(cmd2)
     if result2 is None:
-        return None
+        return None  # _invoke set the failure detail
     rc2, stdout2, stderr2 = result2
     if rc2 == 0:
+        _last_failure.detail = None
         return stdout2
+    _classify_nonzero(rc2, stdout2, stderr2)
     log.warning(
-        "claude_cli: run_p_with_tools fallback exit=%s argv=%s err=%s",
-        rc2, _argv_summary(cmd2), (stderr2 or "")[:200],
+        "claude_cli: run_p_with_tools fallback exit=%s argv=%s", rc2, _argv_summary(cmd2),
     )
     return None
+
+
+def prewarm_token(model: str | None = None, timeout_s: int = 60) -> tuple[str, str]:
+    """Make ONE serial `claude -p` call to refresh the OAuth access token
+    before the parallel enrich/liveness fan-out, and classify the outcome.
+
+    Returns ``(category, detail)`` where category is one of:
+      * ``ok``        — call succeeded; the OAuth access token is now warm.
+      * ``auth``      — 401/403 / "Invalid authentication" — creds broken.
+      * ``quota``     — usage limit / credit balance exhausted (subscription).
+      * ``transient`` — timeout / 429 / overloaded / network — do NOT alert.
+      * ``cli_absent``— the `claude` binary is not on PATH.
+
+    WHY THIS EXISTS — the refresh-token rotation race:
+      The subscription auth is an 8h OAuth *access* token in
+      ``~/.claude/.credentials.json``, refreshed via a single-use (rotating)
+      *refresh* token. ``job_enrich.enrich_jobs_ai`` fans out ``workers`` (4)
+      concurrent ``claude -p`` subprocesses. When the access token has expired,
+      all N workers try to redeem the SAME refresh token at once — the auth
+      server accepts the first and 401s the rest, and because the redeemed
+      token rotated, the losers can't retry cleanly either. The token never
+      settles, so every run 401-storms until a lone serial call refreshes it
+      (observed in prod 2026-07-05, 07:00–20:00: job_enrich:haiku 76% fail).
+      Calling this ONCE, serially, up front performs that single clean refresh
+      so the downstream pool inherits a valid token.
+    """
+    def _attempt() -> tuple[str, str]:
+        out = run_p(
+            "Reply with: ok",
+            timeout_s=timeout_s,
+            model=model or SMALLEST_MODEL,
+        )
+        if out is not None:
+            return ("ok", "")
+        detail = pop_last_failure() or {}
+        reason = str(detail.get("reason") or "error")
+        status_code = str(detail.get("api_error_status") or "")
+        blob = f"{detail.get('stdout_head', '')} {detail.get('stderr_head', '')}".lower()
+        if reason == "cli_absent":
+            return ("cli_absent", "claude CLI not on PATH")
+        if (
+            status_code.startswith("401")
+            or status_code.startswith("403")
+            or "invalid authentication" in blob
+            or "authenticate" in blob
+            or "oauth" in blob
+        ):
+            return ("auth", f"api_error_status={status_code or '?'}")
+        if (
+            "usage limit" in blob
+            or "credit balance" in blob
+            or "quota" in blob
+            or "insufficient" in blob
+        ):
+            return ("quota", f"{status_code or '-'} {blob[:100]}".strip())
+        # 429 / overloaded / 5xx / timeout / nonzero — transient, not a
+        # subscription fault. Surface but do not page the operator.
+        return ("transient", f"reason={reason} status={status_code or '-'}")
+
+    # The FIRST cold call of an idle searcher cycle triggers an OAuth
+    # access-token refresh against the rotating refresh-token endpoint, which
+    # intermittently returns a transient 401. That single 401 is not broken
+    # creds — the very next call inherits the settled token and succeeds (in
+    # prod the enrich/liveness fan-out right after a prewarm 401 runs at 0%
+    # auth failure). Retry once so a refresh-race 401 clears silently; a truly
+    # broken/expired subscription 401s on BOTH attempts and still pages.
+    cat, detail = _attempt()
+    if cat == "auth":
+        cat, detail = _attempt()
+    return (cat, detail)
 
 
 def extract_assistant_text(cli_stdout: str) -> str:

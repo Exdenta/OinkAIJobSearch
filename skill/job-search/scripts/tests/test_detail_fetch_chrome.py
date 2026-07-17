@@ -96,7 +96,7 @@ def test_chrome_agent_result_is_cached(monkeypatch):
 
     first = detail.fetch_body_text("https://undp.org/job/2")
     assert first == "CHROME RECOVERED BODY"
-    assert detail._BODY_CACHE["https://undp.org/job/2"] == "CHROME RECOVERED BODY"
+    assert detail._BODY_CACHE[("https://undp.org/job/2", False, True)] == "CHROME RECOVERED BODY"
 
     # A second call hits the cache and must NOT invoke the chrome helper again.
     second = detail.fetch_body_text("https://undp.org/job/2")
@@ -129,7 +129,7 @@ def test_chrome_agent_empty_returns_empty(monkeypatch):
     assert out == ""
     assert rec["called"] == 1
     # Empty result is cached as "" too (no infinite re-fetch within a run).
-    assert detail._BODY_CACHE["https://undp.org/job/3"] == ""
+    assert detail._BODY_CACHE[("https://undp.org/job/3", False, True)] == ""
 
 
 def test_chrome_agent_raise_falls_back_to_empty(monkeypatch):

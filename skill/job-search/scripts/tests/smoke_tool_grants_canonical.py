@@ -89,6 +89,7 @@ _LITERAL_EXEMPT = {
     Path(__file__),                                              # this test
     SCRIPTS_ROOT / "tests" / "smoke_market_research.py",         # asserts CLI argv
     SCRIPTS_ROOT / "tests" / "smoke_web_search_aleksandr.py",    # doc-string only
+    SCRIPTS_ROOT / "tests" / "test_un_careers_allowed_tools.py", # asserts wire kwargs
 }
 
 # Files that grant tools via the ``run_p_with_tools`` /
@@ -100,6 +101,7 @@ _TOOL_GRANTING_FILES = (
     SCRIPTS_ROOT / "sources" / "curated_boards.py",
     SCRIPTS_ROOT / "sources" / "devex.py",
     SCRIPTS_ROOT / "sources" / "ub_doctoral.py",
+    SCRIPTS_ROOT / "sources" / "un_careers.py",
     SCRIPTS_ROOT / "sources" / "web_search.py",
     SCRIPTS_ROOT / "telegram_client.py",
 )

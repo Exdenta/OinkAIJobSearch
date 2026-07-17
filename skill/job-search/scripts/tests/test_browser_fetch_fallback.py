@@ -33,6 +33,16 @@ import browser_fetch  # noqa: E402
 import sources._detail_fetch as detail  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _no_late_fallback_tiers(monkeypatch):
+    """The anti-bot chain grew two tiers past the browser (super-scraper
+    API, then the chrome-agent subprocess — default-ON since 691a092).
+    These tests pin the BROWSER tier's contract only; neutralize the later
+    tiers so an empty browser result stays empty instead of spawning a real
+    `claude -p --chrome` subprocess that hits the network."""
+    monkeypatch.setattr(detail, "_try_chrome_agent_fallback", lambda *a, **k: "")
+
+
 # --------------------------------------------------------------------------
 # Helpers: a fake playwright.sync_api module recording whether launch happened
 # --------------------------------------------------------------------------

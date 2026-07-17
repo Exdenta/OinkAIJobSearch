@@ -141,7 +141,23 @@ DEFAULT_HEADERS = {
 }
 
 # Per-process cache so a duplicate URL within the same run only fetches once.
-_BODY_CACHE: dict[str, str] = {}
+# Keyed on (url, min_body_chars>0, allow_chrome_agent) — two callers
+# hitting the same URL with different escalation kwargs must not silently share a
+# thin/escalated result cached under the other's settings.
+_BODY_CACHE: dict[tuple[str, bool, bool, bool], str] = {}
+
+
+def _clean_html(raw: str, *, max_chars: int) -> str:
+    """Strip HTML down to plain text, fix mojibake, cap at `max_chars`."""
+    # Drop script/style/noscript blocks BEFORE strip_html so their inner
+    # text (JS code, CSS, importmap JSON) doesn't end up in the body.
+    raw = _BLOCK_STRIP_RE.sub(" ", raw or "")
+    raw = _COMMENT_RE.sub(" ", raw)
+    raw = _DOCTYPE_RE.sub(" ", raw)
+    text = fix_mojibake(strip_html(raw))
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip() + "…"
+    return text
 
 
 def fetch_body_text(
@@ -150,18 +166,32 @@ def fetch_body_text(
     timeout_s: float = 15.0,
     max_chars: int = 4000,
     headers: dict | None = None,
+    min_body_chars: int = 0,
+    allow_chrome_agent: bool = True,
 ) -> str:
     """Fetch `url`, strip HTML, return cleaned text up to `max_chars`.
 
     Empty string on any failure (timeout / 4xx / 5xx / unparseable body).
     Caller decides what to do with the empty — typically fall back to
     the listing-card snippet.
+
+    `min_body_chars` (opt-in, default 0/off): when a 200 response's cleaned
+    body is shorter than this, run the same anti-bot escalation chain
+    (browser → chrome-agent) before accepting the thin body — recovers
+    JS-shell pages that return 200 with an empty shell. Must stay opt-in:
+    a bare 200+short-body does NOT escalate by default.
+
+    `allow_chrome_agent` (default True): when False, stop before the
+    real-desktop-Chrome fallback. Use for unattended paths where a Chrome
+    access prompt would block the run.
     """
     if not url:
         return ""
-    cached = _BODY_CACHE.get(url)
+    cache_key = (url, min_body_chars > 0, allow_chrome_agent)
+    cached = _BODY_CACHE.get(cache_key)
     if cached is not None:
         return cached
+
     try:
         # safe_request follows redirects with per-hop SSRF revalidation and
         # raises SSRFBlocked (a RequestException) for private/internal targets.
@@ -173,43 +203,73 @@ def fetch_body_text(
         )
     except requests.RequestException as e:
         log.debug("detail_fetch: GET %s raised %s", url, e)
-        _BODY_CACHE[url] = ""
+        _BODY_CACHE[cache_key] = ""
         return ""
     if resp.status_code >= 400:
         log.debug("detail_fetch: GET %s → %s", url, resp.status_code)
         # Anti-bot block (403/429/503): the page likely exists but `requests`
-        # was fingerprinted. If the operator enabled the headless-browser
-        # fallback AND playwright is installed, retry ONCE through a real
-        # browser. Any failure there → fall back to today's behavior ("").
+        # was fingerprinted. Escalate through the fallback chain: headless
+        # browser (free, local) → operator's real desktop Chrome (last
+        # resort). Any tier's failure falls through to the next; if ALL
+        # fail, degrade to today's "".
         if resp.status_code in _ANTIBOT_STATUSES:
             rendered = _try_browser_fallback(url, max_chars=max_chars)
             if rendered:
-                _BODY_CACHE[url] = rendered
+                _BODY_CACHE[cache_key] = rendered
                 return rendered
-            # Tier 3: headless Playwright also came back empty (still blocked).
-            # As a last resort, drive the operator's real desktop Chrome. This
-            # is gated OFF by default (chrome_agent_fallback_enabled), so when
+            # Last resort, drive the operator's real desktop Chrome. This is
+            # gated OFF by default (chrome_agent_fallback_enabled), so when
             # disabled it returns "" with no subprocess and behavior is exactly
             # today's. max_chars is NOT enforced here — the chrome helper owns
             # its own cleaning/contract.
-            recovered = _try_chrome_agent_fallback(url)
-            if recovered:
-                _BODY_CACHE[url] = recovered
-                return recovered
-        _BODY_CACHE[url] = ""
+            if allow_chrome_agent:
+                recovered = _try_chrome_agent_fallback(url)
+                if recovered:
+                    _BODY_CACHE[cache_key] = recovered
+                    return recovered
+        _BODY_CACHE[cache_key] = ""
         return ""
 
-    raw = resp.text or ""
-    # Drop script/style/noscript blocks BEFORE strip_html so their inner
-    # text (JS code, CSS, importmap JSON) doesn't end up in the body.
-    raw = _BLOCK_STRIP_RE.sub(" ", raw)
-    raw = _COMMENT_RE.sub(" ", raw)
-    raw = _DOCTYPE_RE.sub(" ", raw)
-    text = fix_mojibake(strip_html(raw))
-    if len(text) > max_chars:
-        text = text[:max_chars].rstrip() + "…"
-    _BODY_CACHE[url] = text
+    text = _clean_html(resp.text or "", max_chars=max_chars)
+    if min_body_chars > 0 and len(text) < min_body_chars:
+        # 200 but a JS-shell-empty (or near-empty) body — same escalation
+        # chain as the anti-bot branch above, opt-in only.
+        rendered = _try_browser_fallback(url, max_chars=max_chars)
+        if rendered:
+            _BODY_CACHE[cache_key] = rendered
+            return rendered
+        if allow_chrome_agent:
+            recovered = _try_chrome_agent_fallback(url)
+            if recovered:
+                _BODY_CACHE[cache_key] = recovered
+                return recovered
+    _BODY_CACHE[cache_key] = text
     return text
+
+
+def fetch_raw_html(url: str, *, timeout_s: float = 15.0) -> str:
+    """Fetch `url` and return its RAW (uncleaned) HTML.
+
+    For callers that need to preserve links — e.g. listing/index pages,
+    where `text_utils.html_links_to_text` recovers per-posting/next-page
+    URLs from the markup. Unlike `fetch_body_text`, no `_clean_html` is
+    applied here and there's no `_BODY_CACHE` entry.
+
+    No anti-bot escalation here: the fallback tiers (`browser_fetch`/
+    `chrome_agent_fetch`) pre-clean their output to plain text before
+    returning, so they can't compose with a "give me the raw markup"
+    call. "" on any failure.
+    """
+    if not url:
+        return ""
+    try:
+        resp = safe_request("GET", url, timeout=timeout_s, headers=DEFAULT_HEADERS)
+    except requests.RequestException as e:
+        log.debug("detail_fetch: raw GET %s raised %s", url, e)
+        return ""
+    if resp.status_code >= 400:
+        return ""
+    return resp.text or ""
 
 
 def fetch_many_bodies(

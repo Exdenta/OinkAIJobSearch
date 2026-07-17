@@ -37,11 +37,12 @@ down its call chain.
 from __future__ import annotations
 
 import os
+import re
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from claude_cli import extract_assistant_text, run_p, run_p_with_tools
+from claude_cli import extract_assistant_text, pop_last_failure, run_p, run_p_with_tools
 
 if TYPE_CHECKING:
     # Telemetry resolves at integration time; keep the runtime import lazy
@@ -52,7 +53,6 @@ if TYPE_CHECKING:
 
 
 _DEFAULT_STORE: "MonitorStore | None" = None
-
 
 def _resolve_store(store: "MonitorStore | None") -> "MonitorStore | None":
     """Return the explicit store, or the lazy default built from
@@ -194,26 +194,44 @@ def _safe_usage_from_envelope(stdout: str | None) -> dict[str, Any]:
     return out
 
 
-def _infer_status(stdout: str | None, output_chars: int, result_chars: int) -> str:
+# `claude_cli` publishes the reason for the most recent failure on a
+# thread-local; these are the reasons it emits (see `_set_failure` there).
+# We map each to the DB `status` value 1:1 so the coarse historical
+# `cli_missing` bucket splits into honest causes. `cli_absent` is the ONLY
+# reason that still means "the binary was missing".
+_FAILURE_REASON_STATUS = frozenset({
+    "cli_absent", "timeout", "start_error", "nonzero_exit", "api_error",
+})
+
+
+def _infer_status(
+    stdout: str | None,
+    output_chars: int,
+    result_chars: int,
+    failure: dict[str, Any] | None = None,
+) -> str:
     """Bucket a Claude CLI invocation into a status enum.
 
-    * `stdout is None` → 'cli_missing' (subprocess crashed / missing CLI /
-      timeout / non-zero exit — `run_p` collapses all of these to None).
+    * `stdout is None` → the honest failure reason from `claude_cli`'s
+      thread-local (`cli_absent` / `timeout` / `start_error` / `nonzero_exit`
+      / `api_error`). Historically this was the catch-all `cli_missing`, which
+      lied whenever the binary was present and the real cause was a timeout or
+      a mid-run API error (rate limit / overloaded). We fall back to
+      `cli_missing` only when the reason is unavailable (raw caller bypassed
+      the wrapper's pop, or an older `claude_cli` without the channel).
     * `output_chars > 0` AND `result_chars == 0` → 'empty_result'. The CLI
       returned a well-formed envelope (we got bytes on stdout) but the
       parsed `result` field was the empty string — the model emitted
       nothing. This is the silent-failure mode that used to be invisible
-      because both this and the cli_missing case landed as
-      `output_chars == 0`. Now `output_chars > 0` proves the subprocess
-      ran, and `result_chars == 0` isolates the model-side failure.
-    * Anything else (including `output_chars == 0` from an empty stdout
-      that wasn't None — rare, but possible if a caller passes
-      `--output-format text` and the model produced nothing) → 'ok'.
-      We deliberately do NOT label that case 'empty_result' because we
-      can't prove the envelope was well-formed; only the strict
-      envelope-with-result-equals-"" path gets the smoking-gun label.
+      because both this and the None case landed as `output_chars == 0`.
+      Now `output_chars > 0` proves the subprocess ran, and `result_chars ==
+      0` isolates the model-side failure.
+    * Anything else → 'ok'.
     """
     if stdout is None:
+        reason = (failure or {}).get("reason")
+        if reason in _FAILURE_REASON_STATUS:
+            return reason
         return "cli_missing"
     if output_chars > 0 and result_chars == 0:
         return "empty_result"
@@ -274,6 +292,56 @@ def _forensic_log_call(
         )
 
 
+def _resolve_route(caller: str, model: str | None) -> tuple[str, str | None]:
+    """Resolve (provider, model) for this caller. Single-provider build:
+    always the Claude CLI."""
+    return "claude", model
+
+
+def _dispatch_text(
+    caller: str,
+    prompt: str,
+    *,
+    provider: str = "claude",
+    model: str | None = None,
+    **kwargs: Any,
+) -> str | None:
+    """Run a single-shot text prompt through the chosen provider, returning
+    the same CLI-style envelope string regardless.
+
+    `provider` and `model` are already resolved by `_resolve_route`.
+    Single-provider build: always `claude_cli.run_p` (subscription CLI).
+    """
+    # Provider-neutral knob accepted for call-site compatibility;
+    # `claude_cli.run_p` has no such parameter, so pop it rather than
+    # leaking a TypeError into the call.
+    kwargs.pop("json_mode", None)
+    return run_p(prompt, model=model, **kwargs)
+
+
+def _resolve_tools_route(caller: str, model: str | None) -> tuple[str, str | None]:
+    """Provider route for tool-style calls. Single-provider build: always
+    the Claude CLI."""
+    return "claude", model
+
+
+def _tag_value(prompt: str, tag: str) -> str:
+    m = re.search(rf"<{re.escape(tag)}>(.*?)</{re.escape(tag)}>", prompt or "", re.DOTALL)
+    return " ".join(m.group(1).split()) if m else ""
+
+
+def _dispatch_tools(
+    caller: str,
+    prompt: str,
+    *,
+    provider: str,
+    model: str | None,
+    fallback_model: str | None,
+    **kwargs: Any,
+) -> tuple[str | None, str | None, str]:
+    return run_p_with_tools(prompt, model=fallback_model, **kwargs), fallback_model, "claude_cli"
+
+
 def wrapped_run_p(
     store: "MonitorStore | None",
     caller: str,
@@ -291,9 +359,17 @@ def wrapped_run_p(
     prompt head + stdout head for post-hoc analysis). Both are best-effort
     and never break the call path.
     """
+    # Per-stage routing: pick provider + (possibly overridden) model. The
+    # resolved model is what we ACTUALLY call and what telemetry records, so
+    # /stats reflects reality when a stage is re-pointed.
+    provider, model = _resolve_route(caller, model)
     started_at = time.time()
-    stdout = run_p(prompt, model=model, **kwargs)
+    stdout = _dispatch_text(caller, prompt, provider=provider, model=model, **kwargs)
     finished_at = time.time()
+    # Pop the structured failure reason claude_cli published on this thread
+    # (always pop to clear it; only meaningful when stdout is None and the
+    # claude path ran — a Mistral success leaves it stale-but-ignored).
+    failure = pop_last_failure()
     elapsed_ms = int((finished_at - started_at) * 1000)
     # Parse the envelope BEFORE recording so the status inference and
     # `result_chars` column see the same view of the output. Wrapped in
@@ -301,7 +377,8 @@ def wrapped_run_p(
     # telemetry — the underlying user-facing call already returned.
     output_chars = len(stdout or "")
     result_chars = _safe_result_chars(stdout)
-    status = _infer_status(stdout, output_chars, result_chars)
+    status = _infer_status(stdout, output_chars, result_chars, failure)
+    exit_code = failure.get("exit_code") if (stdout is None and failure) else None
     # Real token counts + actual cost from the CLI envelope when present;
     # all-None on a text/empty/corrupt envelope (surrogate stays the
     # fallback). Never raises.
@@ -319,7 +396,7 @@ def wrapped_run_p(
                 output_chars=output_chars,
                 result_chars=result_chars,
                 elapsed_ms=elapsed_ms,
-                exit_code=None,
+                exit_code=exit_code,
                 status=status,
                 started_at=started_at,
                 finished_at=finished_at,
@@ -357,14 +434,24 @@ def wrapped_run_p_with_tools(
     **kwargs: Any,
 ) -> str | None:
     """Time + record a `claude_cli.run_p_with_tools` invocation."""
+    provider, routed_model = _resolve_tools_route(caller, model)
     started_at = time.time()
-    stdout = run_p_with_tools(prompt, model=model, **kwargs)
+    stdout, model, actual_provider = _dispatch_tools(
+        caller,
+        prompt,
+        provider=provider,
+        model=routed_model,
+        fallback_model=model,
+        **kwargs,
+    )
     finished_at = time.time()
+    failure = pop_last_failure()
     elapsed_ms = int((finished_at - started_at) * 1000)
     # Same envelope-parsing dance as wrapped_run_p — see its comment.
     output_chars = len(stdout or "")
     result_chars = _safe_result_chars(stdout)
-    status = _infer_status(stdout, output_chars, result_chars)
+    status = _infer_status(stdout, output_chars, result_chars, failure)
+    exit_code = failure.get("exit_code") if (stdout is None and failure) else None
     usage = _safe_usage_from_envelope(stdout)
 
     resolved = _resolve_store(store)
@@ -379,7 +466,7 @@ def wrapped_run_p_with_tools(
                 output_chars=output_chars,
                 result_chars=result_chars,
                 elapsed_ms=elapsed_ms,
-                exit_code=None,
+                exit_code=exit_code,
                 status=status,
                 started_at=started_at,
                 finished_at=finished_at,

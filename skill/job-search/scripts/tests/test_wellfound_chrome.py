@@ -156,20 +156,23 @@ def test_helper_exception_returns_empty_list(monkeypatch):
     assert out == []
 
 
-def test_default_flag_off_is_zero_regression(monkeypatch):
-    """End-to-end with the REAL helper: the default chrome_agent_fallback_enabled
-    flag is OFF, so fetch_listings_via_chrome returns [] WITHOUT spawning a
-    subprocess, and the adapter returns [] — identical to today.
+def test_flag_off_is_zero_regression(monkeypatch):
+    """End-to-end with the REAL helper: with chrome_agent_fallback_enabled
+    forced OFF, fetch_listings_via_chrome returns [] WITHOUT spawning a
+    subprocess, and the adapter returns [] — the pre-fallback behavior.
 
-    We stub the probe to avoid any network I/O but otherwise drive the real
-    chrome_agent_fetch module.
+    Chrome-agent fallback must stay opt-in for unattended production runs:
+    the default/off-switch path must not spawn a browser-access prompt.
     """
     import chrome_agent_fetch
 
-    # Sanity: the shipped default keeps the fallback disabled.
+    # Sanity: the shipped default is production-safe/off.
     from defaults import DEFAULTS
     assert DEFAULTS.get("chrome_agent_fallback_enabled", False) is False
 
+    monkeypatch.setattr(
+        chrome_agent_fetch, "_chrome_agent_config", lambda: (False, None, 240)
+    )
     monkeypatch.setattr(
         wellfound, "_probe_block_reason", lambda: ("datadome_403", {})
     )

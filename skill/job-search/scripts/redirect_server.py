@@ -92,6 +92,7 @@ class _Handler(BaseHTTPRequestHandler):
     # Wired by `start_redirect_server` after class creation.
     db = None  # type: ignore[assignment]
     secret = ""
+    on_click: Callable[[int], None] | None = None
 
     # Quiet the default `127.0.0.1 - - [...]` noise on stderr; we log
     # via the project's `logging` setup instead.
@@ -160,6 +161,14 @@ class _Handler(BaseHTTPRequestHandler):
 
         self._send(302, headers={"Location": url})
 
+        # Value-event hook: fires after the redirect is already on the
+        # wire, so a slow/failing callback can't delay the user.
+        if self.on_click is not None:
+            try:
+                self.on_click(chat_id)
+            except Exception:  # noqa: BLE001
+                log.exception("redirect_server: on_click callback failed")
+
 
 def start_redirect_server(
     db,  # DB instance
@@ -167,6 +176,7 @@ def start_redirect_server(
     host: str | None = None,
     port: int | None = None,
     secret: str | None = None,
+    on_click: Callable[[int], None] | None = None,
 ) -> ThreadingHTTPServer | None:
     """Spin up the redirect server in a daemon thread.
 
@@ -196,6 +206,7 @@ def start_redirect_server(
         pass
     _BoundHandler.db = db
     _BoundHandler.secret = secret
+    _BoundHandler.on_click = on_click
 
     server = ThreadingHTTPServer((host, port), _BoundHandler)
     t = threading.Thread(

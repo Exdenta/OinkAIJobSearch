@@ -1,65 +1,48 @@
-"""Universitat de Barcelona — Doctoral Programmes adapter (slug: `ub_doctoral`).
+"""Universitat de Barcelona — PhD / predoctoral vacancy adapter (slug: `ub_doctoral`).
 
-Surfaces PhD-position openings tied to UB. The canonical landing page,
+Reads UB's official public-vacancy board (the *seu electrònica* → *Ofertes de
+feina*), filtered server-side to currently-OPEN vacancies:
 
-    https://web.ub.edu/en/web/estudis/doctoral-programmes
+    https://seu.ub.edu/ofertaPublicaCategoriaPublic/categories
 
-lists *programmes* (multi-year structured PhDs) rather than directly-funded
-job openings. Real openings live in three messy places:
+REWRITTEN 2026-07-13 — this adapter used to shell out to the Claude CLI and ask
+it to browse `web.ub.edu` / `www.ub.edu`. That was broken twice over:
 
-  1. UB's HR / convocatories portal
-     (https://www.ub.edu/web/portal/en/convocatories.html → redirects to
-     https://web.ub.edu/web/ub/ — the listings sit under "Working at the UB")
-  2. Per-doctoral-programme pages where PIs sometimes list openings inline.
-  3. Mirrored EURAXESS postings (covered by a separate adapter; we don't
-     import or depend on it — keep this self-contained per the brief).
+  1. Those hosts sit behind a WAF that 403s every datacenter IP and every
+     non-Spanish residential IP, so the model never saw a page at all.
+  2. Even unblocked, the pages it was pointed at are navigation hubs that carry
+     no vacancies whatsoever.
 
-Why AI delegation (option 4)
-----------------------------
-RSS/feed probes against the doctoral-programmes URL all fail:
-
-    GET .../doctoral-programmes/feed         -> 404
-    GET .../doctoral-programmes/rss          -> 404
-    GET .../doctoral-programmes?format=rss   -> 200 but HTML (no feed)
-
-The site is Liferay (sets JSESSIONID + GUEST_LANGUAGE_ID cookies on every
-hit), the per-page markup is irregular Drupal/Liferay layout, and content
-shifts between the EN/ES/CA locales. Hand-maintained selectors would break
-constantly.
-
-Volume is genuinely low — at any given time UB rarely has more than a
-handful of open PhD positions advertised on their public pages — so paying
-~$0.05 per run for a Claude CLI call that uses WebFetch is the right
-trade-off. The adapter shells out via `claude_cli.run_p_with_tools` with a
-strict JSON-only prompt and lets the model crawl up to two pages
-(landing + one HR/convocatories link) on its side.
+The old module header argued an LLM was unavoidable because "the site is Liferay
+and hand-maintained selectors would break constantly". That reasoning was about
+the WRONG HOST. `seu.ub.edu` is a different system: a plain, stable HTML table
+with `data-label` cells, a server-side open-state filter (`estat=Oberta`) and
+full-text search (`text=`) — no JS, no cookies, no WAF, no AI needed. So this
+adapter is now a plain HTTP fetch: faster, free, and no longer dependent on the
+Claude CLI (one less failure surface in the bot's per-cycle hot path).
 
 Filters / config
 ----------------
-  - `max_per_source` (default 12)         — cap on returned Jobs
-  - `ai_scrape_timeout_s` (default 180)   — passed to the CLI
-  - `sources.ub_doctoral` toggle          — wired separately in defaults.py;
-                                            this module is opt-in.
+  - `max_per_source` (default 12)  — cap on returned Jobs
+  - `sources.ub_doctoral` toggle   — wired in defaults.py; this module is opt-in.
 
-Fallback behavior matches the curated_boards adapter:
-  - CLI missing  -> warn + return []
-  - timeout      -> log + return []
-  - non-JSON     -> log + return []
-  - empty result -> return [] (totally normal — UB often has 0 active posts)
+Never raises: any network/parse failure logs and returns what it already has.
+
+PARALLEL IMPLEMENTATION — keep in sync with apify/ub-doctoral-scraper/src/main.py,
+which feeds the SAME downstream scoring pipeline via apify_fetch.record_to_job.
+The actor emits a dedicated `deadline` column; `Job` has no such field — and UB
+publishes deadlines only inside each vacancy's attached PDF anyway, so neither
+side ever invents one.
 """
 from __future__ import annotations
 
-import hashlib
 import logging
-from typing import Any
+import re
+from datetime import datetime
 
-from claude_cli import (
-    TOOLS_DENY_SHELL_FS,
-    TOOLS_WEB_BOTH,
-    extract_assistant_text,
-    parse_json_block,
-    run_p_with_tools,
-)
+import requests
+from bs4 import BeautifulSoup
+
 from dedupe import Job
 from text_utils import clean_snippet, fix_mojibake
 
@@ -67,149 +50,110 @@ log = logging.getLogger(__name__)
 
 SOURCE_KEY = "ub_doctoral"
 
-# Primary URL the LLM is told to start from. The HR/convocatories link is
-# given as a secondary hint inside the prompt rather than a separate fetch
-# (we want exactly one CLI invocation per run).
-LANDING_URL = "https://web.ub.edu/en/web/estudis/doctoral-programmes"
-HR_URL = "https://www.ub.edu/web/ub/en/menu_eines/treballar.html"
+BOARD_URL = "https://seu.ub.edu/ofertaPublicaCategoriaPublic/categories"
+DETAIL_URL = "https://seu.ub.edu/ofertaPublicaCategoriaPublic/listPublicacionsAmbCategoria"
 
-_PROMPT = """You are a careful PhD-position scraper for the University of Barcelona (UB).
+# UB's board ignores `max` above 10 and pages via `offset`.
+PAGE_SIZE = 10
+MAX_PAGES = 5
 
-Your job: surface CURRENTLY-OPEN, FUNDED PhD positions or doctoral-research vacancies tied to UB.
-This is NOT a request for the list of doctoral programmes — those are multi-year curricula, not jobs.
-We want concrete openings a candidate can apply to right now (a specific thesis topic, a named
-supervisor or department, a deadline, or an "apply here" link).
+# UB writes its vacancy titles in Catalan; "predoctoral" is the term it uses for
+# funded PhD contracts, and it is what the board's own full-text search matches.
+DEFAULT_QUERY = "predoctoral"
 
-Use the WebFetch tool to load these URLs. You may follow at most ONE additional link per page if it
-clearly leads to current vacancies (e.g. "Open positions", "Vacancies", "Convocatories", "PhD
-positions", "Predoctoral contracts"):
+UA = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9,ca;q=0.8,es;q=0.7",
+}
 
-  Primary:   {landing_url}
-  Secondary: {hr_url}
-
-If the primary page only lists programmes (no openings), check the secondary page and any obvious
-"working at UB" / "predoctoral" / "convocatories" sub-page. Don't crawl deeper than that.
-
-Return STRICT JSON (no commentary, no code fences) with this exact shape:
-
-{{"jobs": [
-  {{
-    "title": "Programme + thesis topic if available, else just the position title",
-    "url": "absolute https URL of the position detail page",
-    "posted_at": "YYYY-MM-DD if visible, else empty string",
-    "snippet": "first ~400 chars summarising the role / requirements"
-  }}
-], "reasoning": "one short sentence explaining what you found or why the result is empty"}}
-
-Rules:
-- ONLY include genuine open vacancies. Skip the programme catalogue entries.
-- Skip purely administrative / non-research roles.
-- Cap at 15 jobs.
-- `url` MUST be absolute https. Prefer https://web.ub.edu/... or https://www.ub.edu/... ;
-  external mirrors (euraxess.ec.europa.eu) are also fine if that's the canonical apply link.
-- If you find nothing, return {{"jobs": [], "reasoning": "no open PhD positions visible today"}}.
-- Output MUST be parseable by json.loads(). Do not add any text before or after the JSON.
-""".strip()
+_CID_RE = re.compile(r"categoria\.id=(\d+)")
 
 
-def _stable_external_id(url: str, title: str) -> str:
-    """Stable external_id even if UB rewrites the URL with a new session token."""
-    if url and url.startswith("http"):
-        return url
-    raw = f"{url}::{title}".encode("utf-8")
-    return hashlib.sha1(raw).hexdigest()[:16]
+def _params(offset: int) -> dict[str, str]:
+    return {
+        "lang": "en",  # forces the English `data-label` column names we parse
+        "tipus": "totes",
+        "estat": "Oberta",  # currently-open vacancies only — filtered by UB
+        "text": DEFAULT_QUERY,
+        "dataOfertaPublicaFilter": "dataPublicacio",
+        "max": str(PAGE_SIZE),
+        "offset": str(offset),
+    }
 
 
-def _parse_response(text: str) -> tuple[list[dict[str, Any]], str]:
-    """Return (jobs_list, reasoning). reasoning is "" if the model didn't supply one."""
-    data = parse_json_block(text)
-    if not isinstance(data, dict):
-        return [], ""
-    jobs = data.get("jobs") or []
-    if not isinstance(jobs, list):
-        jobs = []
-    reasoning = str(data.get("reasoning") or "")
-    return [j for j in jobs if isinstance(j, dict)], reasoning
+def _posted_at(raw: str) -> str:
+    """UB prints dd-mm-yyyy. Return YYYY-MM-DD, or "" when unreadable — never guessed."""
+    try:
+        return datetime.strptime((raw or "").strip(), "%d-%m-%Y").strftime("%Y-%m-%d")
+    except ValueError:
+        return ""
 
 
-def fetch(filters: dict | None = None) -> list[Job]:
-    """Fetch current UB doctoral PhD-position openings via Claude CLI + WebFetch.
-
-    Returns an empty list on any failure (CLI missing, timeout, parse error,
-    or genuinely zero open positions). Never raises.
-    """
-    f = filters or {}
-    cap = int(f.get("max_per_source") or 12)
-    timeout_s = int(f.get("ai_scrape_timeout_s") or 180)
-
-    prompt = _PROMPT.format(landing_url=LANDING_URL, hr_url=HR_URL)
-
-    log.info(
-        "%s.fetch: invoking claude CLI (cap=%d timeout=%ds landing=%s)",
-        SOURCE_KEY, cap, timeout_s, LANDING_URL,
-    )
-
-    # Pin to haiku (2026-05-25) — see same fix in devex/web_search.
-    # Tool grants standardized via canonical constants in ``claude_cli`` —
-    # comma-separated allow list + explicit deny list for shell/filesystem
-    # (prompt-injection defense for untrusted page contents).
-    from claude_cli import SMALLEST_MODEL as _MODEL
-    stdout = run_p_with_tools(
-        prompt,
-        allowed_tools=TOOLS_WEB_BOTH,
-        disallowed_tools=TOOLS_DENY_SHELL_FS,
-        timeout_s=timeout_s,
-        model=_MODEL,
-    )
-    if stdout is None:
-        log.warning("%s.fetch: CLI unavailable or failed; returning []", SOURCE_KEY)
-        return []
-
-    body = extract_assistant_text(stdout)
-    raw, reasoning = _parse_response(body)
-
-    if not raw:
-        body_head = (body or "").strip().replace("\n", " ")[:300]
-        log.info(
-            "%s.fetch: 0 raw postings (reasoning=%r body_head=%r)",
-            SOURCE_KEY, reasoning, body_head,
-        )
-        return []
-
-    log.info(
-        "%s.fetch: %d raw postings; reasoning=%r",
-        SOURCE_KEY, len(raw), reasoning,
-    )
-
+def _jobs_from_page(html: str) -> list[Job]:
+    soup = BeautifulSoup(html, "html.parser")
     out: list[Job] = []
-    sample_titles: list[str] = []
-    for r in raw[:cap]:
-        url = (r.get("url") or "").strip()
-        title = fix_mojibake(str(r.get("title") or "")).strip()
+    for tr in soup.find_all("tr"):
+        link = tr.find("a", href=_CID_RE)
+        if not link:
+            continue
+        cid = _CID_RE.search(link["href"]).group(1)
+        cells = {
+            (td.get("data-label") or "").strip(): td.get_text(" ", strip=True)
+            for td in tr.find_all("td")
+        }
+        # The full convocatòria text is in the link's title attribute; the visible
+        # cell text is the same string, so take whichever is longer.
+        title = max((link.get("title") or "").strip(), link.get_text(" ", strip=True), key=len)
+        title = fix_mojibake(re.sub(r"\s+", " ", title)).strip()
         if not title:
             continue
-        if url and not url.startswith("http"):
-            # Best-effort absolute-ization for relative paths.
-            url = f"https://web.ub.edu{url}" if url.startswith("/") else ""
-        if not url:
-            url = LANDING_URL  # last resort so the message link is at least valid
-        ext_id = _stable_external_id(url, title)
-        snippet = clean_snippet(str(r.get("snippet") or ""), max_chars=400)
         out.append(Job(
             source=SOURCE_KEY,
-            external_id=ext_id,
+            external_id=cid,  # UB's own stable numeric vacancy id
             title=title[:140],
             company="Universitat de Barcelona",
             location="Barcelona, Spain",
-            url=url,
-            posted_at=str(r.get("posted_at") or "").strip()[:32],
-            snippet=snippet,
+            url=f"{DETAIL_URL}?categoria.id={cid}",
+            posted_at=_posted_at(cells.get("Publication date", "")),
+            snippet=clean_snippet(title, max_chars=400),
         ))
-        if len(sample_titles) < 3:
-            sample_titles.append(title[:80])
-
-    log.info(
-        "%s.fetch: kept=%d sample_titles=%s",
-        SOURCE_KEY, len(out), sample_titles,
-    )
     return out
+
+
+def fetch(filters: dict | None = None) -> list[Job]:
+    """Fetch currently-open UB PhD / predoctoral vacancies. Never raises."""
+    cap = int((filters or {}).get("max_per_source") or 12)
+
+    jobs: list[Job] = []
+    seen: set[str] = set()
+    for page in range(MAX_PAGES):
+        try:
+            resp = requests.get(
+                BOARD_URL, params=_params(page * PAGE_SIZE), headers=UA, timeout=30
+            )
+            resp.raise_for_status()
+        except Exception as exc:  # network / DNS / HTTP error — keep what we have
+            log.warning(
+                "ub_doctoral: board fetch failed (%s); returning %d job(s)", exc, len(jobs)
+            )
+            break
+
+        page_jobs = _jobs_from_page(resp.text)
+        if not page_jobs:
+            break
+        for job in page_jobs:
+            if job.external_id in seen:
+                continue
+            seen.add(job.external_id)
+            jobs.append(job)
+
+        # Cap met, or a short page means this was the last one.
+        if len(jobs) >= cap or len(page_jobs) < PAGE_SIZE:
+            break
+
+    jobs = jobs[:cap]
+    log.info("ub_doctoral: %d open vacancy(ies) from UB's board", len(jobs))
+    return jobs

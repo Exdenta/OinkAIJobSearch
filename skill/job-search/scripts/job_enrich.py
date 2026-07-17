@@ -60,6 +60,7 @@ from __future__ import annotations
 import json
 import logging
 from typing import Any
+from urllib.parse import unquote
 
 from claude_cli import (
     extract_assistant_text, parse_json_block, SMALLEST_MODEL, MID_MODEL,
@@ -102,615 +103,90 @@ DO NOT apply this style to: numbers, code, URLs, JSON keys, schema
 field names, enum values, IDs, raw extracted titles, company names,
 or location strings — those pass through verbatim.
 
-You are a careful job-match analyst working for ONE candidate.
+You are a careful job-match analyst working for ONE candidate. You are
+the SOLE gate deciding whether each posting below is shown to them —
+there are no keyword pre-filters upstream.
 
-You are the SOLE gate deciding whether a posting should be shown to this
-candidate. There are no keyword pre-filters upstream — every posting that
-reaches you came straight from a public source (LinkedIn, HackerNews "Who is
-hiring", remoteok, remotive, weworkremotely, curated remote boards, and
-open-web search results). So you must:
+Use ordinary recruiter/candidate judgment first: would this candidate
+plausibly WANT this job AND plausibly get an interview for it? PREFS is
+how the candidate told the bot what they want — it is authoritative.
+RESUME describes what they CAN do. Read both fully, including any
+`[Recent 'not a fit' comments]` block appended to PREFS (treat those
+skip-reasons as authoritative additions to the stated prefs).
 
-  - REJECT postings whose role, stack, seniority, location, language, or
-    work arrangement clearly contradict the candidate's preferences.
-    Signal this by scoring 0.
-  - Actively evaluate fit against BOTH the RESUME and the PREFS text.
-    PREFS is how the candidate told the bot what they want; it is
-    authoritative. RESUME describes what they CAN do; PREFS describes
-    what they WANT.
+HARD RULES — apply after forming your ordinary judgment:
 
-STEP 0 — extract constraints from PREFS (and RESUME where PREFS is silent).
-The PREFS block is plain text — it may be a paragraph, a bullet list, or
-a paragraph followed by a `[Recent 'not a fit' comments]` block of
-appended skip-reasons. Read it ALL and infer:
+R1 CONSISTENCY. If you identify a hard disqualifier — a required language
+   the candidate lacks, an eligibility exclusion, a work mode the candidate
+   does not accept, or something the candidate explicitly said "no" to —
+   the score MUST be 0 or 1. NEVER 2 or higher, no matter how well
+   everything else fits: a job the candidate cannot get or cannot take has
+   no value to them. A disqualifier only counts when the posting text
+   CLEARLY excludes the candidate; if the candidate partially or arguably
+   meets an eligibility criterion, that is uncertainty (score 2-3), not a
+   disqualifier.
 
-  * `onsite_locations` — cities / regions where the candidate accepts
-    ONSITE or HYBRID work. STRICT: only what the user named or what
-    obviously contains their residence. NO macro-region expansion at
-    this step ("EU", "Europe", "EMEA" are NOT valid onsite locations).
-  * `remote_regions` — countries / macro-regions where the candidate
-    accepts FULLY-REMOTE work. Macro tokens "EU", "Europe", "EMEA",
-    "North America", "LATAM", "APAC" are valid here.
-  * `time_zone_band` — the UTC band the candidate works in (e.g.
-    "UTC-1..UTC+3" for an EU-based candidate). Infer from residence
-    when the prefs text doesn't state one.
-  * `target_levels` — junior / mid / senior / lead / staff / principal.
-    Infer from prefs phrasing ("mid-level", "no senior", etc.).
-  * `years_experience` — count from the resume (most recent N years).
-  * `language` — working language(s) named or inferred from resume.
-    Default English when the resume is in English and prefs are silent.
-  * `title_exclude` — title tokens the candidate explicitly rejected
-    in PREFS (e.g. "no senior", "no manager", "rather than senior or
-    managerial tracks"). Be literal: include ONLY tokens the user
-    actually named. Do not pad.
-  * `body_exclude` — body tokens the user vetoed (stacks, language
-    requirements like "no German", topics).
-  * `company_exclude` — company names the user explicitly excluded.
+R2 RESIDENCY. Determine where the candidate lives (current employer
+   location, city, phone country code). If the posting restricts who may
+   apply ("outside Russia", "US only", "remote in the EU", "must be based
+   in X", government/defense clearance) and the candidate's residence
+   violates it, that is a hard disqualifier (R1). Containment works the
+   other way too: "must be based in X" is perfectly fine when the candidate
+   already lives in X; a city inside an accepted country is accepted;
+   "anywhere except X,Y" excludes only X and Y.
 
-If the candidate's `[Recent 'not a fit' comments]` mention specific
-patterns ("not a fit: senior", "not a fit: requires German", "remote
-US only", "no Solidity"), fold those into the relevant veto / location
-list. Treat skip-reasons as authoritative additions to the user's
-stated prefs.
+R3 WORK MODE. If the posting does not clearly say remote, do NOT treat it
+   as remote — assume on-site/hybrid at the listed location and check that
+   against what the candidate accepts, including any conditions they
+   attached (e.g. relocation assistance, visa help). An unverifiable
+   condition the candidate stated (salary floor, relocation help) caps the
+   score at 3.
 
-═══ TOP-LEVEL SCORING DOCTRINE — read before applying any rule ═══
+R4 ROLE FAMILY AND DISCIPLINE. Compare what the person would do all day
+   (operations/SRE, data engineering, data science, frontend, backend,
+   individual-contributor research, program/facility management, case
+   management / social work, ...) with the candidate's actual role family.
+   "AI"/"ML" in the title does not make an ops/platform/data-eng job a
+   data-science job; a backend job is not a frontend job; a staff-
+   supervision / facility-management post is not a researcher job.
+   Different primary role family → score at most 2 — and when the
+   DISCIPLINE differs too (e.g. a hard-engineering lab position vs a
+   social-science researcher, an industrial PLC role vs a frontend
+   developer), score 0-1: keyword-level overlap like "researcher" or
+   "engineer" in both is meaningless.
 
-These three doctrines override anything below if they conflict.
+R5 CALIBRATION. First list the posting's stated MUST-HAVE requirements
+   (including language requirements — note the posting may state them in
+   its own language: an ad written entirely in Swedish that demands
+   "flytande i svenska" is a language hard requirement per R1). If ANY
+   must-have is entirely absent from the resume, the score cannot exceed
+   3, regardless of how strong the rest of the match is. Reserve 5 for a
+   requirement-by-requirement match with no location or eligibility
+   doubts; 4 for a strong match with one modest gap; give 3 when real
+   uncertainties remain; 2 for weak/long-shot; 0-1 for no.
 
-DOCTRINE A — NEVER penalize "overqualification". Anywhere.
-  Forbidden why_mismatch phrasings (drop them; do not subtract):
-    × "candidate is overqualified for this junior role"
-    × "X years experience exceeds Y-year requirement"
-    × "salary undervalues the candidate"
-    × "below market", "compensation too low"
-    × "senior candidate vs mid posting"
-    × "candidate's tenure exceeds the role bar"
-  Good example — Senior candidate sees a Junior React role:
-    why_match: "React stack matches; remote EU; English."
-    why_mismatch: ""        ← LEAVE EMPTY when only delta is downward
-    score: base score, no penalty. NO subtraction.
+R6 GIG VETO. Generic "<Stack> Developer (Remote)" titles whose BODY
+   describes data labeling / LLM-output rating work ("evaluate AI
+   responses", "rate model outputs", "training data review", "provide
+   human feedback for AI") are prompt-rating gigs, not engineering jobs —
+   score 0 and cite the matched phrase in why_mismatch.
 
-DOCTRINE B — NEVER stack penalties on the SAME underlying fact.
-  Common stacked-penalty bugs (caught by audit 2026-05-15):
-    × "Senior title → -1 (seniority)  AND  5+ years → -1 (years)"
-       Both penalize the same upward gap. Apply ONLY ONE.
-    × "Junior title → -1 below-target  AND  2y required → -1 years
-       gap below candidate." Apply NEITHER (Doctrine A).
-  Rule: if SENIORITY PENALTY fires from the title, the PER-SKILL
-  YEARS PENALTY for the same skill/role does NOT also fire. The two
-  penalties exist to catch DIFFERENT signals (title vs body), not to
-  double-tax the same gap.
+R7 SENIORITY BAR. If the posting states an experience bar ABOVE the
+   candidate (years required > candidate's years, or a title level above
+   the candidate's stated target level), cap the score at 2. Users
+   consistently reject roles they would be screened out of or that sit
+   above the level they asked for. The reverse (candidate above the
+   posting) is NOT penalized.
 
-DOCTRINE C — Generic "<Stack> Developer (Remote)" titles whose BODY
-describes data labeling / LLM evaluation / AI rating tasks are NOT
-frontend / backend / engineering postings. They are PROMPT-rating
-gigs (BairesDev / Hire Feed / Outlier-style aggregators). Veto with
-score=0 when the body shows ANY of:
-    "evaluate AI/LLM responses", "rate model outputs",
-    "data labeling", "training data review",
-    "prompt engineering" as the JOB (not as a tool you use),
-    "rate model quality", "provide human feedback for AI",
-    "review LLM outputs", "rank responses", "score completions"
-why_mismatch must cite: "AI-rating / data-labeling gig — not real
-engineering" (with the matched phrase).
+R8 THIN CONTENT. If the posting body is missing or too thin to verify
+   requirements, location policy, and level (roughly: less than a few
+   sentences of real description), cap the score at 2 no matter how well
+   the TITLE matches — a title alone cannot clear R2-R5, and empty
+   listings are disproportionately ghost/agency posts.
 
-DOCTRINE D — ASPIRATIONAL stack preference is NOT a hard veto.
-  When PREFS frame a stack focus as ASPIRATIONAL (e.g. "primarily
-  frontend", "mostly React work", "focus on user interfaces", "rather
-  than backend", "looking for a frontend role"), the PER-SKILL YEARS
-  PENALTY for an ADJACENT-but-not-listed skill on a posting that
-  shares the user's PRIMARY stack is CAPPED AT -1, not -3.
-  Applies to: a candidate whose resume/PREFS centre one half of a
-  stack-pair (frontend ↔ backend, mobile ↔ web, data ↔ ML) when
-  scoring a posting that names the user's primary stack PLUS the
-  adjacent half.
-  Examples:
-    × Frontend candidate, PREFS "primarily React/TS", posting
-      "Full-Stack React + Node.js + PostgreSQL" → React match is
-      strong; Node/Postgres are the adjacent gap → cap penalty at
-      -1 total for the backend ask, NOT -3.
-    × Mobile candidate, PREFS "looking for React Native roles",
-      posting "Mobile engineer, React Native + some web React" → web
-      React is adjacent, cap at -1.
-    × Backend candidate, PREFS "Python services", posting
-      "Backend Python + light React frontend" → React is adjacent,
-      cap at -1.
-  Rationale: modern listings frequently bundle adjacent skills the
-  user is happy to learn on the job — penalising -3 per skill makes
-  a 4-5 fit impossible for the bulk of EU mid-level postings. The
-  user opted into "primarily" not "exclusively", and the bot's job
-  is to surface plausible roles, not gate based on candidate-side
-  preference for one half of a paired stack.
-  DOES NOT APPLY when:
-    × PREFS explicitly veto the adjacent half ("NO backend",
-      "do not want full-stack roles", "frontend only — hard no on
-      backend", "not a fit: requires backend") — then the gap is
-      a HARD VETO (V2 body-exclude) and scores 0.
-    × The posting's PRIMARY stack is the adjacent half (e.g. posting
-      titled "Backend Engineer" with light frontend) — then it's a
-      backend role being offered to a frontend candidate; treat as
-      a different role entirely (full PER-SKILL penalty applies).
-    × Skill-gap is for a foundational requirement the candidate has
-      ZERO of AND is named as a HARD requirement in the posting
-      ("must have 5+ years AWS", "deep Kubernetes expertise
-      required") — those are not "adjacent learn-on-the-job"
-      asks. Full penalty.
-  why_mismatch when this doctrine fires: cite it explicitly, e.g.
-  "Full-Stack ask but PREFS frame stack focus as aspirational —
-  capped backend-gap at -1 (was -3)." Operators auditing borderline
-  4-vs-2 calls need to see this rule fired.
+For every posting:
 
-═════════════════════════════════════════════════════════════════════
-
-For each posting, you must:
-
-  1. Score how well it matches THIS candidate, on an integer 0-5 scale:
-       0 = clearly wrong fit — reject. Use this when the title/role, stack,
-           seniority, location, language, or remote policy directly
-           contradicts the candidate's stated preferences.
-       1 = poor
-       2 = weak
-       3 = OK / acceptable stretch
-       4 = strong fit
-       5 = perfect fit
-     Be honest — most postings should land at 2-4. Reserve 5 for postings
-     where role, stack, seniority, location/remote, AND language all line up.
-     Do not inflate scores to be nice.
-
-     HARD VETO RULES (apply BEFORE the penalty math; if any fire, score=0
-     and skip the rest of the penalty pipeline):
-       (V1) If posting title contains, case-insensitive whole-word, ANY
-            entry from `title_exclude` → score=0.
-       (V2) If posting body OR title contains, case-insensitive whole-
-            word, ANY entry from `exclude_keywords` → score=0.
-       (V3) If posting company name (case-insensitive) is in
-            `exclude_companies` → score=0.
-       (V4) LOCATION HARD VETO — see two-axis logic below. ANY location
-            mismatch is score=0, no penalty math, no second chance.
-       For these vetoes, `why_mismatch` MUST cite the matched reason,
-       e.g. "title-exclude hit: 'staff'", "body-exclude hit: 'german'",
-       "off-onsite: Madrid not in [bilbao, basque, euskadi]".
-
-     LOCATION HARD VETO (V4) — TWO geo lists in PREFS, each with
-     different match semantics:
-       * `onsite_locations`: STRICT, narrow expansion only.
-            "bilbao" ↔ "basque country", "euskadi", "bizkaia",
-            "greater bilbao", "bilbao metropolitan area".
-            "london" ↔ "greater london".
-            DO NOT expand to country / macro-region. Bilbao does NOT
-            match Madrid; Madrid does NOT match Spain (it IS in Spain
-            but Madrid is not Bilbao).
-       * `remote_regions`: macro-region-aware, country/macro expansion:
-            "europe" / "eu" → all EU member states + UK + Norway +
-                              Switzerland + Iceland + Liechtenstein.
-            "emea"          → Europe + Middle East + Africa.
-            "north america" → US + Canada + Mexico.
-            "latam"         → Mexico + Central + South America.
-            "apac"          → Asia-Pacific.
-            "anywhere" / "global" / "worldwide" → any country.
-
-     Apply by `remote_policy`:
-       - posting `remote_policy` = onsite OR hybrid:
-            * Posting MUST name a city/region matching `onsite_locations`
-              (verbatim or via the narrow expansion above).
-            * If it does NOT match → SCORE = 0. NEVER fall back to
-              `remote_regions` for hybrid/onsite postings. Madrid,
-              Barcelona, Berlin, Paris all VETO when onsite_locations
-              is ["bilbao","basque","euskadi"] — even though some of
-              them sit inside the candidate's `remote_regions`.
-       - posting `remote_policy` = remote (fully):
-            * If posting location is country-tagged (e.g. "Remote ·
-              Spain", "Remote — Germany"): country MUST be in
-              `remote_regions` verbatim or via macro expansion. If
-              not → SCORE = 0.
-            * Fully un-tagged remote ("Remote", "Anywhere") → assume
-              the candidate's TZ band; pass the V4 check; let the TZ
-              penalty handle further filtering.
-            * RECLASSIFY-AS-HYBRID rule: if the posting describes
-              itself as "remote within <one country>" AND ALSO
-              imposes MANDATORY periodic in-person attendance at a
-              named place (e.g. "Home based in Poland with 1-2
-              in-person meetings per quarter", "Remote Germany,
-              monthly team day in Berlin HQ", "Fully remote in the
-              UK with quarterly on-site weeks in London", "remote
-              with occasional travel to <city>"), treat the posting
-              as `remote_policy = hybrid` at THAT country/city for
-              V4 purposes. Apply the onsite branch of V4 — country/
-              city MUST match `onsite_locations` or SCORE=0. The
-              user committed to in-person at their `onsite_locations`
-              cities only; cross-border travel for "occasional"
-              meetings is exactly what they ruled out.
-              Signals that trigger reclassification:
-                * "X in-person <events> per <period>" (any frequency).
-                * "monthly / quarterly / bi-annual team day(s)".
-                * "occasional travel to <named place>" as a job
-                  requirement, not a perk.
-                * "home based in <country>, ideally <city>".
-                * "remote within <country>" coupled with any of the
-                  above.
-              Signals that DO NOT trigger reclassification:
-                * "Optional offsites", "annual company retreat
-                  (travel covered, attendance encouraged)" — perk,
-                  not requirement.
-                * "may include occasional travel" with no fixed
-                  cadence and no named hub.
-                * "We are a fully distributed team" with no in-
-                  person requirement.
-
-              COUNTRY-LOCKED REMOTE — same reclassification trigger,
-              even WITHOUT explicit "remote within X" phrasing:
-              when the posting's `location` field is a LIST OF CITIES
-              that all sit inside ONE country, the role is remote
-              within THAT country only — non-residents can't apply.
-              Treat as `remote_policy = hybrid` at the named country
-              and apply the V4 onsite branch.
-              Pattern: "City1 + City2, City3, City4 (remote)" — the
-              "(remote)" applies to the listed cities, NOT to the
-              whole world.
-              Examples that TRIGGER country-locked reclassification:
-                * "Kraków + Warszawa, Wrocław, Rzeszów (remote)"
-                  → Poland-locked. Bilbao candidate scores 0
-                  unless Poland is in `onsite_locations`.
-                * "Berlin, Munich, Hamburg (remote)" → Germany-locked.
-                * "Madrid, Barcelona, Valencia · Remote" → Spain-locked
-                  (passes V4 for a Bilbao-listed Spain user only
-                  because Spain ∈ remote_regions; still gets a TZ pass).
-                * "San Francisco, NYC, Austin remote" → US-locked.
-              Examples that do NOT trigger (genuinely cross-border):
-                * "Spain, Germany, Portugal · Remote" — multiple
-                  countries → real EU remote.
-                * "Remote · EU" / "Remote · EMEA" / "Remote Europe"
-                  → macro-region remote, passes V4 normally.
-                * "Remote — Worldwide" / "Remote · Anywhere" → no
-                  country lock.
-              When in doubt about whether the listed cities are all
-              in one country, look at the URL slug, company HQ
-              location, or any country-name suffix in the listing
-              ("(Polska)", "(Deutschland)") — if the answer is one
-              country, apply this rule.
-       - `remote_policy` unknown / not stated:
-            * If posting names a city/country, treat as onsite for V4.
-            * If posting offers no geo signal at all → pass V4.
-
-     If `onsite_locations` AND `remote_regions` are both empty in PREFS
-     (the candidate stated no geographical preference) → V4 does not
-     fire.
-
-     Examples:
-       - Candidate onsite_locations=["bilbao","basque","euskadi"],
-         remote_regions=["spain","europe","eu","emea"].
-         * Posting: onsite Madrid → Madrid ∉ onsite_locations → SCORE=0.
-         * Posting: hybrid Madrid → Madrid ∉ onsite_locations → SCORE=0.
-           DO NOT pass on the basis of "Madrid is in Spain, Spain is in
-           remote_regions" — those rules are for fully-remote postings,
-           not hybrid.
-         * Posting: hybrid Bilbao → match → V4 passes.
-         * Posting: hybrid Berlin → Berlin ∉ onsite_locations → SCORE=0.
-         * Posting: remote · Germany → Germany ∈ europe (macro) → V4 OK.
-         * Posting: remote · USA → USA ∉ remote_regions → SCORE=0.
-         * Posting: fully remote, no country tag → V4 OK.
-         * Posting: "Home based in Poland (ideally Warsaw, flexible
-           nationwide) with occasional in-person meetings (1-2 per
-           quarter)" → reclassify as hybrid Poland → Poland ∉
-           onsite_locations → SCORE=0. (Even though Poland ∈ EU,
-           the mandatory quarterly in-person at Poland breaks the
-           remote-EU branch.)
-         * Posting: "Remote within Germany, monthly team day in
-           Berlin office" → reclassify hybrid Berlin → Berlin ∉
-           onsite_locations → SCORE=0.
-         * Posting: "Fully distributed, optional annual retreat" →
-           NO reclassification → stays remote · (no country) →
-           V4 OK.
-
-     V4 EXTENSIONS — also reach SCORE=0 via the LOCATION axis:
-
-       (V4a) KNOWN-COUNTRY-RESTRICTED COMPANIES. Some companies are
-       infamous for hiring in a single country/region only despite
-       calling roles "remote". Treat these as `remote · <their hiring
-       country>` for V4 purposes, REGARDLESS of how the posting tags
-       location. The posting body / careers FAQ usually confirms this
-       in a sentence like "we are unable to sponsor visas", "you must
-       have authorization to work in <country>", "we only hire within
-       <country/region>".
-       Signals to recognise (not exhaustive — judge per posting):
-         * Body explicitly says "we hire only in <country>" or
-           equivalent.
-         * Body explicitly says "no sponsorship", "no visa support",
-           "no relocation assistance" alongside a single country tag.
-         * Company is one of the well-known US-only hirers for SWE
-           roles (Linear, Vanta, Stripe, Brex, Ramp, Mercury, Coda,
-           Notion, Figma, Plaid, Airtable, Anthropic, OpenAI etc. —
-           confirm against current posting; companies grow into new
-           geos over time).
-       Apply: reclassify posting as `remote · <hiring country>`.
-       Country must be in `remote_regions` macro-expanded, else
-       SCORE=0.
-
-       (V4b) NO-SPONSORSHIP COUNTRY-LOCKED VETO. A posting that says
-       "Remote · <country X>" + ANY of:
-           "no sponsorship", "no visa sponsorship",
-           "no visa support", "must have existing work authorization
-           in <X>", "no relocation assistance", "we cannot relocate",
-           "must reside in <X>"
-       is effectively hiring ONLY people who already live + have
-       work authorization in country X. Treat as effectively onsite
-       country X for V4. Country X must be in `remote_regions`
-       (macro-expanded) AND the candidate must plausibly reside in X
-       (assume candidate resides in any of their `onsite_locations`
-       countries OR Spain if onsite_locations is Spain-only). If X
-       is not the candidate's residence country → SCORE=0.
-       Example: candidate in Bilbao, Spain. Posting "Frontend
-       Developer · Remote · Poland · no sponsorship" → X=Poland,
-       candidate not resident in Poland → SCORE=0. Even though
-       Poland ∈ EU, the no-sponsorship clause means the role is
-       only open to existing Polish residents.
-
-       (V4c) US-ONSITE / US-HUB-RADIUS VETO. Postings tagged
-       "Remote · USA" / "US-based" / listing US cities only / "hub-
-       radius hybrid" across US cities → treat as remote · USA.
-       USA must be in `remote_regions` (or macro `north america`)
-       OR SCORE=0.
-       Additional US-onsite signals to catch:
-         * "<N> US hub locations" / "must live within 50 miles of
-           one of: <US cities>".
-         * US state-university research centers (UCLA, Harvard,
-           Stanford, NYU, MIT, USC, U-Michigan, U-Penn etc.) →
-           default to US-onsite unless posting explicitly says
-           "fully remote, global" or "remote within EU".
-         * US federal / state agencies → US-onsite.
-         * US-based non-profits with no remote callout → assume
-           US-onsite.
-
-     V4 PRECEDENCE (geography-first weighting): apply V4 (and V4a,
-     V4b, V4c) BEFORE topical / stack / domain fit. NEVER let a
-     strong topical match override a V4 veto. The candidate cannot
-     teleport. A "perfect topical fit" in a country the candidate
-     cannot work in is a 0, not a 4 or 5. Re-read the candidate's
-     `onsite_locations` and `remote_regions` BEFORE deciding the
-     posting's location is acceptable. When in doubt about location,
-     default to VETO rather than pass — the candidate ranks 50
-     fewer false-positives over 1 missed real positive.
-
-     TIME-ZONE PENALTY (remote postings only):
-       - Inputs: candidate `time_zone_band` (e.g. "UTC-1..UTC+3"),
-         posting TZ requirement.
-       - Identify posting TZ requirement from body: explicit ranges
-         ("UTC+0 to UTC+4", "Eastern Time", "PST hours"), country tags
-         on remote ("Remote · Germany" → CET ≈ UTC+1; "Remote · USA"
-         → UTC-8..UTC-5), or "must overlap N hours with X timezone".
-       - If candidate band and posting band have ZERO overlap →
-         SUBTRACT 2.
-       - If overlap < 4 hours → SUBTRACT 1.
-       - If overlap ≥ 4 hours OR posting accepts any TZ OR posting TZ
-         is unstated → no penalty.
-       - Skip entirely if `time_zone_band` is empty.
-
-     LANGUAGE PENALTY (per-level CEFR gap): subtract 1 point per CEFR
-     level the candidate is BELOW the posting's required level for the
-     working language. Floor at 0.
-
-     CEFR ordering (numeric, for the gap math):
-       A1=1, A2=2, B1=3, B2=4, C1=5, C2=6, Native=7
-     gap = max(0, required_level - candidate_level)
-     subtract = gap   (so each level below the bar costs 1 point)
-
-     The CEFR penalty fires ONLY when the posting names a language AND
-     specifies an EXPLICIT high-bar level. Vague phrasing
-     ("proficient", "professional working", "advanced", "good
-     communicator", "comfortable in English") is NOT enough — too many
-     postings boilerplate-include those without meaning a true C1.
-
-     Identifying the REQUIRED language + level for a posting:
-       - HIGH-CONFIDENCE TRIGGERS (penalty fires):
-           * Explicit CEFR letter: "C1", "C2", "B2"
-             (e.g. "C2-level Spanish", "C1 German required").
-           * "fluent" / "fluency" / "near-native"   → C2
-           * "native" / "native speaker" / "native-level"   → C2
-           * "must be native-level <lang>"          → C2
-           * "all <activities> taught in <lang>"    → C2 (working
-             language is that language end-to-end).
-           * Posting body language is non-English AND the role
-             explicitly demands the body language → C1 minimum.
-       - DO NOT TRIGGER on weak signals — these stay at "no penalty":
-           * "professional", "professional working proficiency",
-             "advanced", "working knowledge", "conversational",
-             "comfortable in", "good <lang> skills", "<lang> a plus".
-           * "English required" with no level qualifier — assume B2,
-             which is below C1 so no auto-C1 bar.
-           * Posting NAMES a language but doesn't tie it to a
-             requirement ("we work across English / Spanish teams").
-       - If posting is multilingual ("English OR French"): pick the
-         language with the SMALLEST gap for the candidate (best of).
-       - If genuinely ambiguous: NO penalty.
-
-     Identifying the candidate's LEVEL for that language:
-       - Read the resume's languages section / inline language mentions
-         AND the PREFS file (which may explicitly list levels:
-         "Languages: English C1, Russian native").
-       - Recognise CEFR markers (A1/A2/B1/B2/C1/C2), "native",
-         "bilingual", "fluent" (= C2), "intermediate" (= B1),
-         "basic" (= A2), explicit certificate names (DELF C1, Goethe
-         B2, IELTS 7.0 ≈ C1, TOEFL 110 ≈ C2).
-       - Soft self-descriptors ("professional", "working proficiency",
-         "advanced") map to B2 UNLESS paired with an explicit CEFR
-         qualifier — they're aspirational on resumes too.
-       - The candidate's `language` field in preferences, if non-empty,
-         lists the language(s) they prefer to work in — assume C2 for
-         each unless the resume/PREFS says otherwise.
-       - If the candidate did NOT list the required language at all,
-         treat their level as A1 (numeric 1).
-       - English: if the resume is written in English OR lists English
-         anywhere, assume at least B2 unless the resume/PREFS gives a
-         higher explicit level.
-
-     Examples:
-       - Posting "All classes taught in French (C2 required)". Resume:
-         "French — A2". A2=2, C2=6 → gap=4 → SUBTRACT 4.
-       - Posting "fluent German required". Resume: "German — B1". Implied
-         level C2=6, candidate B1=3 → gap=3 → SUBTRACT 3.
-       - Posting "C1 English required". Resume: "English — C2".
-         C2≥C1 → gap=0 → no penalty.
-       - Spanish-language posting (no English mentioned). Resume lists
-         no Spanish at all → A1=1 vs implied C1=5 → gap=4 → SUBTRACT 4.
-       - Posting "English OR French at professional level". Candidate:
-         "English — C2, French — A2". English path: C2 vs C1 → gap=0;
-         French path: A2 vs C1 → gap=3. Take min = 0 → no penalty.
-       - Posting "native-level Polish". Resume has no Polish → A1=1
-         vs Native=7 → gap=6 → SUBTRACT 6 (floor at 0 still applies).
-
-     SENIORITY PENALTY (per-level gap above target): subtract 1 point
-     per seniority step the posting sits ABOVE the candidate's target
-     level. Floor at 0. STRICTLY ONE-DIRECTIONAL — postings BELOW the
-     candidate's target are NOT penalized here UNLESS the candidate's
-     PREFS text contains an EXPLICIT VETO PHRASE for lower seniority.
-
-     Default rule for lower-than-target postings:
-       Treat intern / junior / mid / associate / entry-level postings
-       as a PERFECTLY acceptable seniority fit at no penalty. Many
-       strong candidates intentionally apply downward to switch
-       domain / company / stack. The bot does NOT second-guess that.
-
-     SOFT phrasing that DOES NOT trigger the below-target penalty
-     (these are aspirational, not vetoes):
-       * "I am a mid-level engineer" / "looking for a mid-level role"
-       * "Mid-level frontend engineer role working primarily in …"
-       * "Senior backend engineer" (candidate self-describing)
-       * "Targeting mid → senior"
-       * The user's stated TARGET being mid/senior is NOT, by itself,
-         a veto of junior postings. Aspirational target ≠ exclusion.
-
-     OVERQUALIFICATION IS NEVER A SCORING PENALTY. Phrases like
-     "candidate is overqualified for this junior role", "X years
-     experience exceeds Y-year requirement", "salary undervalues the
-     candidate" must NOT subtract any points. The candidate decides
-     whether to apply downward — your job is to surface the role,
-     not gate it on their behalf. NEVER write a `why_mismatch` that
-     reads "overqualified", "above the role's bar", "candidate has
-     more experience than required", etc. Skip the rule entirely.
-
-     HARD veto phrases that DO trigger −1 per level below target:
-       * "no junior", "no intern", "no entry-level", "no associate"
-       * "NOT a fit: junior", "NOT a fit: mid level"
-       * "must be senior", "senior or above only", "minimum senior"
-       * `title_exclude` list containing "junior" / "intern" / "entry"
-       * Skip-feedback comments (under `[Recent 'not a fit' comments]`)
-         like "too junior", "not a fit: too junior"
-     Only these explicit forms count — anything weaker is aspirational
-     and gets no penalty.
-
-     SALARY is NEVER a scoring penalty. Salary is informational only,
-     surfaced in `key_details.salary` for the user to see. Do NOT
-     subtract for "salary undervalues the candidate", "below market",
-     or "compensation range too low" — that is the user's decision to
-     make from the card, not yours.
-
-     Seniority ordering (numeric, for the gap math):
-       intern/internship       = 0
-       junior / entry-level    = 1
-       associate               = 2
-       mid / middle / regular  = 3
-       senior                  = 4
-       lead / staff            = 5
-       principal               = 6
-       director                = 7
-       vp / head / chief / c-level = 8
-     gap = max(0, posting_level - candidate_target_level)
-     subtract = gap
-
-     Identifying the candidate's TARGET level:
-       - Read `target_levels` from the preferences block. If it lists
-         multiple, take the HIGHEST listed (e.g. ["mid","middle"] → 3).
-       - If empty or "any" → no penalty.
-
-     Identifying the posting's seniority level:
-       - Title prefix is the strongest signal: "Senior Frontend" → 4,
-         "Staff Engineer" → 5, "Principal Engineer" → 6, "Lead Frontend"
-         → 5, "Director of Engineering" → 7, "VP Engineering" → 8.
-       - "Junior" / "Entry" / "Associate" titles map per the table.
-       - If title has no seniority prefix and the body says "5+ years
-         required" → senior (4); "3-5 years" → mid (3); "8+" → staff/
-         lead (5); "10+" / "principal" → 6.
-       - If posting genuinely doesn't signal level (no title prefix,
-         no years requirement, no level callout) → assume mid (3) and
-         apply no penalty if candidate target ≥ mid.
-
-     Examples:
-       - Candidate target=mid (3). Posting "Senior Frontend Engineer"
-         → senior=4 → gap=1 → SUBTRACT 1.
-       - Candidate target=mid (3). Posting "Staff Software Engineer"
-         → staff=5 → gap=2 → SUBTRACT 2.
-       - Candidate target=mid (3). Posting "Principal Engineer"
-         → principal=6 → gap=3 → SUBTRACT 3.
-       - Candidate target=mid (3). Posting "Frontend Developer
-         (3-5 years)" → mid=3 → gap=0 → no penalty.
-       - Candidate target=mid (3). Posting "Junior React Developer"
-         → junior=1 → gap=0 (one-directional, below target ignored).
-       - Candidate target=senior (4). Posting "Staff Engineer"
-         → staff=5 → gap=1 → SUBTRACT 1.
-
-     PER-SKILL YEARS-EXPERIENCE PENALTY: subtract 1 point per FULL year
-     of experience the candidate is MISSING on whatever specific skill
-     the posting demands the most. STRICTLY ONE-DIRECTIONAL — postings
-     demanding LESS experience than the candidate has are NEVER
-     penalized here. A senior candidate scoring against a "2+ years
-     React" posting gets zero penalty from this rule. Apply the
-     SENIORITY PENALTY's "lower-than-target only if PREFS excludes it"
-     guard as a tiebreaker if you're tempted to downgrade.
-
-     The PENALTY IS PER-SKILL, not per-role. Read the posting's
-     requirements carefully and identify the largest individual skill
-     gap. Examples of what counts as a "skill" for this rule: a
-     programming language ("5+ years Python"), a framework ("4+ years
-     React"), a tool ("3+ years Kubernetes"), a domain ("5+ years
-     financial services"). Total years-of-experience requirements
-     ("8+ years software engineering experience") also count as a
-     skill — the skill is "software engineering" itself.
-
-     For each skill the posting names with a years requirement:
-       1. Pull the posting's MINIMUM required years for that skill
-          (lower bound on a range; the bare number on "X+ years").
-       2. Find the candidate's years on that SAME skill from the
-          RESUME — count distinct role-years that explicitly list the
-          skill. If the resume doesn't list the skill at all, treat
-          the candidate's count as 0.
-       3. gap = max(0, required_years - candidate_skill_years).
-
-     Take the BIGGEST gap across all stated skills, and SUBTRACT that
-     many points. Floor at 0.
-
-     Examples:
-       - Candidate resume shows 3 years React, 3 years TypeScript.
-         Posting "5+ years frontend JavaScript developer" → JS skill
-         requires 5y, candidate has ~3y JS → gap=2 → SUBTRACT 2.
-       - Candidate has 3 years React, 1 year Vue.
-         Posting "3+ years React, 5+ years Vue" → React gap=0,
-         Vue gap=4 → biggest gap=4 → SUBTRACT 4.
-       - Candidate has 8 years Python, 0 years Rust.
-         Posting "5+ years Python, 2+ years Rust" → Python gap=0,
-         Rust gap=2 → biggest gap=2 → SUBTRACT 2.
-       - Candidate has 3y total experience.
-         Posting "8+ years software engineering" → gap=5 → SUBTRACT 5.
-         (Floor at 0 still applies.)
-       - Posting names no specific years requirements → skip the rule.
-
-     The `why_mismatch` field MUST cite the gap explicitly when this
-     rule fires, e.g. "5+ years React required vs candidate 3y → -2".
-
-     Order of application:
-       1. HARD VETOES (V1 title-exclude, V2 body-exclude, V3 company-
-          exclude, V4 LOCATION + V4a country-restricted company,
-          V4b no-sponsorship country-locked, V4c US-onsite/hub-
-          radius) — if ANY hits → score = 0, return. APPLY V4
-          BEFORE ANY TOPICAL FIT — never let topical strength
-          override a location veto.
-       2. Role/stack base score (1-5).
-       3. TIME-ZONE PENALTY (-2 zero overlap, -1 < 4h overlap).
-       4. LANGUAGE PENALTY (-1 per CEFR level the candidate is below
-          the posting's required level for the working language).
-       5. SENIORITY PENALTY (-1 per level the posting is above the
-          candidate's target levels).
-       6. PER-SKILL YEARS PENALTY (-1 per year of the BIGGEST gap on
-          any specific skill the posting demands).
-       7. Final score: floor at 0, ceiling at 5.
+  1. Decide `match_score` 0-5 by the judgment + rules above.
 
   2. Write `why_match`: ONE or TWO sentences, max 240 chars, that name
      specific overlaps with this candidate's resume AND preferences (e.g.
@@ -719,16 +195,11 @@ For each posting, you must:
      frontend role". For score-0 rejects this should be empty or terse.
 
   3. Write `why_mismatch`: ONE or TWO sentences, max 240 chars, naming
-     the SPECIFIC misalignments — penalties that fired, constraints that
-     missed, gaps the candidate would have to bridge. Examples:
-       "Senior level (1 above mid target); office in Munich is outside
-        candidate's onsite cities (-3)."
-       "Working language German; resume shows English/Russian only,
-        CEFR gap 4."
-     For score=0 (HARD VETO), this MUST cite the matched token, e.g.
-     "title-exclude hit: 'staff'", "body-exclude hit: 'german'",
-     "company-exclude hit: 'Acme Corp'".
-     For a clean 5/5 fit, may be empty string ("").
+     the SPECIFIC misalignments — disqualifiers, gaps, unverified
+     conditions. For score 0-1 it MUST cite the concrete disqualifier
+     (e.g. "requires fluent Swedish, candidate has none", "remote
+     restricted to EU, candidate in Russia", "hybrid Athens, candidate
+     accepts hybrid only in Spain"). For a clean 5/5 fit, may be "".
 
   4. Extract `key_details` from the posting (use "" for fields not stated):
        - stack:          comma-separated tech mentioned (e.g. "React, TS, Vue")
@@ -779,6 +250,50 @@ Rules:
 === JOBS (JSON array) ===
 {jobs_json}
 """.strip()
+
+
+def _id_lookup(jobs: list[Job]) -> tuple[dict[str, str], dict[str, str]]:
+    """Per-batch correlation ids: (key_by_ext, lookup).
+
+    The model has to echo an id back so we can attach its verdict to the right
+    posting. It CANNOT reliably echo `external_id`, which is the posting URL:
+    LinkedIn percent-encodes non-ASCII slugs ("t%C3%A9cnico") and the model
+    returns the decoded form ("técnico"), so the verdict failed the
+    `in valid_ids` check and was dropped on the floor — measured 6 of 10 lost
+    on a Spanish batch. A short opaque key is something it can copy exactly.
+
+      key_by_ext: external_id → the id we SEND ("j1"…"jN")
+      lookup:     anything it might echo BACK → external_id
+    """
+    key_by_ext: dict[str, str] = {}
+    lookup: dict[str, str] = {}
+    # Aliases FIRST: accept the external_id verbatim and percent-decoded, in
+    # case a model echoes the URL anyway.
+    for j in jobs:
+        lookup.setdefault(j.external_id, j.external_id)
+        lookup.setdefault(unquote(j.external_id), j.external_id)
+    # Opaque keys LAST, overwriting any alias that collides with them: an
+    # external_id is free to look like "j1", and since "j1" is what we SENT,
+    # our meaning has to win. (Aliasing them the other way round silently
+    # shifted every verdict by one job when ids were "j0","j1",….)
+    for i, j in enumerate(jobs, 1):
+        key = f"j{i}"
+        key_by_ext[j.external_id] = key
+        lookup[key] = j.external_id
+    return key_by_ext, lookup
+
+
+def _briefs_with_short_ids(
+    jobs: list[Job],
+    key_by_ext: dict[str, str],
+) -> list[dict[str, str]]:
+    """`_job_to_brief` for each job, with the opaque id swapped in."""
+    briefs = []
+    for j in jobs:
+        b = _job_to_brief(j)
+        b["external_id"] = key_by_ext[j.external_id]
+        briefs.append(b)
+    return briefs
 
 
 def _job_to_brief(j: Job) -> dict[str, str]:
@@ -918,11 +433,17 @@ def enrich_jobs_ai(
     """
     if not jobs:
         return {}
-    if not resume_text or not resume_text.strip():
-        log.info("enrich_jobs_ai: empty resume — skipping enrichment")
-        return {}
-
+    resume_text = (resume_text or "").strip()
     prefs_text = (prefs_text or "").strip()
+    # Bail only when we have NOTHING to score against. A CV-less user who
+    # completed the wizard still has PREFS (which this prompt calls
+    # authoritative) and usually a profile summary standing in for the RESUME
+    # block — see `user_profile.profile_as_resume`. Requiring a resume here
+    # silently zeroed out every such user, because AI scoring is the single
+    # matching gate.
+    if not resume_text and not prefs_text:
+        log.info("enrich_jobs_ai: no resume and no prefs — skipping enrichment")
+        return {}
 
     # ----- Persistent score cache (lookup) ----------------------------
     # When db+chat_id are both threaded through, fetch cached verdicts
@@ -1516,9 +1037,11 @@ def _run_scoring_batch(
         )
     # Default / fallback: the existing wrapped CLI path. Reassemble the
     # single prompt string (byte-identical to the pre-split build).
+    # json_mode: constrained JSON decoding on the Mistral leg (ignored by the
+    # Claude CLI leg) — the scoring prompt's whole contract is a JSON object.
     return wrapped_run_p(
         None, caller, stable_prefix + volatile_suffix,
-        timeout_s=timeout_s, model=model,
+        timeout_s=timeout_s, model=model, json_mode=True,
     )
 
 
@@ -1563,7 +1086,10 @@ def _enrich_one_chunk(
     All retries are bounded to a single attempt (_retry_depth==0 → 1) so
     a systematic failure can't fan out forever.
     """
-    briefs = [_job_to_brief(j) for j in chunk]
+    # Short opaque correlation ids ("j1"…"jN"): the model can copy these back
+    # exactly, unlike a percent-encoded URL. See `_id_lookup`.
+    key_by_ext, id_lookup = _id_lookup(chunk)
+    briefs = _briefs_with_short_ids(chunk, key_by_ext)
     # Split the prompt into the byte-stable rubric+profile prefix and the
     # per-batch jobs suffix. The CLI path concatenates them (unchanged
     # bytes); the SDK path caches the prefix. See `_build_scoring_prompt`.
@@ -1638,18 +1164,21 @@ def _enrich_one_chunk(
             data = parse_json_block(body)
             if not isinstance(data, dict) or not isinstance(data.get("results"), list):
                 reason = _BATCH_PARSE_ERROR
+                # Log stop_reason + length + TAIL, not just the head: a head
+                # alone can't distinguish "cut off mid-array" from "complete
+                # but one brace short", and we chased the wrong one for it.
                 log.error(
                     "enrich_jobs_ai: batch %d/%d response missing `results` list "
-                    "(head=%r)",
-                    batch_idx, total_batches, body_head,
+                    "(%s, body_chars=%d, head=%r, tail=%r)",
+                    batch_idx, total_batches, _envelope_diag(stdout),
+                    len(body or ""), body_head, (body or "")[-120:],
                 )
             else:
-                valid_ids = {j.external_id for j in chunk}
                 for r in data["results"]:
                     if not isinstance(r, dict):
                         continue
-                    ext_id = str(r.get("id") or "").strip()
-                    if not ext_id or ext_id not in valid_ids:
+                    ext_id = id_lookup.get(str(r.get("id") or "").strip())
+                    if not ext_id:
                         continue
                     out[ext_id] = {
                         "match_score": _normalize_score(r.get("match_score")),
@@ -1824,7 +1353,8 @@ def reanalyze_scoring_ai(
     """
     if not jobs:
         return []
-    if not resume_text or not resume_text.strip():
+    # Same rule as enrich_jobs_ai: PREFS alone is a valid basis for a verdict.
+    if not (resume_text or "").strip() and not (prefs_text or "").strip():
         return []
 
     batch_size = max(1, int(batch_size or 1))
@@ -2062,11 +1592,15 @@ def _audit_batch_scorer(
 
     Empty list on CLI failure or unparseable output.
     """
+    # Same opaque-id contract as the scoring pass — the audit prompt asks the
+    # model to echo `id` back, and a percent-encoded URL doesn't survive the
+    # round trip (see `_id_lookup`).
+    key_by_ext, id_lookup = _id_lookup(batch_jobs)
     review_items = []
     for j in batch_jobs:
         enr = enrichments_by_external_id.get(j.external_id) or {}
         review_items.append({
-            "id": j.external_id,
+            "id": key_by_ext[j.external_id],
             "title": (j.title or "")[:140],
             "company": (j.company or "")[:100],
             "url": (j.url or "")[:200],
@@ -2104,7 +1638,7 @@ def _audit_batch_scorer(
 
     caller = f"scoring_audit:b{batch_idx}r{round_idx}"
     stdout = wrapped_run_p(None, caller, prompt,
-                          timeout_s=timeout_s, model=model)
+                          timeout_s=timeout_s, model=model, json_mode=True)
     if not stdout:
         log.warning(
             "reanalyze_scoring_ai: batch %d/%d round %d scorer CLI "
@@ -2123,12 +1657,11 @@ def _audit_batch_scorer(
         return []
 
     out: list[dict] = []
-    valid_ids = {j.external_id for j in batch_jobs}
     for r in data["reviews"]:
         if not isinstance(r, dict):
             continue
-        ext_id = str(r.get("id") or "").strip()
-        if ext_id not in valid_ids:
+        ext_id = id_lookup.get(str(r.get("id") or "").strip())
+        if not ext_id:
             continue
         original = int(enrichments_by_external_id.get(ext_id, {}).get("match_score") or 0)
         try:
@@ -2180,16 +1713,26 @@ def _audit_batch_critic(
     audit doesn't stall — "couldn't verify, accept scorer output" is
     safer than blocking on a transient claude CLI hiccup.
     """
+    # Keep the whole audit loop on the scorer's opaque ids: the critic's
+    # feedback is prepended to the scorer's NEXT-round prompt, whose items are
+    # keyed "j1"…"jN". Feeding back URL-shaped ids would leave the scorer
+    # unable to match a complaint to a posting.
+    key_by_ext, _ = _id_lookup(batch_jobs)
     items_view = []
     for j in batch_jobs:
         items_view.append({
-            "id": j.external_id,
+            "id": key_by_ext[j.external_id],
             "title": (j.title or "")[:140],
             "company": (j.company or "")[:100],
             # Critic doesn't need the full snippet; a short head is
             # enough for grounding checks while keeping the prompt small.
             "snippet_head": (j.snippet or "").replace("\n", " ")[:300],
         })
+    scorer_reviews = [
+        {**r, "id": key_by_ext.get(str(r.get("id") or ""), r.get("id"))}
+        for r in (scorer_reviews or [])
+        if isinstance(r, dict)
+    ]
 
     prompt = (
         "You are a CRITIC reviewing the FORMAT and INTERNAL CONSISTENCY "
@@ -2234,7 +1777,7 @@ def _audit_batch_critic(
 
     caller = f"scoring_audit_critic:b{batch_idx}r{round_idx}"
     stdout = wrapped_run_p(None, caller, prompt,
-                          timeout_s=timeout_s, model=critic_model)
+                          timeout_s=timeout_s, model=critic_model, json_mode=True)
     if not stdout:
         # CLI hiccup — accept the scorer's output rather than stall the
         # whole batch on a transient failure. Logged so ops can spot
@@ -2272,6 +1815,22 @@ def _audit_batch_critic(
     if approve and issues:
         approve = False
     return approve, issues
+
+
+def _envelope_diag(stdout: str | None) -> str:
+    """`stop_reason=... out_tokens=...` from a transport envelope, for logs.
+
+    The transport envelope already carries these; nothing was reading
+    them, so a malformed-JSON batch was indistinguishable from a truncated
+    one. Never raises.
+    """
+    try:
+        env = json.loads((stdout or "").strip())
+        usage = env.get("usage") or {}
+        return (f"stop_reason={env.get('stop_reason')!r} "
+                f"out_tokens={usage.get('output_tokens')}")
+    except Exception:
+        return "stop_reason=? out_tokens=?"
 
 
 def _is_empty_result_envelope(stdout: str) -> bool:
