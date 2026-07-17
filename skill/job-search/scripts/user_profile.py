@@ -13,11 +13,12 @@ JSON object. This module provides the consumer-side helpers:
 
 Profile shape (see `profile_builder.py` for the authoritative schema).
 
-Schema v3 (current) splits geo into TWO axes so we can express "onsite-or-
-hybrid OK in a small pinned list AND remote OK in a wider macro region":
+Schema v5 (current) splits location intent into THREE granularity-agnostic
+lists so Haiku can reason about geographic containment (Madrid ⊂ Spain ⊂
+Europe ⊂ Earth) instead of matching city tokens literally:
 
     {
-      "schema_version": 3,
+      "schema_version": 5,
       "ideal_fit_paragraph": "...",
       "primary_role": "...",
       "target_levels": ["senior"],
@@ -31,13 +32,14 @@ hybrid OK in a small pinned list AND remote OK in a wider macro region":
       "exclude_keywords": [...],
       "exclude_companies": [...],
 
-      # NEW in v3 — replace the single `locations` list with two axes.
-      "onsite_locations":  [...],   # cities/regions where onsite/hybrid OK
-      "remote_regions":    [...],   # countries/macro-regions where remote OK
-      # Legacy single-list location stays in the JSON for back-compat readers.
-      "locations":         [...],
+      # v5 — three independent lists, each accepts city/country/continent/earth.
+      "remote_locations":  [...],   # where FULLY-REMOTE work is OK
+      "hybrid_locations":  [...],   # where HYBRID work is OK
+      "onsite_locations":  [...],   # where fully ONSITE work is OK
+      # No `remote` enum, no `locations` union, no `remote_regions` in v5 —
+      # the three lists ARE the single source of truth. Downstream derives
+      # any coarse enum it needs (see `_project`).
 
-      "remote": "remote"|"hybrid"|"onsite"|"any",
       "time_zone_band": "...",
       "salary_min_usd": 80000,
       "drop_if_salary_unknown": false,
@@ -57,9 +59,11 @@ hybrid OK in a small pinned list AND remote OK in a wider macro region":
       "built_from": {resume_sha1, prefs_sha1, model, elapsed_ms}
     }
 
-Schema v2 profiles (single `locations` + `remote`) are still loaded — the
-projector synthesizes `onsite_locations`/`remote_regions` from the legacy
-fields so downstream code is schema-agnostic.
+Schema v3 profiles (onsite_locations + remote_regions + locations + remote)
+and v2 profiles (single `locations` + `remote`) are still LOADED — the
+projector synthesizes the three v5 lists from the legacy fields so downstream
+code is schema-agnostic. New BUILDS always emit v5 (enforced in
+`build_profile_sync`).
 
 Fields the user didn't state stay at their sentinel (`[]` / `"any"` / `0` /
 `""`). `effective_filters` treats sentinel values as "inherit from global".
@@ -110,7 +114,8 @@ def is_empty_profile(profile: dict[str, Any] | None) -> bool:
         return True
     for key in ("stack_primary", "stack_secondary", "title_must_match",
                 "title_exclude", "exclude_keywords", "exclude_companies",
-                "locations", "onsite_locations", "remote_regions"):
+                "locations", "onsite_locations", "remote_regions",
+                "remote_locations", "hybrid_locations"):
         if profile.get(key):
             return False
     if (profile.get("remote") or "any") != "any":
@@ -209,12 +214,23 @@ def _project(profile: dict[str, Any]) -> dict[str, Any]:
       * `exclude_keywords` = exclude_keywords ∪ stack_antipatterns
       * `seniority`        = target_levels collapsed to a single enum if it
                              contains exactly one distinct level, else "any".
-      * `onsite_locations` / `remote_regions`: schema v3 fields. For v2
-        profiles (single `locations`), we synthesize:
-          - onsite_locations = strict (city/region) entries only
-          - remote_regions   = full legacy `locations` list
-        so the prompt's two-axis location rule still has data to work with.
-      * title gates, locations, remote, companies, salary, language,
+      * `remote_locations` / `hybrid_locations` / `onsite_locations`:
+        schema v5 fields (each accepts city/country/continent/earth). Read
+        verbatim from v5 profiles. For legacy v3 profiles (city-only
+        `onsite_locations` + `remote_regions`), the v3 city list is mirrored
+        into BOTH `onsite_locations` and `hybrid_locations` (v3 conflated the
+        two modes) and `remote_regions` → `remote_locations`. For v2 profiles
+        (single `locations`), strict tokens → onsite+hybrid, the full list →
+        remote_locations.
+      * `remote` (enum any/remote/hybrid/onsite): v5 has no emitted `remote`
+        field, so it is DERIVED from which lists are non-empty (only one mode
+        → that mode; multiple modes → "any"; none → fall back to the legacy
+        stored `remote` value). The LinkedIn/web_search adapters still read
+        `filters["remote"]` for remote-only search mode, so this derivation
+        preserves that signal without a v5 enum field.
+      * `locations` (legacy union) = union of the three v5 lists, kept for the
+        unused legacy pre-filter `apply_profile` and `is_empty_profile`.
+      * title gates, companies, salary, language,
         max_age_hours, min_match_score, free_text pass through.
     """
     p = profile or {}
@@ -253,27 +269,64 @@ def _project(profile: dict[str, Any]) -> dict[str, Any]:
     else:
         seniority = "any"
 
-    remote = str(p.get("remote") or "any").strip().lower()
-    if remote not in _VALID_REMOTE:
-        remote = "any"
+    # ---- Location preferences (schema v5) ----
+    # v5 emits three granularity-agnostic lists: remote_locations,
+    # hybrid_locations, onsite_locations (each: city/country/continent/earth).
+    # Legacy v3 profiles carry onsite_locations (city-only) + remote_regions +
+    # locations (union) + remote (enum); v2 carries locations + remote only.
+    # Read v5 first; synthesize v5 from legacy when v5 is absent so downstream
+    # code stays schema-agnostic.
+    remote_locations = _str_list(p.get("remote_locations"))
+    hybrid_locations = _str_list(p.get("hybrid_locations"))
+    onsite_locations = _str_list(p.get("onsite_locations"))
 
-    legacy_locations = _str_list(p.get("locations"))
-    onsite = _str_list(p.get("onsite_locations"))
-    remote_regions = _str_list(p.get("remote_regions"))
+    if not (remote_locations or hybrid_locations or onsite_locations):
+        # Back-compat: synthesize v5 axes from legacy v3/v2 fields.
+        legacy_locations = _str_list(p.get("locations"))
+        legacy_remote_regions = _str_list(p.get("remote_regions"))
+        v3_onsite = _str_list(p.get("onsite_locations"))  # v3 was city-only
+        if v3_onsite or legacy_remote_regions:
+            # v3 conflated onsite+hybrid into one city list; mirror it into
+            # both v5 modes so a v3 profile behaves as before.
+            onsite_locations = list(v3_onsite)
+            hybrid_locations = list(v3_onsite)
+            remote_locations = list(legacy_remote_regions)
+        elif legacy_locations:
+            # v2 flat list: macro tokens → remote, strict tokens → onsite/hybrid.
+            onsite_locations = [t for t in legacy_locations
+                                 if t not in _MACRO_REGION_TOKENS]
+            hybrid_locations = list(onsite_locations)
+            remote_locations = list(legacy_locations)
 
-    # Synthesize the v3 axes from a v2 profile if explicit fields absent.
-    # A v2 `locations` list typically contains both strict cities and macro
-    # regions; without further info we feed strict-looking tokens to onsite
-    # and the full list to remote_regions. _MACRO_REGION_TOKENS lists the
-    # tokens we treat as macro (and therefore NOT onsite-acceptable).
-    if not onsite and not remote_regions and legacy_locations:
-        onsite = [t for t in legacy_locations if t not in _MACRO_REGION_TOKENS]
-        remote_regions = list(legacy_locations)
-    elif onsite and not remote_regions:
-        remote_regions = list(legacy_locations) or list(onsite)
-    elif remote_regions and not onsite:
-        onsite = [t for t in (legacy_locations or remote_regions)
-                  if t not in _MACRO_REGION_TOKENS]
+    # Derive the coarse `remote` enum the LinkedIn/web_search adapters still
+    # read (apify_fetch: filters.get("remote") in ("require","remote") ⇒
+    # remote-only LinkedIn mode). v5 has no emitted `remote` field, so derive
+    # it from which lists are non-empty. A stored v3/v2 `remote` value wins
+    # only when ALL v5 lists are empty (a pure legacy profile with no geo).
+    modes_nonempty = sum(bool(x) for x in (remote_locations, hybrid_locations,
+                                          onsite_locations))
+    if modes_nonempty == 0:
+        remote = str(p.get("remote") or "any").strip().lower()
+        if remote not in _VALID_REMOTE:
+            remote = "any"
+    elif modes_nonempty > 1:
+        remote = "any"  # multiple modes → old enum can't represent the combo
+    elif remote_locations:
+        remote = "remote"
+    elif hybrid_locations:
+        remote = "hybrid"
+    else:  # onsite_locations only
+        remote = "onsite"
+
+    # Legacy `locations` union (kept for the unused legacy pre-filter
+    # `apply_profile` and `is_empty_profile`). Union of the three v5 lists.
+    locations: list[str] = []
+    _seen: set[str] = set()
+    for _lst in (remote_locations, hybrid_locations, onsite_locations):
+        for _t in _lst:
+            if _t not in _seen:
+                _seen.add(_t)
+                locations.append(_t)
 
     years_experience = int(p.get("years_experience") or 0)
     time_zone_band = str(p.get("time_zone_band") or "").strip()
@@ -286,9 +339,11 @@ def _project(profile: dict[str, Any]) -> dict[str, Any]:
         "exclude_companies":      exclude_companies,
         "seniority":              seniority,
         "target_levels":          target_levels,
-        "locations":              legacy_locations,
-        "onsite_locations":       onsite,
-        "remote_regions":         remote_regions,
+        "locations":              locations,
+        "onsite_locations":       onsite_locations,
+        "remote_locations":       remote_locations,
+        "hybrid_locations":       hybrid_locations,
+        "remote_regions":         remote_locations,  # legacy alias for back-compat readers
         "remote":                 remote,
         "time_zone_band":         time_zone_band,
         "years_experience":       years_experience,
@@ -485,6 +540,59 @@ def set_min_match_score(
     return out
 
 
+def profile_as_resume(profile: dict[str, Any] | None) -> str:
+    """Render a profile as a RESUME-block substitute for CV-less users.
+
+    The onboarding wizard lets people finish without uploading a PDF ("Skip
+    for now" — see onboarding.py:CB_SKIP_CV), and the builder still produces a
+    full profile from their button answers. Without this, `enrich_jobs_ai`
+    sees an empty resume, returns {} (it is the SINGLE matching gate — see
+    `search_jobs.post_filter`), and the user gets zero jobs forever.
+
+    The output is prose + plain lists, not JSON: the scoring prompt reads the
+    RESUME block as "what the candidate CAN do", and the ideal-fit paragraph
+    is exactly that, already written in natural language by the builder.
+
+    Returns "" for a profile with no usable signal, so callers can fall back
+    to the PREFS-only path.
+    """
+    p = profile or {}
+    lines: list[str] = []
+
+    ideal = str(p.get("ideal_fit_paragraph") or "").strip()
+    if ideal:
+        lines.append(ideal)
+
+    role = str(p.get("primary_role") or "").strip()
+    if role:
+        lines.append(f"Role: {role}")
+    levels = _str_list(p.get("target_levels"))
+    if levels:
+        lines.append(f"Target level: {', '.join(levels)}")
+    years = int(p.get("years_experience") or 0)
+    if years:
+        lines.append(f"Years of experience: {years}")
+
+    for label, key in (
+        ("Core skills",       "stack_primary"),
+        ("Additional skills", "stack_secondary"),
+        ("Adjacent skills",   "stack_adjacent"),
+        ("Relevant titles",   "title_must_match"),
+    ):
+        vals = _str_list(p.get(key))
+        if vals:
+            lines.append(f"{label}: {', '.join(vals)}")
+
+    if not lines:
+        return ""
+    # ponytail: no CV-parsing fidelity here — this is a profile summary, and
+    # the scorer is told so. Drop it the moment the user uploads a real PDF.
+    return (
+        "(No CV on file — the following is the candidate's profile, built "
+        "from their onboarding answers.)\n\n" + "\n".join(lines)
+    )
+
+
 def get_free_text(profile: dict[str, Any] | None) -> str:
     """Small helper: Opus echoes back the user's free-text in the profile;
     readers that want the raw input for downstream subagents use this."""
@@ -533,20 +641,34 @@ def format_profile_summary_mdv2(
     if yrs:
         lines.append(row("📅", "Years", str(yrs)))
 
-    has_v3_geo = bool(p.get("onsite_locations") or p.get("remote_regions"))
-    geo_rows = (
-        [("Onsite OK in",   "onsite_locations", "🏢"),
-         ("Remote regions", "remote_regions",   "🌍")]
-        if has_v3_geo
-        else [("Locations",  "locations",       "📍")]
-    )
+    has_v5_geo = bool(p.get("remote_locations") or p.get("hybrid_locations")
+                      or p.get("onsite_locations"))
+    if has_v5_geo:
+        # Schema v5: three granularity-agnostic lists (city/country/continent/
+        # earth). Haiku reasons about containment at score time.
+        geo_rows = [
+            ("Remote OK in",  "remote_locations",  "🌍"),
+            ("Hybrid OK in",  "hybrid_locations",  "🔀"),
+            ("Onsite OK in",  "onsite_locations",  "🏢"),
+        ]
+    elif p.get("onsite_locations") or p.get("remote_regions"):
+        # Legacy v3 profile.
+        geo_rows = [
+            ("Onsite OK in",   "onsite_locations", "🏢"),
+            ("Remote regions", "remote_regions",   "🌍"),
+        ]
+    else:
+        geo_rows = [("Locations",  "locations",       "📍")]
     for label, key, emoji in [
         ("Primary stack",     "stack_primary",      "🧰"),
         ("Secondary stack",   "stack_secondary",    "🔧"),
         ("Antipatterns",      "stack_antipatterns", "🚫"),
-        ("Title must match",  "title_must_match",   "📎"),
-        ("Title exclude",     "title_exclude",      "🚫"),
-        ("Body exclude",      "exclude_keywords",   "🚫"),
+        # "hints", not "must match" / "exclude": these lists only steer
+        # web-search discovery queries — the AI scorer judges every posting
+        # holistically and never hard-filters on them.
+        ("Title search hints","title_must_match",   "📎"),
+        ("Title skip hints",  "title_exclude",      "🚫"),
+        ("Body skip hints",   "exclude_keywords",   "🚫"),
         *geo_rows,
         ("Excluded companies","exclude_companies",  "🏢"),
     ]:
@@ -555,7 +677,10 @@ def format_profile_summary_mdv2(
             lines.append(row(emoji, label, ", ".join(vals[:12])))
 
     remote = p.get("remote") or "any"
-    if remote != "any":
+    # v5 profiles have no emitted `remote` field (the three geo lists above
+    # convey the policy); only surface the legacy row for v2/v3 profiles that
+    # explicitly stored one.
+    if remote != "any" and not has_v5_geo:
         lines.append(row("🏠", "Remote policy", remote))
     tz = (p.get("time_zone_band") or "").strip()
     if tz:

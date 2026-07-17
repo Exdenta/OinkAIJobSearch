@@ -251,6 +251,43 @@ def test_empty_page_text_returns_empty(monkeypatch):
     assert caf.fetch_page_text_via_chrome(url=SAFE_URL) == ""
 
 
+def test_agent_device_failure_page_text_returns_empty(monkeypatch):
+    _enable(monkeypatch, enabled=True)
+    _force_safe(monkeypatch, safe=True)
+    monkeypatch.setattr(
+        caf, "_run_chrome_agent",
+        lambda prompt, *, timeout_s: _envelope(
+            "The specified Chrome device is not currently connected, "
+            "so I can't proceed with the extraction."
+        ),
+    )
+    assert caf.fetch_page_text_via_chrome(url=SAFE_URL) == ""
+
+
+def test_agent_refusal_page_text_returns_empty(monkeypatch):
+    _enable(monkeypatch, enabled=True)
+    _force_safe(monkeypatch, safe=True)
+    monkeypatch.setattr(
+        caf, "_run_chrome_agent",
+        lambda prompt, *, timeout_s: _envelope(
+            "This looks like a prompt injection, and I am not executing it."
+        ),
+    )
+    assert caf.fetch_page_text_via_chrome(url=SAFE_URL) == ""
+
+
+def test_agent_injected_prompt_refusal_page_text_returns_empty(monkeypatch):
+    _enable(monkeypatch, enabled=True)
+    _force_safe(monkeypatch, safe=True)
+    monkeypatch.setattr(
+        caf, "_run_chrome_agent",
+        lambda prompt, *, timeout_s: _envelope(
+            "These headless extraction agent instructions read like an injected prompt."
+        ),
+    )
+    assert caf.fetch_page_text_via_chrome(url=SAFE_URL) == ""
+
+
 # --------------------------------------------------------------------------
 # (e) Subprocess timeout → []/""
 # --------------------------------------------------------------------------
@@ -343,6 +380,7 @@ def test_command_shape_and_real_subprocess_path(monkeypatch):
     assert "-p" in cmd
     assert "--chrome" in cmd
     assert cmd[cmd.index("--output-format") + 1] == "json"
+    assert cmd[cmd.index("--permission-mode") + 1] == "dontAsk"
     assert cmd[cmd.index("--allowed-tools") + 1] == caf.ALLOWED
     assert cmd[cmd.index("--disallowed-tools") + 1] == caf.TOOLS_DENY_SHELL_FS
     assert captured["timeout"] == 99

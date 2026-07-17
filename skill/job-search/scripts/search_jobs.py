@@ -42,10 +42,14 @@ sys.path.insert(0, str(HERE))
 from dedupe import Job, JobStore, dedupe_cross_source      # noqa: E402
 from db import DB, profile_hash as _profile_hash           # noqa: E402
 from defaults import DEFAULTS                              # noqa: E402
-from telegram_client import TelegramClient, send_per_job_digest  # noqa: E402
+from telegram_client import (  # noqa: E402
+    TelegramClient,
+    TelegramBlocked,
+    send_per_job_digest,
+)
 from sources import (                                      # noqa: E402
     hackernews, remote_boards, linkedin, curated_boards, web_search,
-    reliefweb, euraxess, math_ku_phd, ub_doctoral,
+    reliefweb, euraxess, un_careers, math_ku_phd, ub_doctoral,
     # Wave 2 sources (added 2026-05-01). 10 live + 3 blocked-stubs.
     # Toggle each independently in defaults.py.
     eures, infojobs, tecnoempleo, ai_jobs_net, jobs_ac_uk,
@@ -60,6 +64,7 @@ from ops.alerts import deliver_alert                       # noqa: E402
 from ops.summary import deliver_daily_summary              # noqa: E402
 import forensic                                             # noqa: E402
 from log_ttl import cleanup_logs                            # noqa: E402
+from log_setup import configure_logging                     # noqa: E402
 # `linkedin` and `web_search` are imported but NOT in the global SOURCES
 # dispatch below — they only run per-user inside the recipient loop, using
 # each profile's stored seeds. See run() below.
@@ -72,9 +77,11 @@ from user_profile import (                                 # noqa: E402
     profile_from_json,
     is_empty_profile,
     effective_filters,
+    profile_as_resume,
     project_to_prefs,
 )
 import user_files                                          # noqa: E402
+import feedback_digest                                      # noqa: E402
 import pig_stickers as _pigs                               # noqa: E402
 
 try:
@@ -91,6 +98,7 @@ SOURCES = {
     "curated_boards":  curated_boards,
     "reliefweb":       reliefweb,
     "euraxess":        euraxess,
+    "un_careers":      un_careers,
     "math_ku_phd":     math_ku_phd,
     "ub_doctoral":     ub_doctoral,
     # Wave 2 sources. Each adapter ships default-OFF in defaults.py — the
@@ -197,6 +205,8 @@ def _decide_buffer_flush(
     enrichments_by_job_id: dict[str, dict],
     profile_hash: str,
     filters: dict,
+    *,
+    manual_run: bool = False,
 ) -> tuple[list[Job], bool, int, float]:
     """Quality-buffer enqueue + flush decision (algorithm v2.6, P1).
 
@@ -211,7 +221,10 @@ def _decide_buffer_flush(
        oldest_age >= ``max_queue_latency_hours`` (the latency cap).
        The night-mute window (``night_mute_*`` knobs, P7) overrides
        this back to hold during the operator's quiet hours — applies
-       to BOTH the threshold-flush AND the age-flush.
+       to BOTH the threshold-flush AND the age-flush. ``manual_run=True``
+       (a user-initiated /jobs or "Check Now") bypasses night-mute: a
+       human asking for jobs right now gets them now, even at 3am. Only
+       scheduled (continuous-searcher) runs respect the quiet window.
     5. Whether or not a flush fires, scan the current queue for rows
        that the rehydration step would silently drop — already-handled
        jobs (in `applications`), already-sent jobs (in `sent_messages`,
@@ -267,9 +280,21 @@ def _decide_buffer_flush(
             end_h = int(filters.get("night_mute_end_hour", 9))
         except (TypeError, ValueError):
             start_h, end_h = 23, 9
-        if start_h != end_h and _is_in_night_mute_window(
+        in_mute = start_h != end_h and _is_in_night_mute_window(
             tz_name=tz_name, start_hour=start_h, end_hour=end_h,
-        ):
+        )
+        if in_mute and manual_run:
+            # User asked for jobs right now (/jobs or "Check Now") — honour
+            # the request even mid-quiet-hours. Night-mute only suppresses
+            # *scheduled* deliveries the user didn't ask for.
+            log.info(
+                "User %s: night-mute window active (%02d:00-%02d:00 %s) but "
+                "this is a manual check — bypassing mute, flushing now "
+                "(depth=%d, oldest_age=%.1fh)",
+                chat_id, start_h, end_h, tz_name,
+                depth, (oldest_age or 0) / 3600.0,
+            )
+        elif in_mute:
             log.info(
                 "User %s: quality-buffer flush would fire (depth=%d, "
                 "oldest_age=%.1fh) but night-mute window active "
@@ -494,14 +519,14 @@ _CURSOR_AWARE_SOURCES = frozenset({"justjoinit", "nofluffjobs", "builtin"})
 # `search_fetches`, but through per-user dispatch (their `fetch_per_user`
 # entry points), so they don't appear in the cursor-aware set above.
 #
-# Tier 4 adds the Claude-CLI delegation adapter(s) that never paginate
-# (`devex` and the curated_boards module). The curated module
+# Tier 4 adds the three Claude-CLI delegation adapters that never paginate
+# (`devex`, `un_careers`, and the curated_boards module). The curated module
 # records under PER-SUB-BOARD keys (`remocate` / `wantapply` /
 # `remoterocketship`) — not under `curated_boards` — because the dispatcher
 # gates each sub-board's cooldown independently (see `_curated_subboards_to_run`
 # / `fetch_all`). So the instrumented set lists the three sub-board keys, not
-# the module name. `devex` is a single-key module and uses its own name as
-# the source key.
+# the module name. `devex` / `un_careers` are single-key modules and use
+# their own name as the source key.
 #
 # This list must stay COMPLETE: the P6-T1 migration
 # (`reset_uninstrumented_source_cooldowns`) uses it to tell which cooldown
@@ -510,8 +535,8 @@ _CURSOR_AWARE_SOURCES = frozenset({"justjoinit", "nofluffjobs", "builtin"})
 # missing here would be wrongly reset to 'normal' on every run.
 _P2_INSTRUMENTED_SOURCES = frozenset({
     "linkedin", "justjoinit", "nofluffjobs", "builtin", "web_search",
-    # Tier 4 — Claude-CLI delegation adapter (no native pagination).
-    "devex",
+    # Tier 4 — Claude-CLI delegation adapters (no native pagination).
+    "devex", "un_careers",
     # curated_boards sub-boards — each records + cools down on its own key.
     "remocate", "wantapply", "remoterocketship",
 })
@@ -527,7 +552,7 @@ _CURATED_SUBBOARDS = ("remocate", "wantapply", "remoterocketship")
 # that `_CURSOR_AWARE_SOURCES` adapters do. These are the Claude-CLI
 # delegation sources: they record one fixed-cell `search_fetches` row per
 # fetch so the cooldown FSM gets a novelty signal, without any page cursor.
-_DB_ONLY_SOURCES = frozenset({"devex", "curated_boards"})
+_DB_ONLY_SOURCES = frozenset({"devex", "un_careers", "curated_boards"})
 
 
 # Adaptive source cooldown (algorithm v2.8 / P4 pipeline overhaul).
@@ -816,7 +841,7 @@ def _fetch_one_source(
 
     `db` is forwarded to cursor-aware adapters (`_CURSOR_AWARE_SOURCES`)
     so they can advance their `search_fetches` cursor, and to the Tier-4
-    `_DB_ONLY_SOURCES` (devex / curated_boards) so they can
+    `_DB_ONLY_SOURCES` (devex / un_careers / curated_boards) so they can
     record fetch novelty (no page cursor). All other adapters keep their
     legacy `fetch(filters)` signature untouched.
     """
@@ -911,9 +936,9 @@ def fetch_all(
     Algorithm v2.2: switched from a serial for-loop to a thread pool
     (configurable via `defaults.ai_source_workers`, default 6). Source
     adapters are network-IO bound (HTTP/RSS/JSON gets, occasional
-    Claude CLI subprocess for curated_boards/devex/
+    Claude CLI subprocess for curated_boards/devex/un_careers/
     ub_doctoral) so threading scales them well — wall time drops from
-    ~11-23 min serial to ~2-4 min for 22 adapters.
+    ~11-23 min serial to ~2-4 min for 23 adapters.
 
     Thread-safety notes:
       * `forensic.log_step` is explicitly thread-safe (per-line append).
@@ -1064,7 +1089,188 @@ def fetch_all(
     return all_jobs, errors
 
 
+# Valid fetch backends for `run(fetch_backend=...)`. "apify" = the published
+# Apify actors via `apify_fetch.fetch_all_apify` — the DEFAULT and standard
+# path. "local" = the in-process `sources/*.py` adapters via `fetch_all` —
+# DEPRECATED (2026-06-28); kept only as a rollback path, not deleted. The two
+# are interchangeable on yield + downstream contract (see
+# claude-docs/wiki/apify-fetch-experiment.md).
+_VALID_FETCH_BACKENDS = frozenset({"local", "apify"})
+
+
+def _resolve_default_fetch_backend() -> str:
+    """Default source-fetch backend, env-overridable for self-hosters.
+
+    Env ``FETCH_BACKEND`` wins (case-insensitive). This is the self-host knob:
+      * ``apify`` — fetch sources via the project's published Apify actors
+        (your ``APIFY_TOKEN``, our ``APIFY_ACTOR_OWNER`` account). You pay
+        Apify for the runs; running our actors is what supports the project.
+        This is the default.
+      * ``local`` — scrape every source in-process via ``sources/*.py`` (free,
+        no Apify token, but you maintain 25 brittle scrapers yourself).
+    An unset/invalid value falls back to ``apify``.
+    """
+    raw = (os.environ.get("FETCH_BACKEND") or "").strip().lower()
+    if raw in _VALID_FETCH_BACKENDS:
+        return raw
+    return "apify"
+
+
+_DEFAULT_FETCH_BACKEND = _resolve_default_fetch_backend()
+
+
+def _fetch_global(
+    filters: dict,
+    *,
+    backend: str = "local",
+    store: MonitorStore | None = None,
+    pipeline_run_id: int | None = None,
+    db=None,
+    cycle_index: int = 0,
+    user_queries: dict | None = None,
+) -> tuple[list[Job], list[str]]:
+    """Dispatch the GLOBAL source fetch to the selected backend.
+
+    Returns the same ``(jobs, errors)`` shape as ``fetch_all`` regardless of
+    backend, so the rest of ``run`` is backend-agnostic.
+
+    ``apify``: calls the published actors. The Apify fetch ignores the P2
+    page-cursor use of ``db`` and the cooldown FSM (``store``/``cycle_index``)
+    — actors paginate from newest each run — so those are accepted-and-dropped
+    for signature parity. ``db`` IS used for one thing: the client-side result
+    cache (see ``apify_fetch.fetch_all_apify``'s ``result_cache_s``) so a
+    dispatch fetched recently by another caller can be replayed instead of
+    re-hitting the actor. Per-source actor meta is logged. ``user_queries`` (a
+    ``{source: [query,...]}`` map from ``apify_fetch.profile_source_queries``)
+    is forwarded to the query-array actors; the LOCAL backend ignores it
+    (local adapters stay broad by design). Falls back to NOTHING on
+    a bad backend string (raises) — an unknown backend is an operator error,
+    not something to silently treat as local.
+    """
+    if backend == "apify":
+        import apify_fetch
+        jobs, errors, meta = apify_fetch.fetch_all_apify(
+            filters,
+            cache_ttl=int(filters.get("apify_cache_ttl_s", 0)),
+            run_timeout=int(filters.get("apify_run_timeout_s", 600)),
+            workers=int(filters.get("apify_workers", 6)),
+            owner=str(filters.get("apify_actor_owner", "nomad-agent")),
+            queries=user_queries,
+            db=db,
+            result_cache_s=int(filters.get("apify_result_cache_s", 0)),
+        )
+        log.info(
+            "fetch backend=apify: %d jobs, %d errors; per-source=%s",
+            len(jobs), len(errors),
+            {m["source"]: m["count"] for m in meta},
+        )
+        if store is not None and pipeline_run_id is not None:
+            for m in meta:
+                source_key = str(m.get("source") or "?")
+                count = int(m.get("count") or 0)
+                seconds = float(m.get("seconds") or 0.0)
+                error = m.get("error")
+                skipped = m.get("skipped")
+                finished_at = time.time()
+                started_at = max(0.0, finished_at - seconds)
+                try:
+                    store.record_source_run(
+                        pipeline_run_id,
+                        source_key,
+                        "failed" if error else "ok",
+                        count,
+                        int(seconds * 1000) if seconds else 0,
+                        error_class="ApifyError" if error else None,
+                        error_head=(str(error or skipped)[:200] if (error or skipped) else None),
+                        started_at=started_at,
+                        finished_at=finished_at,
+                    )
+                except Exception:
+                    log.exception(
+                        "apify source telemetry failed for run_id=%s source=%s",
+                        pipeline_run_id,
+                        source_key,
+                    )
+        return jobs, errors
+    if backend != "local":
+        raise ValueError(f"unknown fetch_backend {backend!r}")
+    return fetch_all(
+        filters, store=store, pipeline_run_id=pipeline_run_id, db=db,
+        cycle_index=cycle_index,
+    )
+
+
 # ---------- main ----------
+
+def _emit_subscription_alert(store, tg, provider: str, category: str, detail: str) -> None:
+    """Send a deduped operator Telegram alert for a subscription problem.
+
+    Reuses the ``error_events`` (fingerprint, hour_bucket) UNIQUE gate so that
+    repeated per-user runs in the same hour raise AT MOST one alert per
+    provider+category — the continuous searcher calls ``run(only_chat=…)`` many
+    times an hour and we do not want to page the operator on every cycle.
+    Never raises: an alert path must not break the run it guards.
+    """
+    try:
+        from telemetry.fingerprint import hour_bucket
+        from instrumentation.contexts import AlertEnvelope
+
+        now = time.time()
+        fp = f"subscription-{category}:{provider}"
+        msg = f"{provider} subscription problem ({category}): {detail}".strip()
+        event_id = store.try_record_error(
+            fingerprint=fp,
+            hour_bucket=hour_bucket(now),
+            where=f"prewarm.{provider}",
+            error_class="SubscriptionAuthError",
+            message_head=msg,
+            stack_tail="",
+            chat_id=None,
+        )
+        if event_id is None:
+            return  # already alerted this hour — suppress the dupe
+        env = AlertEnvelope(
+            where=f"prewarm.{provider}",
+            error_class="SubscriptionAuthError",
+            message_head=msg,
+            stack_tail="",
+            chat_id=None,
+            occurred_at=now,
+            fingerprint=fp,
+            event_id=event_id,
+        )
+        deliver_alert(tg, store, env)
+        log.error("prewarm: ALERTED operator — %s", msg)
+    except Exception:
+        log.exception("prewarm: failed to emit subscription alert (%s/%s)",
+                      provider, category)
+
+
+def _maybe_prewarm_subscriptions(store, tg, filters: dict) -> None:
+    """Serially refresh the Claude OAuth token + verify Mistral auth BEFORE the
+    per-user enrich fan-out, and alert the operator on any subscription-level
+    failure (broken/expired creds, exhausted quota).
+
+    The Claude call is load-bearing beyond alerting: it performs the single
+    serial OAuth-token refresh that stops the concurrent enrich workers from
+    racing a rotating refresh token — see ``claude_cli.prewarm_token`` for the
+    full failure story. Never raises.
+    """
+    try:
+        if not bool(filters.get("ai_enrich", True)):
+            return  # no claude calls this run — nothing to warm
+        import claude_cli
+
+        c_cat, c_detail = claude_cli.prewarm_token()
+        if c_cat in ("auth", "quota", "cli_absent"):
+            _emit_subscription_alert(store, tg, "claude", c_cat, c_detail)
+        elif c_cat == "ok":
+            log.info("prewarm: claude OAuth token warm")
+        else:
+            log.warning("prewarm: claude transient (%s) — %s", c_cat, c_detail)
+    except Exception:
+        log.exception("prewarm: swallowed unexpected error")
+
 
 def run(
     dry_run: bool = False,
@@ -1072,11 +1278,15 @@ def run(
     no_send: bool = False,
     *,
     cycle_index: int = 0,
+    fetch_backend: str = _DEFAULT_FETCH_BACKEND,
+    manual_run: bool = False,
 ) -> int:
-    logging.basicConfig(
-        level=os.environ.get("LOG_LEVEL", "INFO"),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    if fetch_backend not in _VALID_FETCH_BACKENDS:
+        raise ValueError(
+            f"fetch_backend must be one of {sorted(_VALID_FETCH_BACKENDS)}, "
+            f"got {fetch_backend!r}",
+        )
+    configure_logging("job-search")
     load_env()
 
     root = project_root()
@@ -1143,20 +1353,53 @@ def run(
     # error_capture + pipeline_run below).
     store = MonitorStore(db)
 
+    preselected_users = None
+    if not dry_run:
+        if only_chat is not None:
+            candidate_users = [u for u in [db.get_user(only_chat)] if u is not None]
+        else:
+            candidate_users = db.users_for_search()
+        preselected_users = candidate_users
+
+    # Per-user board queries for the Apify query-array actors. Resolvable
+    # only on a per-user run — the continuous searcher always calls
+    # run(only_chat=chat_id), so in production EVERY cycle is per-user.
+    # Multi-user manual runs stay broad (one shared fetch can't take one
+    # user's queries). Failure here degrades to broad, never blocks.
+    user_queries: dict | None = None
+    if (
+        only_chat is not None
+        and fetch_backend == "apify"
+        and bool(filters.get("apify_user_queries", True))
+    ):
+        try:
+            import apify_fetch as _af_queries
+            _q_profile = profile_from_json(db.get_user_profile(only_chat))
+            user_queries = _af_queries.profile_source_queries(_q_profile) or None
+            if user_queries:
+                log.info("User %s: apify per-source queries: %s",
+                         only_chat, user_queries)
+        except Exception:
+            log.exception("apify user-query resolution failed; fetching broad")
+
     # ----- Dry-run preview (no telemetry, no Telegram) --------------------
     if dry_run:
         # cycle_index isn't passed in dry-run: the cooldown gate is
         # bypassed (db=None would skip it anyway, and passing db=db is
         # safe because dry-run doesn't have a running searcher counter).
-        jobs_raw, errors = fetch_all(filters, db=db, cycle_index=cycle_index)
-        log.info("Raw fetched across static sources: %d postings", len(jobs_raw))
+        jobs_raw, errors = _fetch_global(
+            filters, backend=fetch_backend, db=db, cycle_index=cycle_index,
+            user_queries=user_queries,
+        )
+        log.info("Raw fetched across static sources: %d postings (backend=%s)",
+                 len(jobs_raw), fetch_backend)
         new_in_db = job_store.save_all(jobs_raw)
         log.info("DB: %d newly-inserted jobs, %d already known",
                  new_in_db, len(jobs_raw) - new_in_db)
         if only_chat is not None:
             users = [u for u in [db.get_user(only_chat)] if u is not None]
         else:
-            users = db.users_with_resume()
+            users = db.users_for_search()
         dry_jobs = post_filter(jobs_raw, filters)
         print(f"\n=== DRY RUN — {len(dry_jobs)} postings (default filter) ===\n")
         for j in dry_jobs:
@@ -1174,6 +1417,12 @@ def run(
         return 1
 
     tg = TelegramClient(token=token)
+
+    # Serial subscription pre-warm: refresh the Claude OAuth token ONCE (before
+    # enrich_jobs_ai fans out `workers` concurrent `claude -p` calls that would
+    # otherwise race a rotating refresh token) and health-check Mistral. Pages
+    # the operator on a subscription failure. Best-effort; never raises.
+    _maybe_prewarm_subscriptions(store, tg, filters)
 
     # ------------------------------------------------------------------
     # Live run wrapped in monitoring contexts:
@@ -1193,19 +1442,23 @@ def run(
         with pipeline_run(store, "daily_digest") as pctx:
             run_id_for_summary = pctx.run_id
 
-            jobs_raw, errors = fetch_all(
-                filters, store=store, pipeline_run_id=pctx.run_id, db=db,
-                cycle_index=cycle_index,
+            jobs_raw, errors = _fetch_global(
+                filters, backend=fetch_backend,
+                store=store, pipeline_run_id=pctx.run_id, db=db,
+                cycle_index=cycle_index, user_queries=user_queries,
             )
-            log.info("Raw fetched across static sources: %d postings", len(jobs_raw))
+            log.info("Raw fetched across static sources: %d postings (backend=%s)",
+                     len(jobs_raw), fetch_backend)
             new_in_db = job_store.save_all(jobs_raw)
             log.info("DB: %d newly-inserted jobs, %d already known",
                      new_in_db, len(jobs_raw) - new_in_db)
 
-            if only_chat is not None:
+            if preselected_users is not None:
+                users = preselected_users
+            elif only_chat is not None:
                 users = [u for u in [db.get_user(only_chat)] if u is not None]
             else:
-                users = db.users_with_resume()
+                users = db.users_for_search()
             if not users:
                 log.warning("No registered users with a resume. Ask them to /start the bot and upload a CV.")
 
@@ -1257,7 +1510,14 @@ def run(
                 # (recorded below, read by GET /api/feed) plus an optional
                 # rate-limited email ping. Everything send-shaped downstream
                 # keys off this flag, exactly like an operator --no-send.
-                user_no_send = no_send or chat_id < 0
+                # A linked Telegram user who chose email-only delivery
+                # (notify_channel='email') rides the same path: feed rows +
+                # email ping, no Telegram cards.
+                try:
+                    user_channel = db.get_notify_channel(chat_id)
+                except Exception:
+                    user_channel = "telegram" if chat_id > 0 else "email"
+                user_no_send = no_send or chat_id < 0 or user_channel == "email"
 
                 # Algorithm v2: profile JSON is now a thin envelope
                 # (search_seeds + bookkeeping). Scoring inputs come from the
@@ -1267,6 +1527,29 @@ def run(
                 profile = profile_from_json(db.get_user_profile(chat_id))
                 resume_text = user_files.read_resume(chat_id)
                 prefs_text = user_files.read_prefs(chat_id)
+                # CV-less users (finished onboarding via "Skip for now") have
+                # no resume.txt. Score them against their profile instead of
+                # dropping them: enrich_jobs_ai is the single matching gate,
+                # so an empty RESUME block means zero jobs forever. Set HERE,
+                # at the single read point, so every downstream consumer —
+                # enrich_jobs_ai, reanalyze_scoring_ai, _profile_hash — sees
+                # the same text (a profile rebuild then correctly invalidates
+                # the job_scores cache, exactly like a resume edit).
+                resume_is_profile = False
+                if not resume_text.strip():
+                    resume_text = profile_as_resume(profile)
+                    resume_is_profile = bool(resume_text)
+                # Feedback-digest loop: append the LLM-distilled 👍/👎
+                # preference/veto notes (if any) to prefs_text HERE, at the
+                # single read point, so every downstream consumer in this
+                # user's block — enrich_jobs_ai, reanalyze_scoring_ai, and
+                # _profile_hash below — sees the identical augmented text.
+                # Augmenting profile_hash's input is intentional: a fresh
+                # digest is a real scoring input, so it correctly
+                # invalidates the per-user job_scores cache just like a
+                # resume/prefs edit would. Never raises; falls back to the
+                # unaugmented prefs_text on any DB hiccup.
+                prefs_text = feedback_digest.augment_prefs_text(db, chat_id, prefs_text)
                 free_text = prefs_text  # legacy alias for downstream callers
 
                 # M2 per-query telemetry: side-channel map { job_id ->
@@ -1279,8 +1562,10 @@ def run(
 
                 effective = effective_filters(filters, profile)
                 log.info(
-                    "User %s: resume_chars=%d prefs_chars=%d seeds=%s",
-                    chat_id, len(resume_text), len(prefs_text),
+                    "User %s: resume_chars=%d%s prefs_chars=%d seeds=%s",
+                    chat_id, len(resume_text),
+                    " (from profile — no CV)" if resume_is_profile else "",
+                    len(prefs_text),
                     bool((profile or {}).get("search_seeds")),
                 )
 
@@ -1323,15 +1608,35 @@ def run(
                             run_id=pctx.run_id,
                         ) as fctx:
                             with source_run(store, pctx.run_id, "linkedin", user_chat_id=chat_id) as li_sctx:
-                                extra_li = linkedin.fetch_for_user(
-                                    effective,
-                                    li_seeds,
-                                    db=db,
-                                    min_revisit_age_s=int(
-                                        effective.get("source_min_revisit_age_s") or 21600
-                                    ),
-                                    attribution=query_attribution,
-                                ) or []
+                                if fetch_backend == "apify":
+                                    # Per-user LinkedIn via the published
+                                    # linkedin-scraper actor (no DB cursor —
+                                    # the actor paginates from newest itself).
+                                    import apify_fetch as _apify_li
+                                    extra_li, _li_errs = _apify_li.fetch_linkedin_apify(
+                                        li_seeds,
+                                        effective,
+                                        cache_ttl=int(effective.get("apify_cache_ttl_s", 0)),
+                                        run_timeout=int(effective.get("apify_run_timeout_s", 600)),
+                                        workers=int(effective.get("apify_workers", 4)),
+                                        owner=str(effective.get("apify_actor_owner", "nomad-agent")),
+                                        attribution=query_attribution,
+                                        db=db,
+                                        result_cache_s=int(effective.get("apify_result_cache_s", 0)),
+                                    )
+                                    extra_li = extra_li or []
+                                    for _e in _li_errs:
+                                        log.warning("User %s: linkedin-apify: %s", chat_id, _e)
+                                else:
+                                    extra_li = linkedin.fetch_for_user(
+                                        effective,
+                                        li_seeds,
+                                        db=db,
+                                        min_revisit_age_s=int(
+                                            effective.get("source_min_revisit_age_s") or 21600
+                                        ),
+                                        attribution=query_attribution,
+                                    ) or []
                                 li_sctx.set_count(len(extra_li))
                             fctx.set_output({
                                 "raw_count": len(extra_li),
@@ -1371,21 +1676,58 @@ def run(
                             run_id=pctx.run_id,
                         ) as fctx:
                             with source_run(store, pctx.run_id, "web_search", user_chat_id=chat_id) as ws_sctx:
-                                extra = web_search.fetch(
-                                    effective,
-                                    user_free_text=free_text or None,
-                                    profile_seeds=web_seeds,
-                                    db=db,
-                                    min_revisit_age_s=int(
-                                        effective.get("source_min_revisit_age_s") or 21600
-                                    ),
-                                    # Per-user cursor scope: each user has
-                                    # their own page counter for web_search
-                                    # so the exploration rounds don't bleed
-                                    # across users.
-                                    cursor_key=str(chat_id),
-                                    attribution=query_attribution,
-                                ) or []
+                                def _local_web_search():
+                                    # Local CLI web_search: drives a `claude -p`
+                                    # sub-agent with WebSearch. Uses the logged-in
+                                    # subscription, not a BYOK API key. Per-user
+                                    # cursor scope so exploration rounds don't
+                                    # bleed across users.
+                                    return web_search.fetch(
+                                        effective,
+                                        user_free_text=free_text or None,
+                                        profile_seeds=web_seeds,
+                                        ideal_fit=(profile or {}).get("ideal_fit_paragraph") or None,
+                                        db=db,
+                                        min_revisit_age_s=int(
+                                            effective.get("source_min_revisit_age_s") or 21600
+                                        ),
+                                        cursor_key=str(chat_id),
+                                        attribution=query_attribution,
+                                    ) or []
+
+                                if fetch_backend == "apify":
+                                    # Per-user web_search via the published
+                                    # web-search-scraper actor (BYOK — needs
+                                    # ANTHROPIC_API_KEY; skipped with a logged
+                                    # error otherwise). Stateless like the
+                                    # linkedin actor: no per-user cursor.
+                                    import apify_fetch as _apify_ws
+                                    extra, _ws_errs = _apify_ws.fetch_web_search_apify(
+                                        web_seeds,
+                                        effective,
+                                        free_text=free_text or None,
+                                        cache_ttl=int(effective.get("apify_cache_ttl_s", 0)),
+                                        owner=str(effective.get("apify_actor_owner", "nomad-agent")),
+                                        attribution=query_attribution,
+                                        db=db,
+                                        result_cache_s=int(effective.get("apify_result_cache_s", 0)),
+                                    )
+                                    extra = extra or []
+                                    for _e in _ws_errs:
+                                        log.warning("User %s: web_search-apify: %s", chat_id, _e)
+                                    # The apify actor needs a BYOK Anthropic/Mistral
+                                    # key. When it's absent the actor is skipped and
+                                    # yields nothing — fall back to the local CLI
+                                    # path (subscription-backed) so web_search still
+                                    # produces postings instead of silently 0.
+                                    if not extra and any("skipped (BYOK" in _e for _e in _ws_errs):
+                                        log.info(
+                                            "User %s: web_search-apify skipped (no BYOK key) — falling back to local CLI",
+                                            chat_id,
+                                        )
+                                        extra = _local_web_search()
+                                else:
+                                    extra = _local_web_search()
                                 ws_sctx.set_count(len(extra))
                             fctx.set_output({
                                 "raw_count": len(extra),
@@ -1626,6 +1968,7 @@ def run(
                         _decide_buffer_flush(
                             db, chat_id, alive_floor, enrichments_by_job_id,
                             user_profile_hash, filters,
+                            manual_run=manual_run,
                         )
                     )
                     if not flush_now:
@@ -1918,11 +2261,44 @@ def run(
                             except Exception:
                                 log.debug("clear_queue failed; continuing",
                                           exc_info=True)
+                    except TelegramBlocked as e:
+                        # User blocked the bot / chat is gone. Tombstone them
+                        # so the continuous searcher stops running (and stops
+                        # spending) for someone who can't receive messages —
+                        # WITHOUT deleting any of their data. An inbound
+                        # message later clears the flag and resumes searches.
+                        log.warning(
+                            "User %s unreachable (blocked/gone) — pausing their "
+                            "continuous searcher, data retained: %s", chat_id, e,
+                        )
+                        try:
+                            db.mark_blocked(chat_id)
+                        except Exception:
+                            log.exception("mark_blocked failed for %s", chat_id)
+                        pctx.incr_errors(1)
+                        send_failed_chat = chat_id
+                        break
                     except Exception as e:
                         log.exception("Failed to send digest to %s: %s", chat_id, e)
                         pctx.incr_errors(1)
                         send_failed_chat = chat_id
                         break
+                    # notify_channel='both': the Telegram cards above are
+                    # the primary surface; also fire the rate-limited email
+                    # ping. The emailer itself gates on notify_email (kept
+                    # in sync by set_notify_channel), a verified address,
+                    # and the ~daily interval — so this is a no-op for
+                    # telegram-only users and never double-mails.
+                    if user_channel == "both":
+                        try:
+                            from emailer import maybe_send_web_digest_email
+                            maybe_send_web_digest_email(
+                                db, chat_id, user_jobs, enrichments_by_job_id,
+                            )
+                        except Exception:
+                            log.exception(
+                                "both-channel email hook failed for %s", chat_id,
+                            )
 
                 # --- v2.5 audit stage --------------------------------
                 # AFTER the cards have shipped, re-grade the score-≥1
@@ -2124,5 +2500,16 @@ if __name__ == "__main__":
             "what would be sent and to inspect AI spend before delivering."
         ),
     )
+    ap.add_argument(
+        "--fetch-backend",
+        choices=sorted(_VALID_FETCH_BACKENDS),
+        default=_DEFAULT_FETCH_BACKEND,
+        help="Global source fetch backend: 'apify' (published Apify actors, "
+             "DEFAULT) or 'local' (in-process scrapers, DEPRECATED — rollback "
+             "only).",
+    )
     args = ap.parse_args()
-    sys.exit(run(dry_run=args.dry_run, only_chat=args.chat_id, no_send=args.no_send))
+    sys.exit(run(
+        dry_run=args.dry_run, only_chat=args.chat_id, no_send=args.no_send,
+        fetch_backend=args.fetch_backend,
+    ))

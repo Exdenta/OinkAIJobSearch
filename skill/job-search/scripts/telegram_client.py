@@ -24,6 +24,56 @@ log = logging.getLogger(__name__)
 API_BASE = "https://api.telegram.org/bot{token}/{method}"
 
 
+class TelegramBlocked(RuntimeError):
+    """Raised by `TelegramClient._call` when Telegram reports the target chat
+    is permanently unreachable — the user blocked the bot, deleted their
+    account, or the chat no longer exists.
+
+    Kept distinct from generic send failures (network blips, rate limits, bad
+    payloads) so the pipeline can react by putting the user's continuous
+    searcher to sleep — which stops all downstream fetch/LLM spend for someone
+    who can never receive a message — WITHOUT deleting any of their stored
+    data. A later inbound update from the same chat (only possible after they
+    unblock / return) clears the flag and auto-resumes their searches.
+
+    Telegram signals this as HTTP 403 with descriptions like
+    "Forbidden: bot was blocked by the user" or "Forbidden: user is
+    deactivated", and (400) "Bad Request: chat not found" for a chat_id that
+    no longer exists. All mean "stop sending here".
+    """
+
+    def __init__(self, chat_id: Any, description: str) -> None:
+        self.chat_id = chat_id
+        self.description = description
+        super().__init__(f"Telegram chat {chat_id} unreachable: {description}")
+
+
+# Telegram error descriptions (substring, case-insensitive) that mean "this
+# chat can never receive messages again" — as opposed to a transient failure
+# worth retrying. Telegram's error strings are not a stable API, so we match
+# loosely enough that minor wording changes still classify correctly.
+_UNREACHABLE_CHAT_MARKERS: tuple[str, ...] = (
+    "bot was blocked",       # user blocked the bot (403)
+    "user is deactivated",   # account deleted (403)
+    "chat not found",        # chat gone / never existed (400)
+    "bot was kicked",        # removed from a group (403)
+    "peer_id_invalid",       # chat_id no longer resolvable (400)
+)
+
+
+def _is_unreachable_chat(error_code: Any, description: str) -> bool:
+    """True when a Telegram `ok:false` reply means the chat is permanently
+    unreachable (blocked / deactivated / gone), vs a transient error."""
+    try:
+        code = int(error_code or 0)
+    except (TypeError, ValueError):
+        code = 0
+    if code not in (400, 403):
+        return False
+    low = (description or "").lower()
+    return any(marker in low for marker in _UNREACHABLE_CHAT_MARKERS)
+
+
 # ---------- Token-bucket rate limiter ----------
 #
 # Telegram's documented limits (https://core.telegram.org/bots/faq#broadcasting-to-users):
@@ -163,6 +213,20 @@ _RATE_LIMITER = _TelegramRateLimiter(
     burst_per_chat=TG_BURST_PER_CHAT,
 )
 
+# Telegram's ~1 msg/sec-per-chat limit is about *sending into* a chat. These
+# four are interactive replies to a tap, not new messages — and they're the
+# only calls a button press makes. Charging them a per-chat token meant every
+# tap could sleep ~1s (bot.py's update loop is single-threaded, so that sleep
+# stalls every other user's taps too) and queued taps could age past the ~15s
+# answerCallbackQuery window ("query is too old" in prod). They stay on the
+# 30 rps global bucket, which is the limit that actually applies to them.
+_CHAT_THROTTLE_EXEMPT = frozenset({
+    "answerCallbackQuery",
+    "editMessageText",
+    "editMessageReplyMarkup",
+    "deleteMessage",
+})
+
 
 def _extract_chat_id(payload: dict | None) -> Any | None:
     """Best-effort chat_id extraction from a Bot API payload.
@@ -208,6 +272,20 @@ _URL_VALIDATION_429_MAX_RETRIES: int = 2  # 3 attempts total
 # digest to send — never block longer than this even if the header says so.
 _URL_VALIDATION_429_RETRY_AFTER_CAP_S: float = 10.0
 
+# Per-host politeness throttle. Some hosts (notably news.ycombinator.com)
+# rate-limit our validation probes when several fire in quick succession — a
+# whole digest's worth of HN "who is hiring" item URLs hits the same host
+# back-to-back and trips 429, silently dropping live postings. Enforce a
+# minimum gap between requests to the SAME host so we stop generating the
+# 429s at the source (belt; the 429→alive treatment in `_url_is_alive` is
+# the suspenders for when it still trips). Hosts absent from the map are
+# never delayed. Keyed by registrable host; subdomains match too.
+_HOST_MIN_INTERVAL_S: dict[str, float] = {
+    "news.ycombinator.com": _env_float("HN_VALIDATION_MIN_INTERVAL_S", 1.5),
+}
+_HOST_THROTTLE_LOCK = threading.Lock()
+_HOST_LAST_REQUEST_AT: dict[str, float] = {}
+
 # Realistic browser UA — some ATS/CDN endpoints (Cloudflare in particular)
 # 403 a generic bot UA on HEAD even when the page is fully public. We pose
 # as Firefox so the liveness check matches what the user's tap would see.
@@ -224,6 +302,38 @@ _ALIVE_STATUSES = frozenset({200, 301, 302, 303, 307, 308})
 _HEAD_BLOCKED_STATUSES = frozenset({405, 501})
 
 
+def _throttle_host(url: str) -> None:
+    """Block until the per-host minimum interval (``_HOST_MIN_INTERVAL_S``)
+    has elapsed since the last probe to this host. No-op for hosts not in the
+    map. The lock is only touched for throttled hosts, so untracked hosts pay
+    nothing; for a throttled host it serializes probes so concurrent callers
+    also space out. Best-effort — any failure just skips the delay.
+    """
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return
+    if not host:
+        return
+    min_interval = 0.0
+    for h, iv in _HOST_MIN_INTERVAL_S.items():
+        if host == h or host.endswith("." + h):
+            min_interval = iv
+            break
+    if min_interval <= 0:
+        return
+    with _HOST_THROTTLE_LOCK:
+        now = time.monotonic()
+        wait = min_interval - (now - _HOST_LAST_REQUEST_AT.get(host, 0.0))
+        if wait > 0:
+            try:
+                time.sleep(wait)
+            except Exception:
+                pass
+            now = time.monotonic()
+        _HOST_LAST_REQUEST_AT[host] = now
+
+
 def _validation_request(
     method: str, url: str, timeout_s: float, *, headers: dict | None = None,
     verify: bool = True,
@@ -235,6 +345,7 @@ def _validation_request(
     the URL or any redirect target resolves to a private/internal address;
     callers already treat that as a dead URL (drop).
     """
+    _throttle_host(url)
     return safe_request(
         method,
         url,
@@ -399,6 +510,13 @@ def _url_is_alive(url: str, timeout_s: float = URL_VALIDATION_TIMEOUT_S) -> tupl
                     return (True, "head_method_blocked")
                 if gcode in (404, 410, 451):
                     return (False, str(gcode))
+                # A 429 on the ranged GET means the host is UP and serving —
+                # it's rate-limiting our probe IP, not telling us the page is
+                # gone. Treat as alive (see the code==429 branch below for the
+                # full rationale). This is the branch that actually fired for
+                # the news.ycombinator.com drops (HEAD blocked → ranged GET 429).
+                if gcode == 429:
+                    return (True, "http_429_rate_limited")
                 if 400 <= gcode < 600:
                     return (False, f"http_{gcode}")
                 return (False, f"http_{gcode}")
@@ -409,12 +527,16 @@ def _url_is_alive(url: str, timeout_s: float = URL_VALIDATION_TIMEOUT_S) -> tupl
         # bucket them. Everything else 4xx/5xx falls into http_<code>.
         if code in (404, 410, 451):
             return (False, str(code))
-        # If we still see 429 here it means the retry loop exhausted its
-        # budget. Distinct reason so forensic dashboards can split
-        # "rate-limited and we gave up" from "rate-limited on first try"
-        # (the LinkedIn anti-bot path returned True earlier).
+        # A 429 that survived the retry loop means the host is UP and serving
+        # — it's rate-limiting our probe IP, not saying the page is gone
+        # (that's 404/410). The user's tap from a real browser/IP loads fine.
+        # This generalizes the LinkedIn anti-bot branch above to every host:
+        # never drop a live posting for a transient rate-limit. The per-host
+        # throttle in `_throttle_host` makes 429 rare in the first place; this
+        # is the safety net for when it still trips. Distinct reason so
+        # forensic dashboards can still count rate-limited-kept postings.
         if code == 429:
-            return (False, "http_429_after_retries")
+            return (True, "http_429_rate_limited")
         if 400 <= code < 600:
             return (False, f"http_{code}")
         # Unexpected status (e.g. 1xx / 0). Treat as not-alive.
@@ -444,6 +566,36 @@ JOB_AGE_MISSING_POLICY: str = (
 JOB_AGE_FILTER_OFF: bool = os.environ.get("JOB_AGE_FILTER_OFF", "").strip() not in (
     "", "0", "false", "False",
 )
+
+# Per-source override of the missing-date policy. Feed sources that are
+# inherently fresh (LinkedIn / apify board & ATS APIs) can safely `allow` a
+# job whose posted_at is absent/unparseable — their backlog is current.
+# Scrape-only sources whose date is often absent AND whose backlog contains
+# stale, never-closed postings (devex reads Google snippets; web_search hits
+# arbitrary career pages) must `reject` on a missing date — otherwise a
+# dateless 2020 posting sails straight past the age gate. This is a fact
+# about which sources expose a reliable date, not a heuristic about
+# individual postings (cf. the CLAUDE.md design-principle exceptions).
+# Because these sources now reject-on-missing, their extractors emit an
+# HONEST null when no real date is stated instead of fabricating one — see
+# sources/devex.py. Override the set via AGE_MISSING_REJECT_SOURCES=a,b,c.
+_AGE_MISSING_REJECT_SOURCES: frozenset[str] = frozenset(
+    {"devex", "web_search"}
+    | {
+        s.strip().lower()
+        for s in (os.environ.get("AGE_MISSING_REJECT_SOURCES", "") or "").split(",")
+        if s.strip()
+    }
+)
+
+
+def _age_missing_policy_for(source: str) -> str:
+    """Missing-date policy for a specific source: ``reject`` for the
+    scrape-only/dateless sources in ``_AGE_MISSING_REJECT_SOURCES``, else
+    the global ``JOB_AGE_MISSING_POLICY`` default (``allow``)."""
+    if (source or "").strip().lower() in _AGE_MISSING_REJECT_SOURCES:
+        return "reject"
+    return JOB_AGE_MISSING_POLICY
 
 
 def _parse_posted_at(s: str) -> datetime | None:
@@ -732,13 +884,18 @@ def _url_is_real_posting(url: str, job_source: str) -> tuple[bool, str]:
 #
 # Drop on "closed" AND on "unknown" (fail-safe — P6-T4 reversal of the
 # original "skip on unknown" policy after three soft-404s shipped to a
-# user with the verifier returning None). Pass only on "open". Set
-# WEB_SEARCH_VERIFY_OFF=1 to disable the gate entirely.
-
-WEB_SEARCH_VERIFY_OFF: bool = os.environ.get("WEB_SEARCH_VERIFY_OFF", "").strip() not in (
+# user with the verifier returning None). Pass only on "open".
+#
+# Temporarily disabled by default after InfoJobs/LinkedIn false negatives.
+# Set WEB_SEARCH_VERIFY_OFF=0 to re-enable the gate explicitly.
+WEB_SEARCH_VERIFY_OFF: bool = os.environ.get("WEB_SEARCH_VERIFY_OFF", "1").strip() not in (
     "", "0", "false", "False",
 )
-WEB_SEARCH_VERIFY_TIMEOUT_S: int = _env_int("WEB_SEARCH_VERIFY_TIMEOUT_S", 90)
+# Default bumped 90→150 (2026-07): the agentic Claude WebSearch/WebFetch loop
+# and the orchestrated fetch+search path both regularly need >90s on slow
+# ATS/anti-bot pages, and a TimeoutExpired collapses to a None verdict
+# (recorded `cli_missing`) that used to silently drop the posting.
+WEB_SEARCH_VERIFY_TIMEOUT_S: int = _env_int("WEB_SEARCH_VERIFY_TIMEOUT_S", 150)
 
 # Operator escape hatch for the structural soft-404 gate (Section B of
 # P6-T4). Default off (=gate enabled). Flip to any non-empty/non-zero
@@ -748,6 +905,102 @@ WEB_SEARCH_VERIFY_TIMEOUT_S: int = _env_int("WEB_SEARCH_VERIFY_TIMEOUT_S", 90)
 WEB_SEARCH_SOFT_404_GATE_OFF: bool = os.environ.get(
     "WEB_SEARCH_SOFT_404_GATE_OFF", "",
 ).strip() not in ("", "0", "false", "False")
+
+# ---------- Liveness backend toggle: "claude" (agentic, default) vs
+# "orchestrated" (plain-Python fetch via sources._detail_fetch + ONE
+# single-shot LLM classify call via the "liveness_verify" stage) ----------
+#
+# This is the highest-volume, highest-blast-radius verdict path (runs per
+# posting, per user, every digest cycle) — a wrong verdict silently drops
+# or falsely-passes a real posting for every user. Default stays "claude" (unchanged production
+# behavior) until deliberately flipped after a manual verdict-diff check.
+_VALID_LIVENESS_BACKENDS = frozenset({"claude", "orchestrated"})
+
+
+def _liveness_backend() -> str:
+    raw = (os.environ.get("LIVENESS_BACKEND", "") or "").strip().lower()
+    return raw if raw in _VALID_LIVENESS_BACKENDS else "claude"
+
+
+def _parse_liveness_claude_chat_ids_env() -> set[int]:
+    """Parse LIVENESS_CLAUDE_CHAT_IDS — comma-separated chat_ids forced back
+    onto the "claude" backend even after LIVENESS_BACKEND=orchestrated ships
+    fleet-wide. Mirrors bot.py's OINK_LOCAL_CHAT_IDS rollback-lever pattern.
+    The "all" sentinel is handled by `_liveness_claude_all_enabled` and
+    yields an empty set here. Unset/blank → empty set. Bad tokens dropped.
+    """
+    raw = (os.environ.get("LIVENESS_CLAUDE_CHAT_IDS", "") or "").strip()
+    if raw.lower() == "all":
+        return set()
+    out: set[int] = set()
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            cid = int(tok)
+        except ValueError:
+            continue
+        if cid != 0:
+            out.add(cid)
+    return out
+
+
+def _liveness_claude_all_enabled() -> bool:
+    """True when LIVENESS_CLAUDE_CHAT_IDS is the sentinel "all" — emergency
+    fleet-wide rollback to the "claude" backend without touching
+    LIVENESS_BACKEND itself."""
+    return (os.environ.get("LIVENESS_CLAUDE_CHAT_IDS", "") or "").strip().lower() == "all"
+
+
+def _liveness_forced_to_claude(chat_id: int | None) -> bool:
+    if _liveness_claude_all_enabled():
+        return True
+    if chat_id is None:
+        return False
+    return int(chat_id) in _parse_liveness_claude_chat_ids_env()
+
+
+# ---------- Liveness-exempt sources (structural transport exception) ----------
+#
+# Sources whose detail pages CANNOT be liveness-checked by the text-only
+# `claude -p` WebFetch verifier — the markdown conversion strips CSS, so any
+# element hidden via `display:none` leaks into the page text and is misread as
+# live content. euraxess ships a HIDDEN `<div ... style="display:none;"
+# id="expiration">STATUS: EXPIRED</div>` on EVERY job page (unhidden by JS only
+# when the role actually expires). Text-fetch always sees "STATUS: EXPIRED" →
+# the verifier returns `closed` → fail-safe drops EVERY euraxess listing, live
+# or not (observed 2026-06-27: two active BSE/UMU predoc roles, deadlines in
+# July 2026, both false-dropped).
+#
+# These sources are API/feed-sourced and only surface CURRENT vacancies, so
+# their liveness is already established by (a) presence in the source feed and
+# (b) the `MAX_JOB_AGE_DAYS` age gate above — the web scrape adds nothing but
+# false negatives. This is a structural fact about the source's HTML, NOT a
+# job-quality heuristic — the same justified-exception category as the
+# `_SOFT_404_*` ATS-surrogate patterns below and the `_ALLOWED_ATS` allowlist
+# (see CLAUDE.md "exceptions where hardcoded logic IS justified"). Extend via
+# env `LIVENESS_EXEMPT_SOURCES` (comma list) only for sources PROVEN to break
+# the text-only verifier the same way.
+#
+# `hackernews` (added 2026-07-04): a "Who is hiring?" post is a DISCUSSION
+# COMMENT, not an ATS listing — it has no Apply button and its apply info is
+# inline free text (an email or company URL). The verifier's ATS-shaped rules
+# ("CLOSED if no visible Apply button") systematically misread that as closed.
+# HN liveness is already covered without the LLM: the dead-URL HTTP gate above
+# catches deleted/flagged items (404), and the fetcher only reads the CURRENT
+# month's thread so stale comments never surface. Same structural exemption as
+# euraxess — the text-only verifier can only add false negatives here. (This
+# path first became reachable once the 429→alive fix stopped HN dying at the
+# dead-URL gate; see `_url_is_alive`.)
+_LIVENESS_EXEMPT_SOURCES: frozenset[str] = frozenset(
+    {"euraxess", "hackernews"}
+    | {
+        s.strip().lower()
+        for s in (os.environ.get("LIVENESS_EXEMPT_SOURCES", "") or "").split(",")
+        if s.strip()
+    }
+)
 
 
 # ---------- Structural soft-404 patterns (closed-set, transport-layer) ----------
@@ -994,11 +1247,199 @@ def _title_is_soft_404(title: str | None) -> tuple[bool, str]:
     return (False, "")
 
 
-def _web_search_listing_still_open(
+# Shared verdict-classification rules — the ACTUAL decision logic, reused
+# byte-for-byte by both the "claude" (agentic WebFetch) and "orchestrated"
+# (pre-fetched body handed to a single-shot LLM call) backends. Only the
+# PROCEDURE preamble above this block differs between backends (one says
+# "go fetch it yourself", the other says "here's what was already
+# fetched") — the classification rules themselves must never drift between
+# paths, so they live in exactly one place.
+_LIVENESS_VERDICT_RULES = (
+    "VERDICT SIGNALS (case-insensitive match):\n"
+    "  CLOSED if the page text contains ANY of:\n"
+    "    \"no longer accepting\", \"no longer available\",\n"
+    "    \"position has been filled\", \"position is closed\",\n"
+    "    \"this job is no longer accepting applications\",\n"
+    "    \"role is no longer open\", \"applications are closed\",\n"
+    "    \"closed for applications\", \"this position is closed\",\n"
+    "    \"the role you're looking for is no longer\",\n"
+    "    \"sorry, the position\", \"job has expired\", \"expired\",\n"
+    "    \"404\", \"page not found\", \"posting not found\",\n"
+    "    \"role not found\", \"job not found\", \"oops\",\n"
+    "    \"this opening has been removed\",\n"
+    "    \"sorry, this job has expired\" (SmartRecruiters),\n"
+    "    \"Es werden keine Bewerbungen mehr angenommen\" (DE LinkedIn),\n"
+    "    \"Ya no se aceptan solicitudes\" (ES LinkedIn),\n"
+    "    \"Nie przyjmujemy już zgłoszeń\" (PL LinkedIn),\n"
+    "    \"Plus aucune candidature acceptée\" (FR LinkedIn),\n"
+    "    \"Non si accettano più candidature\" (IT LinkedIn),\n"
+    "    \"Brak aktywnych ogłoszeń\" (nofluffjobs/justjoinit),\n"
+    "    \"this offer is no longer active\",\n"
+    "    \"oferta nie jest już aktywna\",\n"
+    "    \"the job posting you are looking for has been removed\"\n"
+    "    (Workable).\n"
+    "  Also CLOSED if it's an ATS page (workable / greenhouse /\n"
+    "  lever / ashby / smartrecruiters / personio / teamtailor /\n"
+    "  recruitee / bamboohr / myworkday) AND there is NO visible\n"
+    "  Apply button / 'Apply for this job' link / application form.\n\n"
+    "  CLOSED — REDIRECT-TO-CAREERS-INDEX (very common, easy to\n"
+    "  miss): the input URL points to a SPECIFIC role (path\n"
+    "  contains an opaque job-id like '/j/4B3352F6E3/', '/o/<id>',\n"
+    "  '/jobs/<uuid>'), but the rendered page is the company's\n"
+    "  GENERIC openings index.\n"
+    "\n"
+    "  TITLE-AS-VETO (overrides everything else on this page):\n"
+    "  If the page <title> tag contains ANY of these tokens —\n"
+    "    \"Current Openings\", \"All Jobs\", \"All Openings\",\n"
+    "    \"Open Roles\", \"Open Positions\", \"Job Openings\",\n"
+    "    \"Careers at\", \"Jobs at\", \"Hiring\" (alone),\n"
+    "    \"<Company> Careers\", \"View Open Positions\"\n"
+    "  — return CLOSED. The title is the strongest signal because\n"
+    "  it's set server-side by the ATS and survives SPA navigation.\n"
+    "  Apply buttons visible on such a page belong to OTHER roles\n"
+    "  and are NOT relevant to the specific URL we asked about.\n"
+    "  Do NOT inspect Apply controls when the TITLE rule fires.\n"
+    "\n"
+    "  ROLE-HEADER-MISSING (second-strongest signal): the expected\n"
+    "  role title (provided below) MUST appear as an H1, page\n"
+    "  heading, or prominent role header on the rendered page. If\n"
+    "  the H1 is generic (\"Current Openings\", \"Careers\",\n"
+    "  company name alone) or names a DIFFERENT role, return\n"
+    "  CLOSED — the specific role at this URL is gone, even if\n"
+    "  the company has other live listings.\n"
+    "\n"
+    "  Other tell-tale signs (any one is sufficient):\n"
+    "    - Final URL after redirects contains query params like\n"
+    "      `?not_found=true`, `?expired=1`, `?removed=true`,\n"
+    "      `&status=closed`, or strips the job-id and lands on\n"
+    "      `/<company>/`, `/<company>/jobs`, `/careers`.\n"
+    "    - The page lists MULTIPLE different roles (a roles grid\n"
+    "      / search bar / filter chips) instead of one role's\n"
+    "      description.\n"
+    "  Workable specifically: `apply.workable.com/<co>/?not_found=true`\n"
+    "  is Workable's standard 'this role was removed' page — it\n"
+    "  returns HTTP 200 with the company's other openings, so\n"
+    "  the 'Apply' buttons visible belong to OTHER roles. ALWAYS\n"
+    "  return closed when you see `not_found=true` in the URL.\n"
+    "  Workable ALSO does this silently: `apply.workable.com/<co>/\n"
+    "  j/<id>/` returning HTTP 200 with title `<Company> -\n"
+    "  Current Openings` and a list of OTHER roles is the SAME\n"
+    "  removed-role signal without the URL hint. The TITLE-AS-VETO\n"
+    "  rule above covers it.\n\n"
+    "  ATS-SPECIFIC CLOSED PATTERNS (each ATS dies differently):\n"
+    "    - Workable: ?not_found=true OR final URL is\n"
+    "      apply.workable.com/<co>/ (no /j/<id>/ slug) → CLOSED.\n"
+    "    - Lever: jobs.lever.co/<co>/<uuid> returning 404 OR\n"
+    "      \"This job is no longer accepting applications\" →\n"
+    "      CLOSED.\n"
+    "    - Ashby: jobs.ashbyhq.com/<co>/<uuid> returning 404 OR\n"
+    "      the page shows the company's careers index instead\n"
+    "      of the specific role → CLOSED.\n"
+    "    - Greenhouse: boards.greenhouse.io/<co>/jobs/<id>\n"
+    "      returning 404 OR \"This position is no longer\n"
+    "      accepting applications\" → CLOSED.\n"
+    "    - SmartRecruiters: jobs.smartrecruiters.com/<co>/<id>\n"
+    "      showing \"Sorry, this job has expired\" or any\n"
+    "      \"expired\" banner → CLOSED.\n"
+    "    - LinkedIn: pages with \"Es werden keine Bewerbungen\n"
+    "      mehr angenommen\" / \"No longer accepting applications\"\n"
+    "      / language-localized equivalent → CLOSED. ALSO closed\n"
+    "      if final URL redirects to linkedin.com/jobs/search/.\n"
+    "    - nofluffjobs / justjoinit: \"Brak aktywnych ogłoszeń\"\n"
+    "      / \"oferta nie jest już aktywna\" / role not in active\n"
+    "      list → CLOSED.\n"
+    "    - Workable API edge: if WebFetch of the apply URL\n"
+    "      returns a JSON-like body with `\"jobs\":[]` or\n"
+    "      `\"job\":null`, the slug exists but role is removed →\n"
+    "      CLOSED.\n\n"
+    "  OPEN if the page shows ANY of:\n"
+    "    \"Apply\", \"Apply now\", \"Apply for this job\",\n"
+    "    \"Submit application\", an embedded application form,\n"
+    "    a clearly visible job description with apply CTA,\n"
+    "    posted_at or 'X days ago' date alongside an apply control.\n"
+    "  IMPORTANT: 'Apply' must belong to THE SPECIFIC role this\n"
+    "  URL identifies — not to other openings on a careers index.\n"
+    "  Verify the page H1 / role header matches (or is a close\n"
+    "  variant of) the provided Title below. If H1 is generic\n"
+    "  (\"Current Openings\", \"Careers\") and the apply controls\n"
+    "  belong to other roles → this is CLOSED, not OPEN.\n\n"
+    "  APPLY-VIA-REDIRECT IS OPEN (aggregator job boards): boards\n"
+    "  like tecnoempleo / infojobs / eures / euraxess / jobs.ac.uk\n"
+    "  routinely show THIS role's own description plus an 'apply on\n"
+    "  the company website' / 'you will be redirected to the\n"
+    "  employer' / 'complete the form on their site' CTA INSTEAD of\n"
+    "  an inline application form. When the page describes THIS\n"
+    "  specific role (H1 / heading matches the Title below) and\n"
+    "  offers a link or redirect to apply, return OPEN — the absence\n"
+    "  of an on-page Apply button or embedded form is NOT 'closed'\n"
+    "  when a redirect-to-employer apply path exists for this role.\n"
+    "  (Contrast, still CLOSED: a redirect that drops the role and\n"
+    "  lands on a GENERIC careers index listing many other roles —\n"
+    "  covered by the TITLE-AS-VETO / ROLE-HEADER-MISSING rules.)\n\n"
+    "Respond with ONE JSON object only — no prose, no markdown fence:\n"
+    "{\"status\": \"open\"|\"closed\"|\"unknown\", "
+    "\"reason\": \"<≤20 words citing the matched phrase>\"}"
+)
+
+
+def _parse_liveness_verdict(stdout: str | None) -> tuple[bool | None, str]:
+    """Shared envelope-unwrap + verdict parse for both backends."""
+    if stdout is None:
+        return (None, "unknown:cli_unavailable")
+    from claude_cli import extract_assistant_text, parse_json_block
+    data = parse_json_block(extract_assistant_text(stdout))
+    if not isinstance(data, dict):
+        return (None, "unknown:parse_failed")
+    status = str(data.get("status") or "").strip().lower()
+    reason = str(data.get("reason") or "")[:80]
+    if status == "open":
+        return (True, "ok")
+    if status == "closed":
+        return (False, f"closed:{reason}")
+    return (None, f"unknown:{reason}")
+
+
+# Liveness `(None, "unknown:<tag>")` verdicts split into two very different
+# causes, and the send-time gate must treat them differently:
+#   * INFRASTRUCTURE failure — the verifier subprocess / LLM call itself
+#     died, timed out, or returned an unparseable envelope. The model never
+#     actually judged the page. Tags below are emitted by the verifier
+#     plumbing (`_parse_liveness_verdict` / `_verify_listing_*`), never by a
+#     model that looked at the posting.
+#   * GENUINE model uncertainty — the model DID read the page and honestly
+#     answered "unknown" (thin/JS-only body, inconclusive fallback search).
+#     Its reason is free-text, so it never matches this closed set.
+# The gate fails OPEN on infrastructure failures (keeping an already-scored
+# job rather than punishing it for our outage) and stays fail-CLOSED on a
+# genuine "unknown" and on "closed". Empirically ~1/3 of Claude-CLI liveness
+# calls returned `cli_unavailable`, and because post-scoring candidate sets
+# are tiny (1-5 jobs) a single verifier hiccup zeroed out a user's whole run.
+_LIVENESS_INFRA_REASONS = frozenset({
+    "cli_unavailable",     # stdout is None (subprocess crashed / timeout / non-zero exit)
+    "parse_failed",        # envelope present but not a JSON object
+    "wrappers_import",     # instrumentation.wrappers import failed
+    "claude_cli_import",   # claude_cli import failed
+    "un_api_error",        # UN Careers per-job API: transport / parse / 4xx failure
+    "un_import",           # sources.un_careers import failed
+})
+
+
+def _liveness_reason_is_infra_failure(reason: str) -> bool:
+    """True when a ``(None, "unknown:<tag>")`` liveness verdict came from a
+    verifier INFRASTRUCTURE failure rather than a genuine model "unknown".
+
+    `no_url` is deliberately NOT infra: a posting with no URL can't be sent
+    anyway, so dropping it is correct.
+    """
+    tag = (reason or "").split(":", 1)[-1].strip()
+    return tag in _LIVENESS_INFRA_REASONS
+
+
+def _web_search_listing_still_open_claude(
     job: Job, timeout_s: int = WEB_SEARCH_VERIFY_TIMEOUT_S,
 ) -> tuple[bool | None, str]:
     """Decide whether a web_search-sourced posting is still accepting
-    applications.
+    applications, via a Claude agentic subprocess (WebFetch + WebSearch).
 
     Returns ``(True, "ok")`` if the agent confirms the listing is open,
     ``(False, "closed:<short reason>")`` if the agent says closed, and
@@ -1010,12 +1451,7 @@ def _web_search_listing_still_open(
     if not (job.url or "").strip():
         return (None, "unknown:no_url")
     try:
-        from claude_cli import (
-            TOOLS_DENY_SHELL_FS,
-            TOOLS_WEB_BOTH,
-            extract_assistant_text,
-            parse_json_block,
-        )
+        from claude_cli import TOOLS_DENY_SHELL_FS, TOOLS_WEB_BOTH
     except ImportError:
         return (None, "unknown:claude_cli_import")
     # Route through the instrumented wrapper so each verifier call is
@@ -1046,120 +1482,10 @@ def _web_search_listing_still_open(
         f"\nURL:     {job.url}\n"
         f"Title:   {(job.title or '')[:200]}\n"
         f"Company: {(job.company or '')[:120]}\n\n"
-        "VERDICT SIGNALS (case-insensitive match):\n"
-        "  CLOSED if the page text contains ANY of:\n"
-        "    \"no longer accepting\", \"no longer available\",\n"
-        "    \"position has been filled\", \"position is closed\",\n"
-        "    \"this job is no longer accepting applications\",\n"
-        "    \"role is no longer open\", \"applications are closed\",\n"
-        "    \"closed for applications\", \"this position is closed\",\n"
-        "    \"the role you're looking for is no longer\",\n"
-        "    \"sorry, the position\", \"job has expired\", \"expired\",\n"
-        "    \"404\", \"page not found\", \"posting not found\",\n"
-        "    \"role not found\", \"job not found\", \"oops\",\n"
-        "    \"this opening has been removed\",\n"
-        "    \"sorry, this job has expired\" (SmartRecruiters),\n"
-        "    \"Es werden keine Bewerbungen mehr angenommen\" (DE LinkedIn),\n"
-        "    \"Ya no se aceptan solicitudes\" (ES LinkedIn),\n"
-        "    \"Nie przyjmujemy już zgłoszeń\" (PL LinkedIn),\n"
-        "    \"Plus aucune candidature acceptée\" (FR LinkedIn),\n"
-        "    \"Non si accettano più candidature\" (IT LinkedIn),\n"
-        "    \"Brak aktywnych ogłoszeń\" (nofluffjobs/justjoinit),\n"
-        "    \"this offer is no longer active\",\n"
-        "    \"oferta nie jest już aktywna\",\n"
-        "    \"the job posting you are looking for has been removed\"\n"
-        "    (Workable).\n"
-        "  Also CLOSED if it's an ATS page (workable / greenhouse /\n"
-        "  lever / ashby / smartrecruiters / personio / teamtailor /\n"
-        "  recruitee / bamboohr / myworkday) AND there is NO visible\n"
-        "  Apply button / 'Apply for this job' link / application form.\n\n"
-        "  CLOSED — REDIRECT-TO-CAREERS-INDEX (very common, easy to\n"
-        "  miss): the input URL points to a SPECIFIC role (path\n"
-        "  contains an opaque job-id like '/j/4B3352F6E3/', '/o/<id>',\n"
-        "  '/jobs/<uuid>'), but the rendered page is the company's\n"
-        "  GENERIC openings index.\n"
-        "\n"
-        "  TITLE-AS-VETO (overrides everything else on this page):\n"
-        "  If the page <title> tag contains ANY of these tokens —\n"
-        "    \"Current Openings\", \"All Jobs\", \"All Openings\",\n"
-        "    \"Open Roles\", \"Open Positions\", \"Job Openings\",\n"
-        "    \"Careers at\", \"Jobs at\", \"Hiring\" (alone),\n"
-        "    \"<Company> Careers\", \"View Open Positions\"\n"
-        "  — return CLOSED. The title is the strongest signal because\n"
-        "  it's set server-side by the ATS and survives SPA navigation.\n"
-        "  Apply buttons visible on such a page belong to OTHER roles\n"
-        "  and are NOT relevant to the specific URL we asked about.\n"
-        "  Do NOT inspect Apply controls when the TITLE rule fires.\n"
-        "\n"
-        "  ROLE-HEADER-MISSING (second-strongest signal): the expected\n"
-        "  role title (provided below) MUST appear as an H1, page\n"
-        "  heading, or prominent role header on the rendered page. If\n"
-        "  the H1 is generic (\"Current Openings\", \"Careers\",\n"
-        "  company name alone) or names a DIFFERENT role, return\n"
-        "  CLOSED — the specific role at this URL is gone, even if\n"
-        "  the company has other live listings.\n"
-        "\n"
-        "  Other tell-tale signs (any one is sufficient):\n"
-        "    - Final URL after redirects contains query params like\n"
-        "      `?not_found=true`, `?expired=1`, `?removed=true`,\n"
-        "      `&status=closed`, or strips the job-id and lands on\n"
-        "      `/<company>/`, `/<company>/jobs`, `/careers`.\n"
-        "    - The page lists MULTIPLE different roles (a roles grid\n"
-        "      / search bar / filter chips) instead of one role's\n"
-        "      description.\n"
-        "  Workable specifically: `apply.workable.com/<co>/?not_found=true`\n"
-        "  is Workable's standard 'this role was removed' page — it\n"
-        "  returns HTTP 200 with the company's other openings, so\n"
-        "  the 'Apply' buttons visible belong to OTHER roles. ALWAYS\n"
-        "  return closed when you see `not_found=true` in the URL.\n"
-        "  Workable ALSO does this silently: `apply.workable.com/<co>/\n"
-        "  j/<id>/` returning HTTP 200 with title `<Company> -\n"
-        "  Current Openings` and a list of OTHER roles is the SAME\n"
-        "  removed-role signal without the URL hint. The TITLE-AS-VETO\n"
-        "  rule above covers it.\n\n"
-        "  ATS-SPECIFIC CLOSED PATTERNS (each ATS dies differently):\n"
-        "    - Workable: ?not_found=true OR final URL is\n"
-        "      apply.workable.com/<co>/ (no /j/<id>/ slug) → CLOSED.\n"
-        "    - Lever: jobs.lever.co/<co>/<uuid> returning 404 OR\n"
-        "      \"This job is no longer accepting applications\" →\n"
-        "      CLOSED.\n"
-        "    - Ashby: jobs.ashbyhq.com/<co>/<uuid> returning 404 OR\n"
-        "      the page shows the company's careers index instead\n"
-        "      of the specific role → CLOSED.\n"
-        "    - Greenhouse: boards.greenhouse.io/<co>/jobs/<id>\n"
-        "      returning 404 OR \"This position is no longer\n"
-        "      accepting applications\" → CLOSED.\n"
-        "    - SmartRecruiters: jobs.smartrecruiters.com/<co>/<id>\n"
-        "      showing \"Sorry, this job has expired\" or any\n"
-        "      \"expired\" banner → CLOSED.\n"
-        "    - LinkedIn: pages with \"Es werden keine Bewerbungen\n"
-        "      mehr angenommen\" / \"No longer accepting applications\"\n"
-        "      / language-localized equivalent → CLOSED. ALSO closed\n"
-        "      if final URL redirects to linkedin.com/jobs/search/.\n"
-        "    - nofluffjobs / justjoinit: \"Brak aktywnych ogłoszeń\"\n"
-        "      / \"oferta nie jest już aktywna\" / role not in active\n"
-        "      list → CLOSED.\n"
-        "    - Workable API edge: if WebFetch of the apply URL\n"
-        "      returns a JSON-like body with `\"jobs\":[]` or\n"
-        "      `\"job\":null`, the slug exists but role is removed →\n"
-        "      CLOSED.\n\n"
-        "  OPEN if the page shows ANY of:\n"
-        "    \"Apply\", \"Apply now\", \"Apply for this job\",\n"
-        "    \"Submit application\", an embedded application form,\n"
-        "    a clearly visible job description with apply CTA,\n"
-        "    posted_at or 'X days ago' date alongside an apply control.\n"
-        "  IMPORTANT: 'Apply' must belong to THE SPECIFIC role this\n"
-        "  URL identifies — not to other openings on a careers index.\n"
-        "  Verify the page H1 / role header matches (or is a close\n"
-        "  variant of) the provided Title below. If H1 is generic\n"
-        "  (\"Current Openings\", \"Careers\") and the apply controls\n"
-        "  belong to other roles → this is CLOSED, not OPEN.\n\n"
-        "  UNKNOWN only when WebFetch gives almost no usable text\n"
+        + _LIVENESS_VERDICT_RULES
+        + "\n\n  UNKNOWN only when WebFetch gives almost no usable text\n"
         "  (e.g. <500 chars, just nav chrome and footer) AND the\n"
-        "  fallback WebSearch step above is genuinely inconclusive.\n\n"
-        "Respond with ONE JSON object only — no prose, no markdown fence:\n"
-        "{\"status\": \"open\"|\"closed\"|\"unknown\", "
-        "\"reason\": \"<≤20 words citing the matched phrase>\"}"
+        "  fallback WebSearch step above is genuinely inconclusive.\n"
     )
     # v2.3: pin liveness to Haiku. The check is high-volume (one call per
     # surviving posting per user per run) and low-complexity (binary
@@ -1186,19 +1512,100 @@ def _web_search_listing_still_open(
         output_format="json",
         model=_LIVENESS_MODEL,
     )
-    if stdout is None:
-        return (None, "unknown:cli_unavailable")
-    body = extract_assistant_text(stdout)
-    data = parse_json_block(body)
-    if not isinstance(data, dict):
-        return (None, "unknown:parse_failed")
-    status = str(data.get("status") or "").strip().lower()
-    reason = str(data.get("reason") or "")[:80]
-    if status == "open":
-        return (True, "ok")
-    if status == "closed":
-        return (False, f"closed:{reason}")
-    return (None, f"unknown:{reason}")
+    return _parse_liveness_verdict(stdout)
+
+
+def _verify_listing_orchestrated(
+    job: Job, timeout_s: int = WEB_SEARCH_VERIFY_TIMEOUT_S,
+) -> tuple[bool | None, str]:
+    """Non-agentic equivalent of `_web_search_listing_still_open_claude`:
+    fetch the URL ourselves (sources._detail_fetch, with the anti-bot/
+    thin-body escalation chain via `min_body_chars`), then ONE single-shot
+    LLM call (the "liveness_verify" stage) reusing
+    `_LIVENESS_VERDICT_RULES` verbatim.
+    """
+    if not (job.url or "").strip():
+        return (None, "unknown:no_url")
+    try:
+        from instrumentation.wrappers import wrapped_run_p
+        from sources._detail_fetch import fetch_body_text
+    except ImportError:
+        return (None, "unknown:wrappers_import")
+
+    body = fetch_body_text(
+        job.url,
+        timeout_s=timeout_s,
+        max_chars=4000,
+        min_body_chars=500,
+        allow_chrome_agent=False,
+    )
+
+    fallback_block = ""
+
+    prompt = (
+        "You verify whether a job posting is still accepting applications.\n"
+        "Be decisive — when in doubt, return `closed` rather than "
+        "`unknown`. A wrong `open` ships a dead URL to the user; a wrong "
+        "`closed` silently drops one posting (cheap miss). Bias toward "
+        "`closed` on ambiguous signals.\n\n"
+        "Below is the ALREADY-FETCHED page content for the URL (no need to fetch it yourself) "
+        "— scan it for the signals listed below.\n"
+        f"\nURL:     {job.url}\n"
+        f"Title:   {(job.title or '')[:200]}\n"
+        f"Company: {(job.company or '')[:120]}\n\n"
+        "FETCHED PAGE CONTENT:\n"
+        f"{body[:4000] if body else '(empty — fetch returned no usable content)'}"
+        + fallback_block + "\n\n"
+        + _LIVENESS_VERDICT_RULES
+        + "\n\n  UNKNOWN only when the fetched content above is almost no usable text\n"
+        "  (e.g. <500 chars, just nav chrome and footer) AND the fallback\n"
+        "  search results above (if any) are genuinely inconclusive.\n"
+    )
+    stdout = wrapped_run_p(None, "liveness_verify", prompt, timeout_s=timeout_s)
+    return _parse_liveness_verdict(stdout)
+
+
+def _is_un_careers_job(job: Job) -> bool:
+    """True for a UN Careers posting — by source slug or by host. `careers.un.org`
+    is a JS-SPA the text verifier can't read, but it has an authoritative per-job
+    JSON API (see `sources.un_careers.check_listing_open`)."""
+    if (job.source or "").strip().lower() == "un_careers":
+        return True
+    host = (urlparse(job.url or "").hostname or "").lower()
+    return host == "careers.un.org" or host.endswith(".careers.un.org")
+
+
+def _un_careers_listing_still_open(
+    job: Job, timeout_s: int = WEB_SEARCH_VERIFY_TIMEOUT_S,
+) -> tuple[bool | None, str]:
+    """Liveness via the UN Careers per-job API instead of the SPA-blind text
+    verifier. A None return carries an infra tag (`un_api_error` / `un_import`)
+    so the send-time gate fails OPEN — a flaky API must not drop a live role."""
+    try:
+        from sources.un_careers import check_listing_open
+    except ImportError:
+        return (None, "unknown:un_import")
+    return check_listing_open(job.url, timeout_s=float(timeout_s))
+
+
+def _web_search_listing_still_open(
+    job: Job, timeout_s: int = WEB_SEARCH_VERIFY_TIMEOUT_S, *, chat_id: int | None = None,
+) -> tuple[bool | None, str]:
+    """Dispatch to the "claude" (default) or "orchestrated" liveness
+    backend per `LIVENESS_BACKEND` — see `_liveness_backend`. `chat_id`
+    (optional, for the `LIVENESS_CLAUDE_CHAT_IDS` rollback lever) forces
+    this specific chat back onto the "claude" backend even after
+    `LIVENESS_BACKEND=orchestrated` ships fleet-wide.
+    """
+    # Source-specific fast path: UN Careers is a JS-only SPA. The text verifier
+    # (both backends) fetches only the empty app shell and systematically
+    # false-CLOSES live roles, so route it to the authoritative per-job JSON API
+    # — no render, no LLM. Applies regardless of LIVENESS_BACKEND.
+    if _is_un_careers_job(job):
+        return _un_careers_listing_still_open(job, timeout_s=timeout_s)
+    if _liveness_backend() == "orchestrated" and not _liveness_forced_to_claude(chat_id):
+        return _verify_listing_orchestrated(job, timeout_s=timeout_s)
+    return _web_search_listing_still_open_claude(job, timeout_s=timeout_s)
 
 
 # ---------- MarkdownV2 helpers ----------
@@ -1225,10 +1632,10 @@ ICON_STACK     = "⚙️"   # tech stack
 ICON_SENIORITY = "📊"   # level
 ICON_LANGUAGE  = "🗣"
 ICON_VISA      = "🛂"
+ICON_CONTACT   = "👤"   # hiring contact ("who to write to")
 ICON_APPLIED   = "✅"
 ICON_SKIPPED   = "⊘"    # lighter than 🚫 for the "not-applied" tag
 ICON_NEW       = "•"    # neutral bullet, used for fresh-post emphasis
-ICON_CONTACT   = "👤"   # hiring contact ("who to write to")
 
 
 def _score_bar(score: int, cells: int = 5) -> str:
@@ -1469,33 +1876,66 @@ def job_keyboard(
     applied_status: str | None = None,
     url: str | None = None,
     chat_id: int | None = None,
+    feedback: str | None = None,
 ) -> dict:
     """Build the inline keyboard under each job message.
 
     callback_data is capped at 64 bytes; our job_id is 16 hex chars → plenty of room.
     Prefixes:
-        a:<job_id>  → mark applied
-        n:<job_id>  → mark not applied / skipped
-        r:<job_id>  → rewrite resume for this position
+        a:<job_id>    → mark applied
+        n:<job_id>    → LEGACY "not a fit" / skip. Old digests still carry this
+                        button; the handler stays alive forever and now also
+                        records a 👎 into job_feedback so stale cards feed the
+                        same table the new buttons write to.
+        fb+:<job_id>  → 👍 thumbs-up — records feedback, does not touch the
+                        applied/skipped status unless nothing was set yet.
+        fb-:<job_id>  → 👎 thumbs-down — records feedback, marks the job
+                        skipped (same dedupe semantics as `n:`), and morphs
+                        the card into a structured "what was off?" prompt.
+        fb0:<job_id>  → un-vote — clears the recorded verdict (and the
+                        interested/skipped status the thumb set) and restores
+                        the neutral 👍/👎 row.
+        r:<job_id>    → rewrite resume for this position
 
-    The top row is a direct URL button (Telegram opens the posting in-browser).
-    When REDIRECT_BASE_URL + REDIRECT_HMAC_SECRET are set in env AND a
-    `chat_id` is supplied, we substitute a signed redirect URL instead so
-    the in-process redirect server can log the click before 302-ing to the
-    posting. See redirect_server.py for the matching listener.
+    `feedback` mirrors the last verdict recorded via `db.record_job_feedback`
+    ('up' / 'down' / None) so a re-rendered card reflects which thumb was
+    tapped. It only affects the row's look when there's no applied/skipped
+    status yet — applied/skipped are stronger signals and keep owning the row.
+
+    The top row is a URL button (Telegram opens the posting in-browser),
+    routed through the signed-redirect click-tracker (`_maybe_redirect_url`
+    / `redirect_server.py`) so each open is recorded as a usage signal for
+    the stale-user check. Verified working end-to-end on prod 2026-07-12
+    (the pre-July-4 "/r hop not completing" breakage was the missing
+    nginx/TLS route, fixed by the web release). Falls back to the raw URL
+    when the redirect env is unset or chat_id is unknown.
     """
     rows: list[list[dict]] = []
     if url:
-        view_url = _maybe_redirect_url(url, job_id, chat_id)
-        rows.append([{"text": "View posting ↗", "url": view_url}])
+        rows.append([{"text": "View posting ↗",
+                      "url": _maybe_redirect_url(url, job_id, chat_id)}])
     if applied_status == "applied":
         status_row = [{"text": "✓ Applied", "callback_data": f"n:{job_id}"}]
     elif applied_status == "skipped":
         status_row = [{"text": "⊘ Skipped", "callback_data": f"a:{job_id}"}]
+    elif feedback == "up":
+        # Tapping the active "Liked" un-votes (fb0:) — back to the neutral
+        # 👍/👎 row, as if never tapped. (It used to flip to fb-: and open
+        # the "what was off?" picker, which read as punishing a re-tap.)
+        status_row = [
+            {"text": "✓ Applied", "callback_data": f"a:{job_id}"},
+            {"text": "👍 Liked", "callback_data": f"fb0:{job_id}"},
+        ]
+    elif feedback == "down":
+        status_row = [
+            {"text": "✓ Applied", "callback_data": f"a:{job_id}"},
+            {"text": "👎 Noted", "callback_data": f"fb0:{job_id}"},
+        ]
     else:
         status_row = [
             {"text": "✓ Applied", "callback_data": f"a:{job_id}"},
-            {"text": "⊘ Not a fit", "callback_data": f"n:{job_id}"},
+            {"text": "👍", "callback_data": f"fb+:{job_id}"},
+            {"text": "👎", "callback_data": f"fb-:{job_id}"},
         ]
     rows.append(status_row)
     # Two AI actions on one row — paired because they tackle the same job
@@ -1506,6 +1946,53 @@ def job_keyboard(
     rows.append([
         {"text": "Analyze fit →",   "callback_data": f"fit:{job_id}"},
         {"text": "Tailor resume →", "callback_data": f"r:{job_id}"},
+    ])
+    return {"inline_keyboard": rows}
+
+
+# Structured reason codes for the 👎 follow-up (`fbr:<code>:<job_id>`).
+# Kept short + deliberately NOT a hardcoded content filter — these are just
+# UI labels the USER picks; the actual "is this a bad posting" judgment
+# never runs in Python. `FEEDBACK_REASON_SENTENCES` turns a tapped code into
+# the plain-English line that lands in `db.append_skip_note`, which feeds
+# the same prefs.txt → scoring-prompt loop as free-text skip reasons.
+FEEDBACK_REASON_CODES: list[tuple[str, str]] = [
+    ("loc",  "📍 Wrong location"),
+    ("sen",  "📊 Wrong seniority"),
+    ("dom",  "🏷 Wrong domain"),
+    ("sal",  "💰 Salary"),
+    ("dead", "☠️ Dead link"),
+    ("seen", "👁 Seen already"),
+]
+
+FEEDBACK_REASON_SENTENCES: dict[str, str] = {
+    "loc":  "wrong location",
+    "sen":  "wrong seniority",
+    "dom":  "wrong domain",
+    "sal":  "salary",
+    "dead": "dead link",
+    "seen": "seen already",
+}
+
+
+def feedback_reason_keyboard(job_id: str) -> dict:
+    """Structured reason picker shown after a 👎 tap on a job card.
+
+    Two buttons per row for the six fixed codes, then one bottom row:
+      • "Other / no reason" (`fbr:other:<job_id>`) — accept the 👎 with no
+        reason recorded and clean up the prompt.
+      • "↩ Return" (`fbr:back:<job_id>`) — undo the 👎 entirely and restore
+        the original job card.
+    """
+    rows: list[list[dict]] = []
+    for i in range(0, len(FEEDBACK_REASON_CODES), 2):
+        rows.append([
+            {"text": label, "callback_data": f"fbr:{code}:{job_id}"}
+            for code, label in FEEDBACK_REASON_CODES[i:i + 2]
+        ])
+    rows.append([
+        {"text": "Other / no reason", "callback_data": f"fbr:other:{job_id}"},
+        {"text": "↩ Return", "callback_data": f"fbr:back:{job_id}"},
     ])
     return {"inline_keyboard": rows}
 
@@ -1596,7 +2083,8 @@ def clean_data_confirm_keyboard(kind: str) -> dict:
 
 
 def suggestions_keyboard(job_id: str, url: str | None = None,
-                         decided: str | None = None) -> dict:
+                         decided: str | None = None,
+                         chat_id: int | None = None) -> dict:
     """Inline keyboard for the tailor-suggestions dialog.
 
     Callback data prefixes:
@@ -1605,7 +2093,8 @@ def suggestions_keyboard(job_id: str, url: str | None = None,
     """
     rows: list[list[dict]] = []
     if url:
-        rows.append([{"text": "🔗 View posting", "url": url}])
+        rows.append([{"text": "🔗 View posting",
+                      "url": _maybe_redirect_url(url, job_id, chat_id)}])
     if decided == "applied":
         rows.append([{"text": "✅ Applied — see attachment", "callback_data": f"noop:{job_id}"}])
     elif decided == "dismissed":
@@ -1781,7 +2270,9 @@ class TelegramClient:
         # Acquire rate-limit tokens before issuing the HTTP request. Skipped
         # entirely when TG_RATE_LIMIT_OFF=1 — the static-pacing fallback path.
         if not TG_RATE_LIMIT_OFF:
-            slept_global, slept_chat = _RATE_LIMITER.acquire(chat_id)
+            slept_global, slept_chat = _RATE_LIMITER.acquire(
+                None if method in _CHAT_THROTTLE_EXEMPT else chat_id
+            )
             # Only emit forensic when blocking actually mattered (>100ms).
             # The check covers either bucket — whichever caused the wait wins
             # the `reason` label so dashboards can bucket by cause.
@@ -1855,7 +2346,10 @@ class TelegramClient:
                 continue
 
             if not data.get("ok"):
-                raise RuntimeError(f"Telegram {method} failed: {data.get('description')}")
+                description = data.get("description") or ""
+                if _is_unreachable_chat(error_code, description):
+                    raise TelegramBlocked(chat_id, description)
+                raise RuntimeError(f"Telegram {method} failed: {description}")
             return data.get("result", {})
 
     @staticmethod
@@ -1988,7 +2482,23 @@ class TelegramClient:
             payload["text"] = text
         if show_alert:
             payload["show_alert"] = True
-        self._call("answerCallbackQuery", payload)
+        try:
+            self._call("answerCallbackQuery", payload)
+        except RuntimeError as e:
+            # A stale/expired/invalid callback query is benign: the client's
+            # loading spinner times out on its own, and the user-facing action
+            # already ran. This happens when the user taps an old card, or when
+            # an upstream Telegram call slept on a 429 long enough to push the
+            # ack past the ~15s window. Swallow it (mirror delete_message's
+            # best-effort swallows) so it never pages ops; re-raise anything
+            # else (auth, network, real API faults).
+            msg = str(e).lower()
+            if ("query is too old" in msg
+                    or "query id is invalid" in msg
+                    or "response timeout expired" in msg):
+                log.info("answer_callback swallowed (stale query): %s", e)
+                return
+            raise
 
     # ----- receiving (used by bot.py) -----
 
@@ -2158,12 +2668,13 @@ def prefilter_for_send(
     dead_url_count = 0
     forum_url_count = 0
     web_search_closed_count = 0
+    web_search_infra_error_count = 0
 
     for job in jobs:
         if not JOB_AGE_FILTER_OFF:
             is_web_search = (job.source or "").strip().lower() == "web_search"
             max_days = 7 if is_web_search else MAX_JOB_AGE_DAYS
-            missing_policy = "reject" if is_web_search else JOB_AGE_MISSING_POLICY
+            missing_policy = _age_missing_policy_for(job.source or "")
             allowed, reason = _is_within_age_window(
                 job.posted_at or "",
                 max_days=max_days,
@@ -2230,7 +2741,28 @@ def prefilter_for_send(
                          job.job_id, job.source, reason)
                 continue
 
-        if not WEB_SEARCH_VERIFY_OFF and (job.url or "").strip():
+        # Source-level liveness exemption: the text-only verifier produces
+        # systematic false-negatives on these sources (see
+        # `_LIVENESS_EXEMPT_SOURCES`). Skip BOTH the soft-404 structural check
+        # and the LLM verifier; the age gate + source-feed freshness above
+        # already established liveness. Age / dead-URL / forum gates still ran.
+        liveness_exempt = (job.source or "").strip().lower() in _LIVENESS_EXEMPT_SOURCES
+        if liveness_exempt and forensic is not None:
+            forensic.log_step(
+                "telegram.liveness_exempt",
+                input={
+                    "job_id": job.job_id, "source": job.source,
+                    "url": job.url, "title": (job.title or "")[:120],
+                },
+                output={
+                    "reason": "source liveness-exempt — text-only verifier "
+                    "misreads hidden display:none EXPIRED badge; trusting "
+                    "feed freshness + age gate",
+                },
+                chat_id=chat_id,
+            )
+
+        if not WEB_SEARCH_VERIFY_OFF and not liveness_exempt and (job.url or "").strip():
             # B. Pre-LLM structural soft-404 check. Match the FINAL URL
             # (after HEAD redirects) against the closed-set of known ATS
             # surrogate shapes. A hit drops the job WITHOUT spending a
@@ -2276,7 +2808,7 @@ def prefilter_for_send(
                     continue
 
             ws_status, ws_reason = _web_search_listing_still_open(
-                job, timeout_s=WEB_SEARCH_VERIFY_TIMEOUT_S,
+                job, timeout_s=WEB_SEARCH_VERIFY_TIMEOUT_S, chat_id=chat_id,
             )
             # C. Forensic entry for EVERY verifier verdict (open / closed
             # / unknown) so post-hoc analysis can see what the verifier
@@ -2300,14 +2832,27 @@ def prefilter_for_send(
                     output={"status": verify_status, "reason": ws_reason},
                     chat_id=chat_id,
                 )
-            # A. Fail-safe gate: drop on both False (verifier says
-            # closed) and None (verifier uncertain / CLI failure / parse
-            # failure). Yesterday three soft-404 URLs shipped to a user
-            # because the gate only dropped on False — `None` outcomes
-            # leaked through. Reversal in policy: bias toward dropping
-            # uncertain web_search postings rather than shipping a
-            # potentially dead URL.
-            if ws_status is not True:
+            # A. Fail-safe gate: drop on False (verifier says closed) and on
+            # a GENUINE model "unknown" (model read the page, couldn't tell).
+            # Yesterday three soft-404 URLs shipped to a user because the gate
+            # only dropped on False — `None` outcomes leaked through. Reversal
+            # in policy: bias toward dropping genuinely-uncertain postings
+            # rather than shipping a potentially dead URL.
+            #
+            # EXCEPTION (fail-OPEN): a `None` that came from a verifier
+            # INFRASTRUCTURE failure (subprocess died / timed out / envelope
+            # unparseable) is NOT a judgment about the posting — the model
+            # never looked. Dropping on it silently loses an already-scored
+            # job every time the verifier flakes (empirically ~1/3 of
+            # Claude-CLI calls), and with 1-5 candidates per user that zeroes
+            # out whole runs. The dead-URL HTTP probe already ran above, so an
+            # obviously-dead URL is gone before we reach here; keeping an
+            # infra-failed job is the safer trade.
+            infra_failure = (
+                ws_status is None
+                and _liveness_reason_is_infra_failure(ws_reason)
+            )
+            if ws_status is not True and not infra_failure:
                 web_search_closed_count += 1
                 if forensic is not None:
                     forensic.log_step(
@@ -2341,6 +2886,30 @@ def prefilter_for_send(
                         job.job_id, ws_reason,
                     )
                 continue
+            if infra_failure:
+                # Fail-open: keep the job, but record the verifier outage so
+                # it stays visible and countable in forensics/logs (a spike
+                # here means the verifier backend is degraded, not that jobs
+                # are genuinely open).
+                web_search_infra_error_count += 1
+                if forensic is not None:
+                    forensic.log_step(
+                        "telegram.web_search_infra_error",
+                        input={
+                            "job_id": job.job_id, "source": job.source,
+                            "url": job.url, "title": (job.title or "")[:120],
+                        },
+                        output={
+                            "reason": ws_reason,
+                            "verdict": "kept_despite_verifier_failure",
+                        },
+                        chat_id=chat_id,
+                    )
+                log.warning(
+                    "prefilter_for_send: keeping %s despite verifier infra "
+                    "failure (fail-open) — %s",
+                    job.job_id, ws_reason,
+                )
 
         alive_jobs.append(job)
 
@@ -2349,6 +2918,7 @@ def prefilter_for_send(
         "dead_url_count": dead_url_count,
         "forum_url_count": forum_url_count,
         "web_search_closed_count": web_search_closed_count,
+        "web_search_infra_error_count": web_search_infra_error_count,
     }
 
 
@@ -2482,6 +3052,7 @@ def send_per_job_digest(
         drop_counts: dict[str, int] = {
             "too_old_count": 0, "dead_url_count": 0,
             "forum_url_count": 0, "web_search_closed_count": 0,
+            "web_search_infra_error_count": 0,
         }
     else:
         alive_jobs, drop_counts = prefilter_for_send(jobs, chat_id, _forensic)
@@ -2553,6 +3124,9 @@ def send_per_job_digest(
             msg_id = tg.send_message(chat_id, text, reply_markup=kb)
             on_sent(msg_id, job)
             sent += 1
+            # NOTE (typo-guard): keep the block-abort catch BELOW so a
+            # TelegramBlocked from send_message propagates instead of being
+            # swallowed per-card.
             # NOTE: pacing now lives inside TelegramClient._call via the
             # token-bucket rate limiter (global 30 rps + per-chat 1 rps with
             # burst). The old static 0.35s sleep here was a blunt
@@ -2562,6 +3136,11 @@ def send_per_job_digest(
             # site is now a no-op so small digests aren't artificially
             # slowed.
             time.sleep(0)
+        except TelegramBlocked:
+            # User blocked the bot / chat is gone. Every remaining card would
+            # 403 too, so abort the whole digest and let the caller tombstone
+            # the user (pausing their searcher, no data deleted).
+            raise
         except Exception as e:
             send_status = "error"
             fail_count += 1

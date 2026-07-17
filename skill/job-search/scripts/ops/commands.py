@@ -1,7 +1,8 @@
 """Operator-only Telegram commands.
 
-Four commands per plan §5: `/health`, `/stats [24h|7d]`, `/alerts […]`,
-`/runlog [N]`. All gated by `is_operator(chat_id)` — non-operators silently
+Commands: `/health`, `/stats [24h|7d]`, `/alerts […]`, `/runlog [N]`
+(plan §5).
+All gated by `is_operator(chat_id)` — non-operators silently
 ghost (mirrors the existing `_is_admin` pattern in bot.py around line 887).
 
 The dispatcher returns False for:

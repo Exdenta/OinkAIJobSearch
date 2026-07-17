@@ -177,6 +177,7 @@ def _run_chrome_agent(prompt: str, *, timeout_s: int) -> str | None:
         "claude", "-p", prompt,
         "--chrome",
         "--output-format", "json",
+        "--permission-mode", "dontAsk",
         "--allowed-tools", ALLOWED,
         "--disallowed-tools", TOOLS_DENY_SHELL_FS,
     ]
@@ -211,6 +212,31 @@ def _coerce_listing(item: Any) -> dict:
             v = item.get(k, "")
             out[k] = v if isinstance(v, str) else ("" if v is None else str(v))
     return out
+
+
+def _looks_like_agent_failure_text(text: str) -> bool:
+    """True when the Chrome agent returned its own failure/refusal prose.
+
+    ``fetch_page_text_via_chrome`` must return page text or ""; otherwise the
+    downstream liveness LLM treats transport errors as job-page evidence.
+    """
+    s = " ".join((text or "").lower().split())
+    return (
+        ("chrome" in s and (
+            "specified chrome device" in s
+            or "no matching browser" in s
+            or "no reachable chrome" in s
+            or "browser target is unavailable" in s
+            or ("deviceid" in s and "not currently connected" in s)
+            or ("device" in s and "isn't currently connected" in s)
+        ))
+        or "i can't proceed with the extraction" in s
+        or "i can't complete this task" in s
+        or "headless extraction agent" in s
+        or "injected prompt" in s
+        or "silent scraping instructions" in s
+        or ("prompt injection" in s and "not execut" in s)
+    )
 
 
 def fetch_listings_via_chrome(
@@ -300,6 +326,9 @@ def fetch_page_text_via_chrome(
         return ""
     text = extract_assistant_text(stdout)
     text = (text or "").strip()
+    if _looks_like_agent_failure_text(text):
+        log.info("chrome_agent: %s returned agent failure text; treating as empty", url)
+        return ""
     if text:
         log.info("chrome_agent: recovered page text from %s (%d chars)", url, len(text))
     else:
