@@ -74,7 +74,7 @@ some sources' TOS restrict use to personal job search.
 ## Quick start
 
 ```bash
-git clone https://github.com/Exdenta/OinkAIJobSearch.git && cd OinkAIJobSearch && claude
+git clone https://github.com/Exdenta/OinkAIJobSearch.git && cd OinkAIJobSearch && claude '/setup'
 ```
 
 Then type **`/setup`**. [Claude Code](https://docs.claude.com/claude-code)
