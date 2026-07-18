@@ -145,17 +145,31 @@ Prints what would be posted without sending or recording anything.
 `bot.py` runs the search loop every couple of hours for a single chat.
 Quality is gated by the per-user buffer (P1) and pagination by the
 source-page cursors (P2), so the loop never re-fetches the same source page
-within 6h and only flushes ≥4-scored matches. Enable with two env vars:
+within 6h and only flushes ≥4-scored matches. Enable with two vars in `.env`
+(NOT `export` — a shell export doesn't survive a restart or a new terminal,
+`.env` does):
 
 ```bash
-export OINK_CONTINUOUS_MODE=1
-export OINK_CONTINUOUS_CHAT_ID=433775883     # your Telegram chat_id
+OINK_CONTINUOUS_MODE=1
+OINK_CONTINUOUS_CHAT_ID=433775883     # your Telegram chat_id
+```
+
+```bash
 python skill/job-search/scripts/bot.py
 ```
 
 With these set, remove any cron entry first (`crontab -e`) — otherwise the
 same search runs twice. The interval is tunable in `defaults.py`
 (`continuous_interval_seconds`, default 7200).
+
+Also set `OPERATOR_CHAT_ID` to your own chat_id in `.env` so sustained
+failures (e.g. the poller getting stuck) reach you instead of sitting
+silently in `bot.log`. But the operator's chat_id is excluded from continuous
+auto-search by default — right for the hosted multi-tenant Oink bot, wrong
+for this repo's self-host mode (single-user only, so the same chat_id IS
+both operator and the one real user). When `OPERATOR_CHAT_ID` equals
+`OINK_CONTINUOUS_CHAT_ID`, also set `OINK_CONTINUOUS_INCLUDE_OPERATOR=1` in
+`.env`, or continuous mode will silently do nothing for that chat.
 
 Continuous mode is single-user — only `OINK_CONTINUOUS_CHAT_ID` is driven
 by the in-process loop. Other users still use on-demand `/jobs` taps.
