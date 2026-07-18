@@ -65,14 +65,17 @@ rather than re-explaining what's already there.
 
 ### 4. Choose a run mode
 
-Two mutually exclusive modes — ask the user which they want (see README
-`## Setup` → step 6 for full detail on both):
+Default to **Continuous mode** without asking — it's the recommended,
+single-user setup and covers the vast majority of self-hosters. Only bring up
+Cron mode if the user explicitly asks about scheduling multiple users,
+external cron/launchd/systemd, or says continuous mode doesn't fit their case
+(see README `## Setup` → step 6 for full detail on both):
 
-- **Continuous mode** (recommended, single-user): `bot.py` runs the search
-  loop itself. Set `OINK_CONTINUOUS_MODE=1` and `OINK_CONTINUOUS_CHAT_ID=<chat_id>`
-  before launching `bot.py`. No cron entry needed — if one exists, tell the
-  user to remove it (`crontab -e`) to avoid double-running.
-- **Cron mode** (legacy, multi-user or non-continuous): schedule
+- **Continuous mode** (default): `bot.py` runs the search loop itself. Set
+  `OINK_CONTINUOUS_MODE=1` and `OINK_CONTINUOUS_CHAT_ID=<chat_id>` before
+  launching `bot.py`. No cron entry needed — if one exists, tell the user to
+  remove it (`crontab -e`) to avoid double-running.
+- **Cron mode** (legacy, multi-user or non-continuous, opt-in only): schedule
   `search_jobs.py` externally. Generate the right snippet for the user's OS:
   - **macOS**: a `~/Library/LaunchAgents/*.plist` running
     `python skill/job-search/scripts/search_jobs.py` on a
