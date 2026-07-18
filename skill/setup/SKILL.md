@@ -56,9 +56,12 @@ rather than re-explaining what's already there.
   on, built by the Oink maintainer — usage is pay-per-result on your Apify
   account. If **y**: sign up at https://apify.com → Settings → API & 
   Integrations → copy the token → append `APIFY_TOKEN=<token>` to `.env`.
-  If **skip**: leave it unset (Wellfound loses its recovery fallback,
-  AcademicPositions stays off) and never bring it up again — not later in
-  setup, not in warnings.
+  If **skip**: append `FETCH_BACKEND=local` to `.env` — the fetch layer
+  defaults to `apify` regardless of whether a token is set, so skipping the
+  token without this line means every search silently fetches 0 jobs. Then
+  leave Apify unset (Wellfound loses its recovery fallback, AcademicPositions
+  stays off) and never bring it up again — not later in setup, not in
+  warnings.
 - Leave every other optional var (`OPERATOR_CHAT_ID`, `OPERATOR_CONTACT`,
   `PRIVACY_POLICY_URL`, `DEMO_CHAT_ID`, redirector vars) as-is/blank unless
   the user asks for them — they're documented inline in `.env.example`.
