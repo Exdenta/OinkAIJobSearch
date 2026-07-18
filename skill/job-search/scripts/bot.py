@@ -27,7 +27,9 @@ Run it:
     python skill/job-search/scripts/bot.py
 
 Stop with Ctrl-C. Only one instance should run at a time (getUpdates is
-single-consumer).
+single-consumer) — a second instance is refused at startup via a pidfile
+lock (state/bot.pid) rather than left to loop forever on Telegram 409
+Conflict errors.
 """
 from __future__ import annotations
 
@@ -3500,9 +3502,17 @@ def _resolve_continuous_chat_ids(db: DB) -> list[int]:
     typo wiped everyone's continuous mode" failure mode.
     """
     def _drop_operator(ids: list[int]) -> list[int]:
-        # The operator is NEVER auto-searched (enforced in code, not just via
-        # the manual OINK_CONTINUOUS_CHAT_ID list). Defense-in-depth so an
-        # operator id can't slip in through either resolution path.
+        # The operator is excluded from auto-search by default — right for
+        # the hosted multi-tenant deployment, where OPERATOR_CHAT_ID is the
+        # maintainer's own monitoring chat and must never get swept into the
+        # DB-fallback "every onboarded user" sweep. Wrong for a self-host
+        # install (this repo's only supported self-host shape — see README
+        # "Not for ... hosting a public multi-tenant service"), where the
+        # same chat_id IS both operator and the one real user. Self-hosters
+        # opt out of the exclusion with OINK_CONTINUOUS_INCLUDE_OPERATOR=1.
+        if (os.environ.get("OINK_CONTINUOUS_INCLUDE_OPERATOR", "") or "").strip().lower() \
+                in _CONTINUOUS_MODE_TRUTHY:
+            return ids
         try:
             from ops.operator import is_operator
         except Exception:
@@ -3969,6 +3979,26 @@ def _reconcile_continuous_once(db: DB) -> list[threading.Thread]:
 # ride out a transient blip, short enough to catch a real outage fast.
 _GETUPDATES_ALERT_AFTER = 12
 
+_PID_FILE = STATE_DIR / "bot.pid"
+
+
+def _claim_single_instance() -> bool:
+    """Refuse a second bot.py instance instead of letting two pollers loop
+    forever on Telegram's getUpdates 409 Conflict (silent unless
+    OPERATOR_CHAT_ID is set — see _GETUPDATES_ALERT_AFTER)."""
+    if _PID_FILE.exists():
+        try:
+            other_pid = int(_PID_FILE.read_text().strip())
+            os.kill(other_pid, 0)
+        except (ValueError, ProcessLookupError):
+            pass  # stale pidfile from a crashed/killed process; reclaim it
+        except PermissionError:
+            return False  # process exists, just owned by someone else
+        else:
+            return False
+    _PID_FILE.write_text(str(os.getpid()))
+    return True
+
 
 def main() -> int:
     configure_logging("bot")
@@ -3980,6 +4010,12 @@ def main() -> int:
         return 1
 
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if not _claim_single_instance():
+        log.error(
+            "Another bot.py instance is already running (see %s). "
+            "Refusing to start a second Telegram poller.", _PID_FILE,
+        )
+        return 1
     db = DB(DB_PATH)
     tg = TelegramClient(token=token)
 
