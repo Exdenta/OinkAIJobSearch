@@ -56,12 +56,16 @@ rather than re-explaining what's already there.
   on, built by the Oink maintainer — usage is pay-per-result on your Apify
   account. If **y**: sign up at https://apify.com → Settings → API & 
   Integrations → copy the token → append `APIFY_TOKEN=<token>` to `.env`.
-  If **skip**: append `FETCH_BACKEND=local` to `.env` — the fetch layer
-  defaults to `apify` regardless of whether a token is set, so skipping the
-  token without this line means every search silently fetches 0 jobs. Then
-  leave Apify unset (Wellfound loses its recovery fallback, AcademicPositions
-  stays off) and never bring it up again — not later in setup, not in
-  warnings.
+  If **skip**: append both `FETCH_BACKEND=local` and `OINK_LOCAL_CHAT_IDS=all`
+  to `.env` — two separate levers, both needed regardless of run mode:
+  `FETCH_BACKEND` is read by `search_jobs.py` (cron mode / direct CLI runs),
+  while continuous mode (`bot.py`) ignores it and instead routes per-chat
+  through `_backend_for_chat()`, which defaults every chat_id to `apify`
+  unless it's covered by `OINK_LOCAL_CHAT_IDS` (a chat-id list, or `"all"` to
+  roll the whole fleet back). Skipping either one means every search silently
+  fetches 0 jobs. Then leave Apify unset (Wellfound loses its recovery
+  fallback, AcademicPositions stays off) and never bring it up again — not
+  later in setup, not in warnings.
 - Leave every other optional var (`OPERATOR_CHAT_ID`, `OPERATOR_CONTACT`,
   `PRIVACY_POLICY_URL`, `DEMO_CHAT_ID`, redirector vars) as-is/blank unless
   the user asks for them — they're documented inline in `.env.example`.
