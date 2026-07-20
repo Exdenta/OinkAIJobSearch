@@ -53,8 +53,7 @@ rather than re-explaining what's already there.
   > instead of from your machine, so job sites see requests from Apify's
   > infrastructure rather than your PC's IP — this avoids the antibot
   > blocks (rate limits, CAPTCHAs, IP bans) that local scraping runs into.
-  > A free Apify account includes $5/month of usage credit, which covers
-  > typical personal use. Set it up? (y/skip)
+  > A free Apify account includes $5/month of usage credit. Set it up? (y/skip)
 
   Be transparent: these are the same Apify actors the hosted Oink bot runs
   on, built by the Oink maintainer — usage is pay-per-result on your Apify
