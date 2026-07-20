@@ -589,6 +589,41 @@ def enabled_apify_sources(filters: dict) -> list[str]:
     return [k for k in ACTOR_MAP if enabled.get(k, False)]
 
 
+# Apify billing signals in an error string. When the account's prepaid monthly
+# usage credit is spent — or a configured ``maxMonthlyUsageUsd`` hard limit is
+# hit — the platform rejects run-sync calls with HTTP 402 and a usage-limit
+# error type. The block is ACCOUNT-level, so one such error means every actor
+# run is dead for the rest of the billing cycle. Matching the wire signal by
+# string is a transport/billing INVARIANT (cf. the ATS allowlist in
+# profile_builder), not a matching heuristic — a hardcoded marker set is the
+# right layer here, and the repo's "prefer prompts over hardcoded logic" rule
+# explicitly exempts HTTP transport invariants.
+_CREDIT_EXHAUSTED_MARKERS = (
+    "http 402",
+    "payment required",
+    "monthly-usage-hard-limit",
+    "monthly usage hard limit",
+    "usage-hard-limit-exceeded",
+    "insufficient-balance",
+    "not enough usage",
+)
+
+
+def credit_exhausted(errors: list[str] | None) -> bool:
+    """True if any Apify error string signals exhausted usage credit / a hit
+    monthly-usage hard limit (HTTP 402 or a usage-limit error type).
+
+    Account-level: a single such error means the whole Apify fetch is blocked
+    for this billing cycle, so the caller should fall back to the local
+    scrapers for the rest of the run.
+    """
+    for e in errors or []:
+        low = str(e).lower()
+        if any(m in low for m in _CREDIT_EXHAUSTED_MARKERS):
+            return True
+    return False
+
+
 def fetch_all_apify(
     filters: dict,
     *,

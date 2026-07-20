@@ -1272,6 +1272,63 @@ def _maybe_prewarm_subscriptions(store, tg, filters: dict) -> None:
         log.exception("prewarm: swallowed unexpected error")
 
 
+def _deliver_operator_notice(tg, store, text: str) -> None:
+    """Send a plain-text notice to the operator/self-hoster chat, gated exactly
+    like ``deliver_alert`` (``OPERATOR_CHAT_ID`` configured + ``alerts_enabled``
+    toggle on). Plain send (no MarkdownV2) so the text needs no escaping. Never
+    raises — a notification failure must not break the run it reports on."""
+    try:
+        from ops.operator import _operator_chat_id
+        op = _operator_chat_id()
+        if op is None:
+            return  # no operator/self-hoster configured → silently disabled
+        try:
+            if str(store.get_toggle("alerts_enabled", "1")) != "1":
+                return
+        except Exception:
+            log.exception("apify-notice: alerts_enabled read failed")
+            return
+        tg.send_plain(op, text)
+    except Exception:
+        log.exception("apify-notice: delivery failed (non-fatal)")
+
+
+def _note_apify_backend_health(store, tg, *, exhausted: bool) -> None:
+    """Announce an Apify→local (or local→Apify) switch to the self-hoster,
+    exactly ONCE per transition.
+
+    Apify credit exhaustion persists for the rest of the billing cycle, so an
+    hourly-deduped alert would page dozens of times over a multi-week outage.
+    Instead we persist a single bit in ``ops_toggles`` (``apify_fallback_active``)
+    and message only when it flips: one notice when scraping drops to local, one
+    when credits return and it climbs back to Apify. Best-effort — never raises.
+    """
+    try:
+        was = store.get_toggle("apify_fallback_active", "0") == "1"
+        if exhausted and not was:
+            store.set_toggle("apify_fallback_active", "1")
+            _deliver_operator_notice(
+                tg, store,
+                "⚠️ Apify credits ran out — job scraping switched to LOCAL mode "
+                "(it now runs from this machine's IP instead of Apify's cloud). "
+                "The bot keeps working, but cloud-only sources are unavailable and "
+                "local scraping is more likely to hit anti-bot blocks. Add credit "
+                "or upgrade your plan at https://apify.com to restore cloud scraping "
+                "— it switches back automatically once credits are available.",
+            )
+            log.warning("apify: credit exhausted — notified operator; run falling back to local")
+        elif not exhausted and was:
+            store.set_toggle("apify_fallback_active", "0")
+            _deliver_operator_notice(
+                tg, store,
+                "✅ Apify credits are available again — job scraping switched back "
+                "to CLOUD (Apify) mode.",
+            )
+            log.info("apify: credit restored — notified operator; back on cloud backend")
+    except Exception:
+        log.exception("apify backend-health note failed (non-fatal)")
+
+
 def run(
     dry_run: bool = False,
     only_chat: int | None = None,
@@ -1447,6 +1504,25 @@ def run(
                 store=store, pipeline_run_id=pctx.run_id, db=db,
                 cycle_index=cycle_index, user_queries=user_queries,
             )
+            # Apify credit exhaustion (HTTP 402 / monthly-usage hard limit) is
+            # account-level, so the global fetch's 402s mean every Apify source
+            # — including the per-user LinkedIn/web_search actors below — is
+            # blocked this cycle. Fall the WHOLE run back to the local scrapers
+            # (flip `fetch_backend` so those per-user paths follow) and tell the
+            # self-hoster once. Apify stays the default: the next run retries it
+            # and climbs back automatically when credits return.
+            if fetch_backend == "apify":
+                import apify_fetch as _af_health
+                if _af_health.credit_exhausted(errors):
+                    _note_apify_backend_health(store, tg, exhausted=True)
+                    fetch_backend = "local"
+                    jobs_raw, errors = _fetch_global(
+                        filters, backend="local",
+                        store=store, pipeline_run_id=pctx.run_id, db=db,
+                        cycle_index=cycle_index,
+                    )
+                else:
+                    _note_apify_backend_health(store, tg, exhausted=False)
             log.info("Raw fetched across static sources: %d postings (backend=%s)",
                      len(jobs_raw), fetch_backend)
             new_in_db = job_store.save_all(jobs_raw)
