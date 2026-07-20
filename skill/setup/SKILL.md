@@ -49,8 +49,12 @@ rather than re-explaining what's already there.
   those missing lines — never touch existing lines or values.
 - After the Telegram token is in, ask **once** (skippable in one word):
   > Optional: connect Apify to make scraping more reliable and unlock extra
-  > sources unscrapable without it. A free Apify account includes $5/month
-  > of usage credit, which covers typical personal use. Set it up? (y/skip)
+  > sources unscrapable without it. Apify runs the scrapers in the cloud
+  > instead of from your machine, so job sites see requests from Apify's
+  > infrastructure rather than your PC's IP — this avoids the antibot
+  > blocks (rate limits, CAPTCHAs, IP bans) that local scraping runs into.
+  > A free Apify account includes $5/month of usage credit, which covers
+  > typical personal use. Set it up? (y/skip)
 
   Be transparent: these are the same Apify actors the hosted Oink bot runs
   on, built by the Oink maintainer — usage is pay-per-result on your Apify
