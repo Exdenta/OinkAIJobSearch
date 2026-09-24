@@ -56,7 +56,7 @@
 |------|---------|------|
 | 🐷 [**Hosted bot**](https://t.me/job_search_everyday_bot) *(recommend to try)* | `/start` in Telegram, upload CV, done — zero setup, sources maintained for you | Free to try |
 | 🏢 [**oinkjobsearch.com**](https://oinkjobsearch.com) | A managed private instance: uptime, upgrades, and support handled for you | Free to try |
-| 🔌 [**Apify Actors**](#the-scrapers-as-an-api) | Standalone job data APIs for a source or a group of sources | See each Actor's Store listing |
+| 🔌 [**Apify Actors**](#the-scrapers-as-an-api) | Job listings for your own app, without the bot | Price varies by Actor |
 | 🛠️ **Self-host this repo** | Full control: your keys, your data, your prompts — see [Setup](#setup-self-hosting) | Free, only your Claude subscription |
 
 ## Who it's for
@@ -382,41 +382,38 @@ their `state/users/<chat_id>/` folder. To wipe job history, delete
 
 ## The scrapers, as an API
 
-The job-source [Apify Actors](https://apify.com/nomad-agent) can be used without
-the Telegram bot. Choose a single-source Actor for a board you already know,
-or a bundle when you want several sources in one dataset. The two product
-styles serve different data needs:
+Want job listings in your own app? You can run these
+[Apify Actors](https://apify.com/nomad-agent) without using the Telegram bot.
+Choose one site when you know where to look, or a bundle for jobs from several
+places.
 
-| Style | Best for | What you receive |
-|-------|----------|------------------|
-| **V1: direct job feeds** | Simple sourcing and first-pass job matching | Straightforward job rows from a source or focused bundle. Fields and filters depend on the Actor. |
-| **V3: normalized job data** | Combining sources, richer matching, and structured filtering | A common job record across normalized Actors. Check each listing for its current options. |
+**V1** keeps things simple: listings from a site or a focused bundle. Each
+Actor has its own fields. **V3** puts jobs from different sites in the same
+format, which makes them easier to combine, filter, and score.
 
-### V1: direct job feeds
+### V1: jobs from a site or bundle
 
-| Looking for | Actors to explore |
-|-------------|-------------------|
+| If you need | Try |
+|-------------|-----|
 | Company job boards | [Ashby](https://apify.com/nomad-agent/ashby-jobs-scraper), [Greenhouse](https://apify.com/nomad-agent/greenhouse-jobs-scraper), [Lever](https://apify.com/nomad-agent/lever-jobs-scraper), [Workable](https://apify.com/nomad-agent/workable-jobs-scraper) |
 | Technology and startup jobs | [LinkedIn](https://apify.com/nomad-agent/linkedin-scraper), [Built In](https://apify.com/nomad-agent/builtin-scraper), [Hacker News](https://apify.com/nomad-agent/hackernews-scraper), [Wellfound](https://apify.com/nomad-agent/wellfound-scraper) |
-| Research and public-interest roles | [EURAXESS](https://apify.com/nomad-agent/euraxess-scraper), [EURES](https://apify.com/nomad-agent/eures-scraper), [UN Careers](https://apify.com/nomad-agent/un-careers-scraper), [ReliefWeb](https://apify.com/nomad-agent/reliefweb-scraper) |
-| Broader coverage | [Web developer jobs](https://apify.com/nomad-agent/web-dev-bundle), [AI and ML jobs](https://apify.com/nomad-agent/ml-ai-dev-bundle), [remote jobs](https://apify.com/nomad-agent/remote-boards-scraper), [research jobs](https://apify.com/nomad-agent/researcher-bundle) |
+| Research, NGO, and public-sector jobs | [EURAXESS](https://apify.com/nomad-agent/euraxess-scraper), [EURES](https://apify.com/nomad-agent/eures-scraper), [UN Careers](https://apify.com/nomad-agent/un-careers-scraper), [ReliefWeb](https://apify.com/nomad-agent/reliefweb-scraper) |
+| Several sites at once | [Web developer jobs](https://apify.com/nomad-agent/web-dev-bundle), [AI and ML jobs](https://apify.com/nomad-agent/ml-ai-dev-bundle), [remote jobs](https://apify.com/nomad-agent/remote-boards-scraper), [research jobs](https://apify.com/nomad-agent/researcher-bundle) |
 
-### V3: normalized job data
+### V3: jobs in one format
 
-These Actors are designed for buyers who want a consistent job record across
-sources. Pick the source coverage you need, then use the Store listing to check
-the available inputs, sample output, and any optional processing.
+Start here if you're pulling jobs from more than one place. The fields line up,
+so you spend less time reshaping the results.
 
-| Looking for | Actors to explore |
-|-------------|-------------------|
+| If you need | Try |
+|-------------|-----|
 | Company job boards | [Ashby](https://apify.com/nomad-agent/normalized-ashby-jobs-scraper), [Greenhouse](https://apify.com/nomad-agent/normalized-greenhouse-jobs-scraper), [Lever](https://apify.com/nomad-agent/normalized-lever-jobs-scraper), [SmartRecruiters](https://apify.com/nomad-agent/normalized-smartrecruiters-jobs-scraper) |
 | European job boards | [EURACTIV](https://apify.com/nomad-agent/normalized-euractiv-jobs-scraper), [EuroBrussels](https://apify.com/nomad-agent/normalized-eurobrussels-jobs-scraper), [FashionJobs](https://apify.com/nomad-agent/normalized-fashionjobs-jobs-scraper), [Poslovi Infostud](https://apify.com/nomad-agent/normalized-infostud-jobs-scraper) |
-| Remote and technology boards | [Dynamite Jobs](https://apify.com/nomad-agent/normalized-dynamitejobs-jobs-scraper), [Himalayas](https://apify.com/nomad-agent/normalized-himalayas-jobs-scraper), [Jobgether](https://apify.com/nomad-agent/normalized-jobgether-jobs-scraper), [HelloWorld.rs](https://apify.com/nomad-agent/normalized-helloworld-jobs-scraper), [Manfred](https://apify.com/nomad-agent/normalized-manfred-jobs-scraper), [MLOps Community](https://apify.com/nomad-agent/normalized-mlops-community-jobs-scraper) |
-| Multiple sources in one call | [All Jobs Scraper](https://apify.com/nomad-agent/all-jobs-scraper) |
+| Remote and tech jobs | [Dynamite Jobs](https://apify.com/nomad-agent/normalized-dynamitejobs-jobs-scraper), [Himalayas](https://apify.com/nomad-agent/normalized-himalayas-jobs-scraper), [Jobgether](https://apify.com/nomad-agent/normalized-jobgether-jobs-scraper), [HelloWorld.rs](https://apify.com/nomad-agent/normalized-helloworld-jobs-scraper), [Manfred](https://apify.com/nomad-agent/normalized-manfred-jobs-scraper), [MLOps Community](https://apify.com/nomad-agent/normalized-mlops-community-jobs-scraper) |
+| Several sites at once | [All Jobs Scraper](https://apify.com/nomad-agent/all-jobs-scraper) |
 
-Browse the [full Actor catalogue](https://apify.com/nomad-agent) for more
-sources. Each Store listing is the current reference for its output, input
-options, and price.
+See the [full Actor list](https://apify.com/nomad-agent) for more sources.
+Each Actor page shows example results, filters, and the current price.
 
 ## Security notes
 
