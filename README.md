@@ -414,6 +414,10 @@ so you spend less time reshaping the results.
 See the [full Actor list](https://apify.com/nomad-agent) for more sources.
 Each Actor page shows example results, filters, and the current price.
 
+### More data Actors
+
+[Airbnb Scraper](https://apify.com/nomad-agent/airbnb-scraper) returns structured listings with location, date, guest and price filters. Detail mode adds descriptions, availability and optional reviews. See the [full guide and examples](docs/airbnb-scraper.md) or use the [agent setup skill](.agents/skills/public-apify-actors/SKILL.md).
+
 ## Security notes
 
 - `.env` contains your bot token — gitignored, don't commit it.
