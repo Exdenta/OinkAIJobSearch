@@ -387,33 +387,24 @@ Want job listings in your own app? You can run these
 Choose one site when you know where to look, or a bundle for jobs from several
 places.
 
-**V1** keeps things simple: listings from a site or a focused bundle. Each
-Actor has its own fields. **V3** puts jobs from different sites in the same
-format, which makes them easier to combine, filter, and score.
-
-### V1: jobs from a site or bundle
+**Simple job Actors** return source facts and original descriptions in flat rows. Most current simple feeds use `nomad-agent-job-row-v3`; the row version does not imply AI processing. **Normalized job Actors** use the nested `nomad-agent-job-v1` format for combining sources and advanced filtering. AI search and fit scoring have their own inputs and results.
 
 | If you need | Try |
-|-------------|-----|
-| Company job boards | [Ashby](https://apify.com/nomad-agent/ashby-jobs-scraper), [Greenhouse](https://apify.com/nomad-agent/greenhouse-jobs-scraper), [Lever](https://apify.com/nomad-agent/lever-jobs-scraper), [Workable](https://apify.com/nomad-agent/workable-jobs-scraper) |
-| Technology and startup jobs | [LinkedIn](https://apify.com/nomad-agent/linkedin-scraper), [Built In](https://apify.com/nomad-agent/builtin-scraper), [Hacker News](https://apify.com/nomad-agent/hackernews-scraper), [Wellfound](https://apify.com/nomad-agent/wellfound-scraper) |
-| Research, NGO, and public-sector jobs | [EURAXESS](https://apify.com/nomad-agent/euraxess-scraper), [EURES](https://apify.com/nomad-agent/eures-scraper), [UN Careers](https://apify.com/nomad-agent/un-careers-scraper), [ReliefWeb](https://apify.com/nomad-agent/reliefweb-scraper) |
-| Several sites at once | [Web developer jobs](https://apify.com/nomad-agent/web-dev-bundle), [AI and ML jobs](https://apify.com/nomad-agent/ml-ai-dev-bundle), [remote jobs](https://apify.com/nomad-agent/remote-boards-scraper), [research jobs](https://apify.com/nomad-agent/researcher-bundle) |
+| --- | --- |
+| Source facts from company job boards | [Ashby](https://apify.com/nomad-agent/ashby-jobs-scraper), [Greenhouse](https://apify.com/nomad-agent/greenhouse-jobs-scraper), [Lever](https://apify.com/nomad-agent/lever-jobs-scraper), [Workable](https://apify.com/nomad-agent/workable-jobs-scraper) |
+| Simple technology and startup feeds | [LinkedIn](https://apify.com/nomad-agent/linkedin-scraper), [Built In](https://apify.com/nomad-agent/builtin-scraper), [Hacker News](https://apify.com/nomad-agent/hackernews-scraper), [Wellfound](https://apify.com/nomad-agent/wellfound-scraper) |
+| Simple research and NGO feeds | [EURAXESS](https://apify.com/nomad-agent/euraxess-scraper), [UN Careers](https://apify.com/nomad-agent/un-careers-scraper), [ReliefWeb](https://apify.com/nomad-agent/reliefweb-scraper), [UNjobs](https://apify.com/nomad-agent/unjobs-scraper) |
+| Simple jobs from several sources | [All Jobs](https://apify.com/nomad-agent/all-jobs-scraper), [Web developer](https://apify.com/nomad-agent/web-dev-bundle), [AI and ML](https://apify.com/nomad-agent/ml-ai-dev-bundle), [Remote boards](https://apify.com/nomad-agent/remote-boards-scraper), [Research](https://apify.com/nomad-agent/researcher-bundle) |
+| Normalized job data | [LinkedIn](https://apify.com/jobatlas/linkedin-enrich-translate-normalize-scraper), [EURAXESS](https://apify.com/jobatlas/euraxess-enrich-translate-normalize-scraper), [Y Combinator](https://apify.com/jobatlas/ycombinator-enrich-translate-normalize-scraper), plus the source Actors in the directory below |
+| Candidate-specific AI results | [AI Job Search Agent](https://apify.com/nomad-agent/ai-job-search-agent), [AI Job Search & Fit Scorer](https://apify.com/jobatlas/ai-job-fit-scorer) |
 
-### V3: jobs in one format
+The [complete public Actor directory](docs/public-actors.md) describes all 76 public Nomad Agent Actors and 17 public Job Atlas copies, checked on 4 October 2026. It includes property, legal, finance, search, marketing, menu and data-sync products as well as jobs. Use the [setup guide](docs/public-actors-setup.md) or [generic Actor skill](.agents/skills/public-apify-actors/SKILL.md) with the exact Actor's current input schema and pricing. The directory check verified public metadata; it did not run Actors or test delivery to an application.
 
-Start here if you're pulling jobs from more than one place. The fields line up,
-so you spend less time reshaping the results.
+### More data Actors
 
-| If you need | Try |
-|-------------|-----|
-| Company job boards | [Ashby](https://apify.com/nomad-agent/normalized-ashby-jobs-scraper), [Greenhouse](https://apify.com/nomad-agent/normalized-greenhouse-jobs-scraper), [Lever](https://apify.com/nomad-agent/normalized-lever-jobs-scraper), [SmartRecruiters](https://apify.com/nomad-agent/normalized-smartrecruiters-jobs-scraper) |
-| European job boards | [EURACTIV](https://apify.com/nomad-agent/normalized-euractiv-jobs-scraper), [EuroBrussels](https://apify.com/nomad-agent/normalized-eurobrussels-jobs-scraper), [FashionJobs](https://apify.com/nomad-agent/normalized-fashionjobs-jobs-scraper), [Poslovi Infostud](https://apify.com/nomad-agent/normalized-infostud-jobs-scraper) |
-| Remote and tech jobs | [Dynamite Jobs](https://apify.com/nomad-agent/normalized-dynamitejobs-jobs-scraper), [Himalayas](https://apify.com/nomad-agent/normalized-himalayas-jobs-scraper), [Jobgether](https://apify.com/nomad-agent/normalized-jobgether-jobs-scraper), [HelloWorld.rs](https://apify.com/nomad-agent/normalized-helloworld-jobs-scraper), [Manfred](https://apify.com/nomad-agent/normalized-manfred-jobs-scraper), [MLOps Community](https://apify.com/nomad-agent/normalized-mlops-community-jobs-scraper) |
-| Several sites at once | [All Jobs Scraper](https://apify.com/nomad-agent/all-jobs-scraper) |
+[Airbnb Scraper](https://apify.com/nomad-agent/airbnb-scraper) returns structured listings with location, date, guest and price filters. Detail mode adds descriptions, availability and optional reviews. See the [full guide and examples](docs/airbnb-scraper.md) or use the [agent setup skill](.agents/skills/public-apify-actors/SKILL.md).
 
-See the [full Actor list](https://apify.com/nomad-agent) for more sources.
-Each Actor page shows example results, filters, and the current price.
+[UK Case Law Scraper](https://apify.com/nomad-agent/uk-case-law-scraper) searches The National Archives' Find Case Law judgments by court, party, judge, citation and date, with optional full text and legislation references. See the [full guide and examples](docs/uk-case-law-scraper.md) or use the [agent setup skill](.agents/skills/public-apify-actors/SKILL.md).
 
 ## Security notes
 
@@ -442,3 +433,7 @@ Required Notice: Copyright Lex Sherman
 or [try the live bot](https://t.me/job_search_everyday_bot) and tell a friend.
 
 </div>
+
+### UK case-law data
+
+[UK Case Law Scraper](https://apify.com/nomad-agent/uk-case-law-scraper) searches The National Archives' Find Case Law judgments by court, party, judge, citation and date, with optional full text and legislation references. See the [full guide and examples](docs/uk-case-law-scraper.md) or use the [agent setup skill](.agents/skills/public-apify-actors/SKILL.md).

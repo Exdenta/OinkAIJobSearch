@@ -1,0 +1,937 @@
+{
+  "schemaVersion": "public-actor-directory-v1",
+  "observedOn": "2026-10-04",
+  "evidenceBoundary": "Public identity, visibility and listing metadata checked using read-only Apify API calls. Descriptions summarize public capabilities; this check did not run Actors, verify complete coverage, test optional modes or write to destinations. Read the current input schema and Pricing tab before use.",
+  "actors": [
+    {
+      "owner": "nomad-agent",
+      "slug": "ai-job-search-agent",
+      "actorId": "ndPGqZvxgTdsgqtd3",
+      "url": "https://apify.com/nomad-agent/ai-job-search-agent",
+      "title": "AI Job Search Agent — No API Key Needed",
+      "family": "AI job search",
+      "description": "Search for jobs against a resume and return AI match scores, reasoning and posting links. AI processing is included; this has its own input and output, separate from the simple Job Search Actor.",
+      "deprecated": false
+    },
+    {
+      "owner": "jobatlas",
+      "slug": "ai-job-fit-scorer",
+      "actorId": "OZ919PaAyAbifOdcL",
+      "url": "https://apify.com/jobatlas/ai-job-fit-scorer",
+      "title": "AI Job Search & Fit Scorer — 10 Sources + AI Matching",
+      "family": "Job fit scoring",
+      "description": "Search developer-job sources or score supplied jobs against a resume or profile. Returns a ranked shortlist with fit scores, requirement checks, evidence and skill gaps; an audit mode is available. No customer model key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "ai-job-fit-scorer",
+      "actorId": "mBRj1sgHTWmoPJEcb",
+      "url": "https://apify.com/nomad-agent/ai-job-fit-scorer",
+      "title": "AI Job Search & Fit Scorer — 10 Sources + AI Matching",
+      "family": "Job fit scoring",
+      "description": "Search developer-job sources or score supplied jobs against a resume or profile. Returns a ranked shortlist with fit scores, requirement checks, evidence and skill gaps; an audit mode is available. No customer model key.",
+      "deprecated": false
+    },
+    {
+      "owner": "jobatlas",
+      "slug": "euraxess-enrich-translate-normalize-scraper",
+      "actorId": "Slu3SAWULLRYnCN9Y",
+      "url": "https://apify.com/jobatlas/euraxess-enrich-translate-normalize-scraper",
+      "title": "EURAXESS Jobs Scraper | Full Details & AI Enrichment",
+      "family": "Normalized jobs",
+      "description": "Search EURAXESS PhD, postdoc and faculty vacancies with deadlines, funding and application links. Export structured data, avoid repeat alerts, and optionally add AI enrichment or English translation.",
+      "deprecated": false
+    },
+    {
+      "owner": "jobatlas",
+      "slug": "linkedin-enrich-translate-normalize-scraper",
+      "actorId": "KMflYVTHiIAXE6nKN",
+      "url": "https://apify.com/jobatlas/linkedin-enrich-translate-normalize-scraper",
+      "title": "LinkedIn Jobs Scraper | AI Enrichment",
+      "family": "Normalized jobs",
+      "description": "Get up to 1,000 LinkedIn jobs per run with full descriptions and original links. Skip repeat jobs for alerts, job boards, and spreadsheets. Add AI enrichment and English translation when needed.",
+      "deprecated": false
+    },
+    {
+      "owner": "jobatlas",
+      "slug": "normalized-ashby-jobs-scraper",
+      "actorId": "OevYsTbGinfu6UPQd",
+      "url": "https://apify.com/jobatlas/normalized-ashby-jobs-scraper",
+      "title": "Ashby Jobs | Normalized",
+      "family": "Normalized jobs",
+      "description": "Unofficial independent Actor for bounded public Ashby job searches. Returns strict normalized records with source links, descriptions, dates, locations, compensation when published, and application details.",
+      "deprecated": false
+    },
+    {
+      "owner": "jobatlas",
+      "slug": "normalized-dynamitejobs-jobs-scraper",
+      "actorId": "IpwQZHpkkNSwKaMM3",
+      "url": "https://apify.com/jobatlas/normalized-dynamitejobs-jobs-scraper",
+      "title": "Dynamite Jobs | Normalized",
+      "family": "Normalized jobs",
+      "description": "Unofficial independent Actor for bounded public Dynamite Jobs searches. Returns strict normalized records with source links, descriptions, dates, locations, compensation when published, and application details.",
+      "deprecated": false
+    },
+    {
+      "owner": "jobatlas",
+      "slug": "normalized-euractiv-jobs-scraper",
+      "actorId": "sAmkfZKybTW9cHb37",
+      "url": "https://apify.com/jobatlas/normalized-euractiv-jobs-scraper",
+      "title": "EURACTIV Jobs | Normalized",
+      "family": "Normalized jobs",
+      "description": "Find EURACTIV jobs with complete original descriptions, HTML, locations and source links. Rich normalized data, advanced filters, optional owner-funded AI enrichment and English display translation, both off by default.",
+      "deprecated": false
+    },
+    {
+      "owner": "jobatlas",
+      "slug": "normalized-eurobrussels-jobs-scraper",
+      "actorId": "vwfm2MxO4c9EEigXg",
+      "url": "https://apify.com/jobatlas/normalized-eurobrussels-jobs-scraper",
+      "title": "EuroBrussels Jobs | Normalized",
+      "family": "Normalized jobs",
+      "description": "Find EuroBrussels jobs with complete original descriptions and advanced filters. Rich normalized data with optional owner-funded AI enrichment and English display translation, both off by default.",
+      "deprecated": false
+    },
+    {
+      "owner": "jobatlas",
+      "slug": "normalized-fashionjobs-jobs-scraper",
+      "actorId": "RMfnnrTz467ZcPQFP",
+      "url": "https://apify.com/jobatlas/normalized-fashionjobs-jobs-scraper",
+      "title": "FashionJobs | Normalized",
+      "family": "Normalized jobs",
+      "description": "Unofficial independent Actor for bounded public FashionJobs searches. Returns strict normalized records with source links, descriptions, dates, locations, compensation when published, and application details.",
+      "deprecated": false
+    },
+    {
+      "owner": "jobatlas",
+      "slug": "normalized-helloworld-jobs-scraper",
+      "actorId": "qePFRkmFju2UBYvlm",
+      "url": "https://apify.com/jobatlas/normalized-helloworld-jobs-scraper",
+      "title": "HelloWorld.rs Jobs | Normalized",
+      "family": "Normalized jobs",
+      "description": "Find HelloWorld.rs jobs with complete original descriptions, HTML, locations and source links. Rich normalized data, advanced filters, optional owner-funded AI enrichment and English display translation, both off by default.",
+      "deprecated": false
+    },
+    {
+      "owner": "jobatlas",
+      "slug": "normalized-himalayas-jobs-scraper",
+      "actorId": "MQPgX54hf69Gt8vkg",
+      "url": "https://apify.com/jobatlas/normalized-himalayas-jobs-scraper",
+      "title": "Himalayas Jobs | Normalized",
+      "family": "Normalized jobs",
+      "description": "Unofficial independent Actor for bounded public Himalayas job searches. Returns strict normalized records with source links, descriptions, dates, locations, compensation when published, and application details.",
+      "deprecated": false
+    },
+    {
+      "owner": "jobatlas",
+      "slug": "normalized-infostud-jobs-scraper",
+      "actorId": "OunbuA4cIXZZBDV3p",
+      "url": "https://apify.com/jobatlas/normalized-infostud-jobs-scraper",
+      "title": "Poslovi Infostud Jobs | Normalized",
+      "family": "Normalized jobs",
+      "description": "Find Poslovi Infostud jobs with complete original descriptions, HTML, locations and source links. Rich normalized data, advanced filters, optional owner-funded AI enrichment and optional English display translation, both off by default.",
+      "deprecated": false
+    },
+    {
+      "owner": "jobatlas",
+      "slug": "normalized-jobgether-jobs-scraper",
+      "actorId": "e3L8nyjTnjbJ5ZiV4",
+      "url": "https://apify.com/jobatlas/normalized-jobgether-jobs-scraper",
+      "title": "Jobgether Jobs | Normalized",
+      "family": "Normalized jobs",
+      "description": "Unofficial independent Actor for bounded public Jobgether job searches. Returns strict normalized records with source links, descriptions, dates, locations, compensation when published, and application details.",
+      "deprecated": false
+    },
+    {
+      "owner": "jobatlas",
+      "slug": "normalized-lever-jobs-scraper",
+      "actorId": "XkRY12lbdved0Gbqq",
+      "url": "https://apify.com/jobatlas/normalized-lever-jobs-scraper",
+      "title": "Lever Jobs | Normalized",
+      "family": "Normalized jobs",
+      "description": "Unofficial independent Actor for bounded public Lever job searches. Returns strict normalized records with source links, descriptions, dates, locations, compensation when published, and application details.",
+      "deprecated": false
+    },
+    {
+      "owner": "jobatlas",
+      "slug": "normalized-manfred-jobs-scraper",
+      "actorId": "ksmcyvFu25NQN2cMJ",
+      "url": "https://apify.com/jobatlas/normalized-manfred-jobs-scraper",
+      "title": "Manfred Jobs | Normalized",
+      "family": "Normalized jobs",
+      "description": "Search Manfred jobs with complete original descriptions, advanced filters, optional owner-funded AI enrichment, and optional English display translation. AI and translation default off. Unofficial independent Actor.",
+      "deprecated": false
+    },
+    {
+      "owner": "jobatlas",
+      "slug": "normalized-mlops-community-jobs-scraper",
+      "actorId": "gbr9thwZuAsInMHJz",
+      "url": "https://apify.com/jobatlas/normalized-mlops-community-jobs-scraper",
+      "title": "MLOps Community Jobs | Normalized",
+      "family": "Normalized jobs",
+      "description": "Unofficial independent Actor for bounded public MLOps Community job searches. Returns strict normalized records with source links, descriptions, dates, locations, compensation when published, and application details.",
+      "deprecated": false
+    },
+    {
+      "owner": "jobatlas",
+      "slug": "normalized-smartrecruiters-jobs-scraper",
+      "actorId": "8AajXDZh2eVT3h1Vr",
+      "url": "https://apify.com/jobatlas/normalized-smartrecruiters-jobs-scraper",
+      "title": "SmartRecruiters Jobs | Normalized",
+      "family": "Normalized jobs",
+      "description": "Unofficial independent Actor for bounded public SmartRecruiters job searches. Returns strict normalized records with source links, descriptions, dates, locations, compensation when published, and application details.",
+      "deprecated": false
+    },
+    {
+      "owner": "jobatlas",
+      "slug": "ycombinator-enrich-translate-normalize-scraper",
+      "actorId": "pF4Lk4ifzb9tZXg7K",
+      "url": "https://apify.com/jobatlas/ycombinator-enrich-translate-normalize-scraper",
+      "title": "Y Combinator Jobs Scraper | Pipelines & Alerts",
+      "family": "Normalized jobs",
+      "description": "Get up to 1,000 Y Combinator startup jobs per run for recruiting pipelines, job boards, and recurring alerts. Export complete descriptions, salary ranges, company details, and source links, with optional AI enrichment and cross-run deduplication.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "euraxess-enrich-translate-normalize-scraper",
+      "actorId": "2JPXQf3gbDCUAi57w",
+      "url": "https://apify.com/nomad-agent/euraxess-enrich-translate-normalize-scraper",
+      "title": "EURAXESS Jobs Scraper | Full Details & AI Enrichment",
+      "family": "Normalized jobs",
+      "description": "Search EURAXESS PhD, postdoc and faculty vacancies with deadlines, funding and application links. Export structured data, avoid repeat alerts, and optionally add AI enrichment or English translation.",
+      "deprecated": true
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "linkedin-enrich-translate-normalize-scraper",
+      "actorId": "kqIdAA2UQiPdOtzEB",
+      "url": "https://apify.com/nomad-agent/linkedin-enrich-translate-normalize-scraper",
+      "title": "LinkedIn Jobs Scraper | AI Enrichment",
+      "family": "Normalized jobs",
+      "description": "Get up to 1,000 LinkedIn jobs per run with full descriptions and original links. Skip repeat jobs for alerts, job boards, and spreadsheets. Add AI enrichment and English translation when needed.",
+      "deprecated": true
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "normalized-ashby-jobs-scraper",
+      "actorId": "gHlWs86RIjfrPLCGz",
+      "url": "https://apify.com/nomad-agent/normalized-ashby-jobs-scraper",
+      "title": "Ashby Jobs | Normalized",
+      "family": "Normalized jobs",
+      "description": "Unofficial independent Actor for bounded public Ashby job searches. Returns strict normalized records with source links, descriptions, dates, locations, compensation when published, and application details.",
+      "deprecated": true
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "normalized-dynamitejobs-jobs-scraper",
+      "actorId": "Ziz8RHn8g2EDrRAN1",
+      "url": "https://apify.com/nomad-agent/normalized-dynamitejobs-jobs-scraper",
+      "title": "Dynamite Jobs | Normalized",
+      "family": "Normalized jobs",
+      "description": "Unofficial independent Actor for bounded public Dynamite Jobs searches. Returns strict normalized records with source links, descriptions, dates, locations, compensation when published, and application details.",
+      "deprecated": true
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "normalized-euractiv-jobs-scraper",
+      "actorId": "r9QX393fOiLyU6ZWr",
+      "url": "https://apify.com/nomad-agent/normalized-euractiv-jobs-scraper",
+      "title": "EURACTIV Jobs | Normalized",
+      "family": "Normalized jobs",
+      "description": "Find EURACTIV jobs with complete original descriptions, HTML, locations and source links. Rich normalized data, advanced filters, optional owner-funded AI enrichment and English display translation, both off by default.",
+      "deprecated": true
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "normalized-eurobrussels-jobs-scraper",
+      "actorId": "iWrmyEdbYouugToo2",
+      "url": "https://apify.com/nomad-agent/normalized-eurobrussels-jobs-scraper",
+      "title": "EuroBrussels Jobs | Normalized",
+      "family": "Normalized jobs",
+      "description": "Find EuroBrussels jobs with complete original descriptions and advanced filters. Rich normalized data with optional owner-funded AI enrichment and English display translation, both off by default.",
+      "deprecated": true
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "normalized-fashionjobs-jobs-scraper",
+      "actorId": "VUzDDJLIyrb5XSgap",
+      "url": "https://apify.com/nomad-agent/normalized-fashionjobs-jobs-scraper",
+      "title": "FashionJobs | Normalized",
+      "family": "Normalized jobs",
+      "description": "Unofficial independent Actor for bounded public FashionJobs searches. Returns strict normalized records with source links, descriptions, dates, locations, compensation when published, and application details.",
+      "deprecated": true
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "normalized-greenhouse-jobs-scraper",
+      "actorId": "GvgSBMMNx4tG1opbL",
+      "url": "https://apify.com/nomad-agent/normalized-greenhouse-jobs-scraper",
+      "title": "Greenhouse Jobs | Normalized",
+      "family": "Normalized jobs",
+      "description": "Search Greenhouse jobs from supported boards with complete original descriptions, normalized fields and advanced filters. Optional owner-funded AI enrichment and English translation are off by default.",
+      "deprecated": true
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "normalized-helloworld-jobs-scraper",
+      "actorId": "XN9UtAPZRUaeHNuH8",
+      "url": "https://apify.com/nomad-agent/normalized-helloworld-jobs-scraper",
+      "title": "HelloWorld.rs Jobs | Normalized",
+      "family": "Normalized jobs",
+      "description": "Find HelloWorld.rs jobs with complete original descriptions, HTML, locations and source links. Rich normalized data, advanced filters, optional owner-funded AI enrichment and English display translation, both off by default.",
+      "deprecated": true
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "normalized-himalayas-jobs-scraper",
+      "actorId": "fquuyCUScJ4QcGENV",
+      "url": "https://apify.com/nomad-agent/normalized-himalayas-jobs-scraper",
+      "title": "Himalayas Jobs | Normalized",
+      "family": "Normalized jobs",
+      "description": "Unofficial independent Actor for bounded public Himalayas job searches. Returns strict normalized records with source links, descriptions, dates, locations, compensation when published, and application details.",
+      "deprecated": true
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "normalized-infostud-jobs-scraper",
+      "actorId": "9ewTLFPWxS94mJ3Li",
+      "url": "https://apify.com/nomad-agent/normalized-infostud-jobs-scraper",
+      "title": "Poslovi Infostud Jobs | Normalized",
+      "family": "Normalized jobs",
+      "description": "Find Poslovi Infostud jobs with complete original descriptions, HTML, locations and source links. Rich normalized data, advanced filters, optional owner-funded AI enrichment and optional English display translation, both off by default.",
+      "deprecated": true
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "normalized-jobgether-jobs-scraper",
+      "actorId": "ocoBtcw1giBHmK8Cw",
+      "url": "https://apify.com/nomad-agent/normalized-jobgether-jobs-scraper",
+      "title": "Jobgether Jobs | Normalized",
+      "family": "Normalized jobs",
+      "description": "Unofficial independent Actor for bounded public Jobgether job searches. Returns strict normalized records with source links, descriptions, dates, locations, compensation when published, and application details.",
+      "deprecated": true
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "normalized-lever-jobs-scraper",
+      "actorId": "avdK0YtwFvg27wFJL",
+      "url": "https://apify.com/nomad-agent/normalized-lever-jobs-scraper",
+      "title": "Lever Jobs | Normalized",
+      "family": "Normalized jobs",
+      "description": "Unofficial independent Actor for bounded public Lever job searches. Returns strict normalized records with source links, descriptions, dates, locations, compensation when published, and application details.",
+      "deprecated": true
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "normalized-manfred-jobs-scraper",
+      "actorId": "1PpKsaa1ty6sJJsvr",
+      "url": "https://apify.com/nomad-agent/normalized-manfred-jobs-scraper",
+      "title": "Manfred Jobs | Normalized",
+      "family": "Normalized jobs",
+      "description": "Search Manfred jobs with complete original descriptions, advanced filters, optional owner-funded AI enrichment, and optional English display translation. AI and translation default off. Unofficial independent Actor.",
+      "deprecated": true
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "normalized-mlops-community-jobs-scraper",
+      "actorId": "gDRJQboYWtCVG0kxI",
+      "url": "https://apify.com/nomad-agent/normalized-mlops-community-jobs-scraper",
+      "title": "MLOps Community Jobs | Normalized",
+      "family": "Normalized jobs",
+      "description": "Unofficial independent Actor for bounded public MLOps Community job searches. Returns strict normalized records with source links, descriptions, dates, locations, compensation when published, and application details.",
+      "deprecated": true
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "normalized-smartrecruiters-jobs-scraper",
+      "actorId": "GJfpV4kcw7C70pqpf",
+      "url": "https://apify.com/nomad-agent/normalized-smartrecruiters-jobs-scraper",
+      "title": "SmartRecruiters Jobs | Normalized",
+      "family": "Normalized jobs",
+      "description": "Unofficial independent Actor for bounded public SmartRecruiters job searches. Returns strict normalized records with source links, descriptions, dates, locations, compensation when published, and application details.",
+      "deprecated": true
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "ycombinator-enrich-translate-normalize-scraper",
+      "actorId": "2YcCZK4Hsuxs5jU8L",
+      "url": "https://apify.com/nomad-agent/ycombinator-enrich-translate-normalize-scraper",
+      "title": "Y Combinator Jobs Scraper | Pipelines & Alerts",
+      "family": "Normalized jobs",
+      "description": "Get Y Combinator startup jobs for recruiting pipelines, job boards, and recurring alerts. Export complete descriptions, salary ranges, company details, and source links in a consistent format, with optional AI enrichment and cross-run deduplication.",
+      "deprecated": true
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "airbnb-scraper",
+      "actorId": "3bs4HXTse68yuJO5a",
+      "url": "https://apify.com/nomad-agent/airbnb-scraper",
+      "title": "Airbnb Scraper — Listings Search, Detail & Reviews",
+      "family": "Property",
+      "description": "Search Airbnb listings by location or map area, dates, guests, price and room filters. Detail mode adds host information, amenities, calendar and optional reviews.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "buyrentkenya-scraper",
+      "actorId": "cuPN1pJ8rsyE4ZIqW",
+      "url": "https://apify.com/nomad-agent/buyrentkenya-scraper",
+      "title": "BuyRentKenya Property Scraper — Kenya Real Estate",
+      "family": "Property",
+      "description": "Find Kenyan houses, flats, land and commercial property for sale or rent. Filter by location, price, rooms and area; optional details include contacts, images and amenities. Preserves source currency.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "ptab-trials-scraper",
+      "actorId": "muANU3J0qDyFF4SHH",
+      "url": "https://apify.com/nomad-agent/ptab-trials-scraper",
+      "title": "PTAB Trials Scraper — USPTO IPR/PGR Tracker + Webhook Alerts",
+      "family": "Public records",
+      "description": "Retrieve USPTO PTAB proceedings, parties, status, dates and institution or final-written decisions. Supports webhook snapshots; requires a USPTO Open Data Portal API key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "spac-redemptions-scraper",
+      "actorId": "K8FMIbPlClOVHX0Tc",
+      "url": "https://apify.com/nomad-agent/spac-redemptions-scraper",
+      "title": "SPAC Redemptions Scraper — SEC EDGAR Lifecycle Tracker",
+      "family": "Public records",
+      "description": "Retrieve SEC EDGAR SPAC filings, merger communications, meeting dates and reported redemption figures. Missing financial values remain unavailable.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "uk-case-law-scraper",
+      "actorId": "6yiUR9P1imsGHYvat",
+      "url": "https://apify.com/nomad-agent/uk-case-law-scraper",
+      "title": "UK Case Law Scraper — BAILII Alternative, Judgments API",
+      "family": "Public records",
+      "description": "Search The National Archives Find Case Law judgments by court, party, judge, date and citation. Returns links with optional judgment text and legislation references.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "uk-nhs-ods-providers-scraper",
+      "actorId": "E7mk8wI2cEebmhgwD",
+      "url": "https://apify.com/nomad-agent/uk-nhs-ods-providers-scraper",
+      "title": "NHS UK Providers Scraper — GP, Pharmacy, Dentist, Care Home",
+      "family": "Public records",
+      "description": "Search the NHS ODS provider directory by name, postcode or provider type. Returns ODS codes, addresses and published phone numbers.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "ai-menu-parser",
+      "actorId": "71WySDIdIJed34QxE",
+      "url": "https://apify.com/nomad-agent/ai-menu-parser",
+      "title": "AI Restaurant Menu Parser — Dishes, Prices & Allergens",
+      "family": "Restaurant menus and photos",
+      "description": "Convert menu photos to dishes, prices, translated names, ingredients and estimated allergens or nutrition. Requires your Gemini API key; verify dietary information with the venue.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "ai-menu-parser-flat",
+      "actorId": "oAbvV2D7hIaKXp9gu",
+      "url": "https://apify.com/nomad-agent/ai-menu-parser-flat",
+      "title": "AI Menu Parser — Flat Price per Menu, No API Key",
+      "family": "Restaurant menus and photos",
+      "description": "Convert menu photos to structured dishes and translated menu data with a flat per-menu charge on success. No customer model key; allergens and nutrition are estimates.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "ai-menu-parser-managed",
+      "actorId": "vU3BLmDBOHLrGEW3S",
+      "url": "https://apify.com/nomad-agent/ai-menu-parser-managed",
+      "title": "AI Restaurant Menu Parser — Dishes & Allergens, No API Key",
+      "family": "Restaurant menus and photos",
+      "description": "Convert menu photos to structured dishes, prices, translated names, ingredients and estimated allergens or nutrition. AI processing is included; no customer model key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "dish-photo-matcher",
+      "actorId": "wV73mdUcIFIasghn1",
+      "url": "https://apify.com/nomad-agent/dish-photo-matcher",
+      "title": "Restaurant Dish Photo Matcher — Photos to Menu Items",
+      "family": "Restaurant menus and photos",
+      "description": "Match supplied restaurant photos or Google Maps photo URLs to menu items and return photo-to-dish pairs. Requires your Gemini API key; review matches before use.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "dish-photo-matcher-managed",
+      "actorId": "KvFG9JSMHCq8xycWy",
+      "url": "https://apify.com/nomad-agent/dish-photo-matcher-managed",
+      "title": "Dish Photo Matcher — Google Maps Food Photos to Menu Items",
+      "family": "Restaurant menus and photos",
+      "description": "Match restaurant photos to menu items and return photo-to-dish pairs. Accepts photo URLs or a Google Maps place plus your menu; no customer model key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "google-maps-menu-scraper",
+      "actorId": "aSJyVFUARbUPj7wLq",
+      "url": "https://apify.com/nomad-agent/google-maps-menu-scraper",
+      "title": "Google Maps Menu Scraper — Place to Structured Menu API",
+      "family": "Restaurant menus and photos",
+      "description": "Turn Google Maps menu photos into structured dishes, prices, translated names, ingredients and estimated allergens or nutrition. Requires your Gemini API key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "google-maps-menu-scraper-managed",
+      "actorId": "N0aT1gxJVjceekSjo",
+      "url": "https://apify.com/nomad-agent/google-maps-menu-scraper-managed",
+      "title": "Google Maps Menu Scraper — Allergens, Nutrition, No API Key",
+      "family": "Restaurant menus and photos",
+      "description": "Turn Google Maps menu photos into structured menu data with translated names, prices and estimated allergens or nutrition. AI processing is included; no customer model key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "bluesky-scraper",
+      "actorId": "f19IJjXRlq6HENuVf",
+      "url": "https://apify.com/nomad-agent/bluesky-scraper",
+      "title": "Bluesky Scraper — Posts, Profiles, Threads & Followers",
+      "family": "Search, marketing and data tools",
+      "description": "Search Bluesky posts and retrieve account feeds, reply threads, custom feeds, profiles and followers with engagement and media fields. No login required.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "google-play-aso-scraper",
+      "actorId": "mMPshpzpRQUk4LgSc",
+      "url": "https://apify.com/nomad-agent/google-play-aso-scraper",
+      "title": "Google Play ASO Keyword Rank Tracker & Reviews Scraper",
+      "family": "Search, marketing and data tools",
+      "description": "Track Google Play keyword rankings and retrieve app details, reviews, ratings, charts, related apps and permissions across countries. Popularity, install and revenue figures are estimates.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "newsletter-sponsors-scraper",
+      "actorId": "5nhNZ2iDIPbNUqRX9",
+      "url": "https://apify.com/nomad-agent/newsletter-sponsors-scraper",
+      "title": "Newsletter Sponsor Finder — InboxReads Directory Scraper",
+      "family": "Search, marketing and data tools",
+      "description": "Find InboxReads newsletters open to sponsorship, cross-promotion or sale. Includes topics, cadence, audience geography, ad-platform signals and published sponsor contacts.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "openai-vector-store-safe-sync",
+      "actorId": "w2xkn3NZ83xeyBJKC",
+      "url": "https://apify.com/nomad-agent/openai-vector-store-safe-sync",
+      "title": "Apify Dataset to OpenAI Vector Store Sync",
+      "family": "Search, marketing and data tools",
+      "description": "Sync selected Apify Dataset fields to an existing OpenAI Vector Store. Supports preview and resumable updates; requires destination access and writes only when explicitly configured.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "serp-multi-engine-scraper",
+      "actorId": "pC7aLjYo7nTZE7nWO",
+      "url": "https://apify.com/nomad-agent/serp-multi-engine-scraper",
+      "title": "Bing, DuckDuckGo, Baidu & Yahoo SERP Scraper — One Run",
+      "family": "Search, marketing and data tools",
+      "description": "Search Bing, DuckDuckGo, Baidu and Yahoo with region, language, device and pagination controls. Returns result rank, title, URL, snippet, page and search engine.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "academicpositions-scraper",
+      "actorId": "EkHXeGeaBlTu4QsvW",
+      "url": "https://apify.com/nomad-agent/academicpositions-scraper",
+      "title": "AcademicPositions Job Scraper — EU Academic Jobs",
+      "family": "Simple and source-specific jobs",
+      "description": "Recent AcademicPositions academic jobs with complete original descriptions (text and HTML), locations, posting dates and source links. Filter by keywords, location, remote, job type and posting age. Only verified postings; repeats are suppressed. No login or API key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "ai-jobs-net-scraper",
+      "actorId": "6W8kNgo85VjHlIqlq",
+      "url": "https://apify.com/nomad-agent/ai-jobs-net-scraper",
+      "title": "AI Jobs Scraper (aijobs.net) — ML & Data Roles",
+      "family": "Simple and source-specific jobs",
+      "description": "Recent Foorilla Hiring (formerly aijobs.net) jobs with complete original descriptions (text and HTML), locations, posting dates and source links. Filter by keywords, location, remote, job type and posting age. Only verified postings; repeats are suppressed. No login or API key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "all-jobs-scraper",
+      "actorId": "OOmLCBfYADq00uBNL",
+      "url": "https://apify.com/nomad-agent/all-jobs-scraper",
+      "title": "All Jobs Scraper — 21 Job Boards in One",
+      "family": "Simple and source-specific jobs",
+      "description": "Recent tech, remote, European and research jobs with complete original descriptions (text and HTML), locations, posting dates and source links. Filter by keywords, location, remote, job type and posting age. Only verified postings; repeats are suppressed. No login or API key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "american-jobs-bundle",
+      "actorId": "PcdkFDsalUjKy5cwo",
+      "url": "https://apify.com/nomad-agent/american-jobs-bundle",
+      "title": "American Jobs Bundle — US Tech Jobs from 6 Boards",
+      "family": "Simple and source-specific jobs",
+      "description": "Recent US tech jobs with complete original descriptions (text and HTML), locations, posting dates and source links. Filter by keywords, location, remote, job type and posting age. Only verified postings; repeats are suppressed. No login or API key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "ashby-jobs-scraper",
+      "actorId": "ASJ12iMIu97bFEeqY",
+      "url": "https://apify.com/nomad-agent/ashby-jobs-scraper",
+      "title": "Ashby Jobs Scraper — Tracked Company Boards",
+      "family": "Simple and source-specific jobs",
+      "description": "Recent Ashby jobs with complete original descriptions (text and HTML), locations, posting dates and source links. Filter by keywords, location, remote, job type and posting age. Only verified postings; repeats are suppressed. No login or API key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "builtin-scraper",
+      "actorId": "BTXRZhlNzd9W4zzfM",
+      "url": "https://apify.com/nomad-agent/builtin-scraper",
+      "title": "Built In Jobs Scraper — US Tech & Startup Jobs",
+      "family": "Simple and source-specific jobs",
+      "description": "Recent Built In jobs with complete original descriptions (text and HTML), locations, posting dates and source links. Filter by keywords, location, remote, job type and posting age. Only verified postings; repeats are suppressed. No login or API key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "company-careers-bundle",
+      "actorId": "TmG3tuikPbP8aNwoY",
+      "url": "https://apify.com/nomad-agent/company-careers-bundle",
+      "title": "Company Careers Jobs — Greenhouse, Lever, Workday & more",
+      "family": "Simple and source-specific jobs",
+      "description": "Recent company careers-page jobs with complete original descriptions (text and HTML), locations, posting dates and source links. Filter by keywords, location, remote, job type and posting age. Only verified postings; repeats are suppressed. No login or API key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "devex-jobs-scraper",
+      "actorId": "GVrnpaCKZs6ijvqTO",
+      "url": "https://apify.com/nomad-agent/devex-jobs-scraper",
+      "title": "Devex Jobs Scraper — No API Key Needed",
+      "family": "Simple and source-specific jobs",
+      "description": "Return Devex international-development, NGO and humanitarian jobs with original descriptions, HTML, locations and source links in nomad-agent-job-row-v1. Input supports posting age and a 1-to-50 result limit; no AI processing.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "devex-scraper",
+      "actorId": "ZutM3sroBQcWaeA0d",
+      "url": "https://apify.com/nomad-agent/devex-scraper",
+      "title": "Devex Jobs Scraper — Complete Source Descriptions",
+      "family": "Simple and source-specific jobs",
+      "description": "Search international-development and NGO jobs from Devex with complete source descriptions, locations and application links. Supports explicit checks of supplied job URLs; use its own input fields.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "euraxess-scraper",
+      "actorId": "N3gbK5IYfJI62GZj3",
+      "url": "https://apify.com/nomad-agent/euraxess-scraper",
+      "title": "EURAXESS Jobs Scraper — EU Research Positions",
+      "family": "Simple and source-specific jobs",
+      "description": "Recent EURAXESS research jobs with complete original descriptions (text and HTML), locations, posting dates and source links. Filter by keywords, location, remote, job type and posting age. Only verified postings; repeats are suppressed. No login or API key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "eures-scraper",
+      "actorId": "AJ9Iq8kh5dhNykxpK",
+      "url": "https://apify.com/nomad-agent/eures-scraper",
+      "title": "EURES European Jobs Scraper — EU Job Portal",
+      "family": "Simple and source-specific jobs",
+      "description": "Recent EURES jobs with complete original descriptions (text and HTML), locations, posting dates and source links. Filter by keywords, location, remote, job type and posting age. Only verified postings; repeats are suppressed. No login or API key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "europe-jobs-bundle",
+      "actorId": "FE4YMaml2dEp5aYLr",
+      "url": "https://apify.com/nomad-agent/europe-jobs-bundle",
+      "title": "Europe Jobs Scraper — EURES, EURAXESS + 12 More Boards",
+      "family": "Simple and source-specific jobs",
+      "description": "Recent European jobs with complete original descriptions (text and HTML), locations, posting dates and source links. Filter by keywords, location, remote, job type and posting age. Only verified postings; repeats are suppressed. No login or API key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "foorilla-ai-jobs-scraper",
+      "actorId": "3pmwELozh8x1P0dSu",
+      "url": "https://apify.com/nomad-agent/foorilla-ai-jobs-scraper",
+      "title": "Foorilla AI Jobs Scraper — ML & Data Roles",
+      "family": "Simple and source-specific jobs",
+      "description": "Recent Foorilla jobs with complete original descriptions (text and HTML), locations, posting dates and source links. Filter by keywords, location, remote, job type and posting age. Only verified postings; repeats are suppressed. No login or API key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "greenhouse-jobs-scraper",
+      "actorId": "GATXeV9PMl13KdbAM",
+      "url": "https://apify.com/nomad-agent/greenhouse-jobs-scraper",
+      "title": "Greenhouse Jobs Scraper — Tracked Company Boards",
+      "family": "Simple and source-specific jobs",
+      "description": "Recent Greenhouse jobs with complete original descriptions (text and HTML), locations, posting dates and source links. Filter by keywords, location, remote, job type and posting age. Only verified postings; repeats are suppressed. No login or API key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "hackernews-scraper",
+      "actorId": "ULAYhMwdtqo7dShpk",
+      "url": "https://apify.com/nomad-agent/hackernews-scraper",
+      "title": "Hacker News Who Is Hiring Jobs Scraper",
+      "family": "Simple and source-specific jobs",
+      "description": "Recent Hacker News Who is hiring jobs with complete original descriptions (text and HTML), locations, posting dates and source links. Filter by keywords, location, remote, job type and posting age. Only verified postings; repeats are suppressed. No login or API key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "ikerbasque-scraper",
+      "actorId": "AybSsaxL5kgF8Ekig",
+      "url": "https://apify.com/nomad-agent/ikerbasque-scraper",
+      "title": "Ikerbasque Jobs Scraper — Basque Research, Spain",
+      "family": "Simple and source-specific jobs",
+      "description": "Recent Ikerbasque research jobs with complete original descriptions (text and HTML), locations, posting dates and source links. Filter by keywords, location, remote, job type and posting age. Only verified postings; repeats are suppressed. No login or API key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "impactpool-scraper",
+      "actorId": "6gD1RdMPm0CqH9Qv4",
+      "url": "https://apify.com/nomad-agent/impactpool-scraper",
+      "title": "Impactpool Jobs Scraper — UN & NGO Careers",
+      "family": "Simple and source-specific jobs",
+      "description": "Recent Impactpool UN and NGO jobs with complete original descriptions (text and HTML), locations, posting dates and source links. Filter by keywords, location, remote, job type and posting age. Only verified postings; repeats are suppressed. No login or API key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "infojobs-scraper",
+      "actorId": "rQXhPiMSny2KtShmX",
+      "url": "https://apify.com/nomad-agent/infojobs-scraper",
+      "title": "InfoJobs Scraper — Ofertas de Trabajo y Empleo España",
+      "family": "Simple and source-specific jobs",
+      "description": "Recent InfoJobs jobs with complete original descriptions (text and HTML), locations, posting dates and source links. Filter by keywords, location, remote, job type and posting age. Only verified postings; repeats are suppressed. No login or API key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "jobs-ac-uk-scraper",
+      "actorId": "cUIrP3kvKrTo67yJA",
+      "url": "https://apify.com/nomad-agent/jobs-ac-uk-scraper",
+      "title": "jobs.ac.uk Scraper — UK Academic, Postdoc & Research Jobs",
+      "family": "Simple and source-specific jobs",
+      "description": "Recent jobs.ac.uk jobs with complete original descriptions (text and HTML), locations, posting dates and source links. Filter by keywords, location, remote, job type and posting age. Only verified postings; repeats are suppressed. No login or API key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "justjoinit-scraper",
+      "actorId": "G2IJgEuHp3ffadMdA",
+      "url": "https://apify.com/nomad-agent/justjoinit-scraper",
+      "title": "JustJoin.it Scraper — Polish Tech & IT Jobs",
+      "family": "Simple and source-specific jobs",
+      "description": "Recent JustJoin.it jobs with complete original descriptions (text and HTML), locations, posting dates and source links. Filter by keywords, location, remote, job type and posting age. Only verified postings; repeats are suppressed. No login or API key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "lever-jobs-scraper",
+      "actorId": "09DtdO51vrY4q0i0i",
+      "url": "https://apify.com/nomad-agent/lever-jobs-scraper",
+      "title": "Lever Jobs Scraper — Tracked Company Boards",
+      "family": "Simple and source-specific jobs",
+      "description": "Recent Lever jobs with complete original descriptions (text and HTML), locations, posting dates and source links. Filter by keywords, location, remote, job type and posting age. Only verified postings; repeats are suppressed. No login or API key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "linkedin-full-info-scraper",
+      "actorId": "4NY60JkLPL9iC8ySe",
+      "url": "https://apify.com/nomad-agent/linkedin-full-info-scraper",
+      "title": "LinkedIn Jobs Scraper — Full Descriptions, No Login",
+      "family": "Simple and source-specific jobs",
+      "description": "Recent LinkedIn jobs with complete original descriptions (text and HTML), locations, posting dates and source links. Filter by keywords, location, remote, job type and posting age. Only verified postings; repeats are suppressed. No login or API key.",
+      "deprecated": true
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "linkedin-scraper",
+      "actorId": "GGGJOOdpf4hgT6FbH",
+      "url": "https://apify.com/nomad-agent/linkedin-scraper",
+      "title": "LinkedIn Jobs Scraper — Simple Job Feed, No Login",
+      "family": "Simple and source-specific jobs",
+      "description": "Recent LinkedIn jobs with complete original descriptions (text and HTML), locations, posting dates and source links. Filter by keywords, location, remote, job type and posting age. Only verified postings; repeats are suppressed. No login or API key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "math-ku-phd-scraper",
+      "actorId": "kGMlC5NTXMeezLAut",
+      "url": "https://apify.com/nomad-agent/math-ku-phd-scraper",
+      "title": "University of Copenhagen PhD Jobs Scraper (KU)",
+      "family": "Simple and source-specific jobs",
+      "description": "Find University of Copenhagen jobs with complete original descriptions, HTML, locations and source links. Simple flat data with posting-age filtering and repeat-delivery suppression.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "ml-ai-dev-bundle",
+      "actorId": "3NcZZ1KxyIoXvvOzN",
+      "url": "https://apify.com/nomad-agent/ml-ai-dev-bundle",
+      "title": "AI & ML Engineer Jobs Scraper — 8 Boards in One",
+      "family": "Simple and source-specific jobs",
+      "description": "Find AI, machine-learning and data roles across LinkedIn, Foorilla, Hacker News, YC, Built In, RemoteOK, Remotive, We Work Remotely, WTTJ and JustJoin.it. Returns simple job rows with original descriptions; performs no AI ranking.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "nofluffjobs-scraper",
+      "actorId": "daGnup1Nl7faGEbpi",
+      "url": "https://apify.com/nomad-agent/nofluffjobs-scraper",
+      "title": "NoFluffJobs Scraper — Poland & CEE IT Jobs with Salaries",
+      "family": "Simple and source-specific jobs",
+      "description": "Recent NoFluffJobs jobs with complete original descriptions (text and HTML), locations, posting dates and source links. Filter by keywords, location, remote, job type and posting age. Only verified postings; repeats are suppressed. No login or API key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "reliefweb-scraper",
+      "actorId": "ongoh9UyfgwIbvPfp",
+      "url": "https://apify.com/nomad-agent/reliefweb-scraper",
+      "title": "ReliefWeb Humanitarian & NGO Jobs | Full Descriptions, $3/1k",
+      "family": "Simple and source-specific jobs",
+      "description": "Recent ReliefWeb humanitarian and NGO jobs with complete original descriptions (text and HTML), locations, posting dates and source links. Filter by keywords, location, remote, job type and posting age. Only verified postings; repeats are suppressed. No login or API key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "remote-boards-scraper",
+      "actorId": "hJEnrpwrHuqE1jp9E",
+      "url": "https://apify.com/nomad-agent/remote-boards-scraper",
+      "title": "Remote Jobs Scraper — RemoteOK, Remotive, WWR, Himalayas",
+      "family": "Simple and source-specific jobs",
+      "description": "Recent remote jobs with complete original descriptions (text and HTML), locations, posting dates and source links. Filter by keywords, location, remote, job type and posting age. Only verified postings; repeats are suppressed. No login or API key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "researcher-bundle",
+      "actorId": "vW8dfaG0Dybl5oVQT",
+      "url": "https://apify.com/nomad-agent/researcher-bundle",
+      "title": "PhD, Postdoc & Research Jobs Scraper — 11 Sources in 1",
+      "family": "Simple and source-specific jobs",
+      "description": "Recent PhD, postdoc and research jobs with complete original descriptions (text and HTML), locations, posting dates and source links. Filter by keywords, location, remote, job type and posting age. Only verified postings; repeats are suppressed. No login or API key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "tecnoempleo-scraper",
+      "actorId": "lCuBIheEvgDhPPADA",
+      "url": "https://apify.com/nomad-agent/tecnoempleo-scraper",
+      "title": "Tecnoempleo Scraper — 2,400+ Spain IT Jobs, Salaries & Empleo",
+      "family": "Simple and source-specific jobs",
+      "description": "Find Spanish IT and developer jobs with full descriptions, employer, location, salary and apply links. Uses its own keyword, province, remote and category controls.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "ub-doctoral-scraper",
+      "actorId": "ugSECzLDDlEw716Or",
+      "url": "https://apify.com/nomad-agent/ub-doctoral-scraper",
+      "title": "Universitat de Barcelona Jobs: PhD, Postdoc & Research",
+      "family": "Simple and source-specific jobs",
+      "description": "Recent Universitat de Barcelona jobs with complete original descriptions (text and HTML), locations, posting dates and source links. Filter by keywords, location, remote, job type and posting age. Only verified postings; repeats are suppressed. No login or API key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "un-careers-scraper",
+      "actorId": "AtAcVhbH1KVGbL9Wh",
+      "url": "https://apify.com/nomad-agent/un-careers-scraper",
+      "title": "UN Careers Job Scraper — United Nations Jobs",
+      "family": "Simple and source-specific jobs",
+      "description": "Find UN Careers jobs with complete original descriptions, HTML, locations and source links. Simple flat data with posting-age filtering and repeat-delivery suppression.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "unjobs-scraper",
+      "actorId": "JMR4w8RUMZsRPloZR",
+      "url": "https://apify.com/nomad-agent/unjobs-scraper",
+      "title": "UNjobs UN & NGO Jobs | Full Descriptions",
+      "family": "Simple and source-specific jobs",
+      "description": "Recent UNjobs UN and NGO jobs with complete original descriptions (text and HTML), locations, posting dates and source links. Filter by keywords, location, remote, job type and posting age. Only verified postings; repeats are suppressed. No login or API key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "web-dev-bundle",
+      "actorId": "m6h2Dtyzxd2C0biiP",
+      "url": "https://apify.com/nomad-agent/web-dev-bundle",
+      "title": "Web Developer Jobs Bundle — 10 Boards, Full Descriptions",
+      "family": "Simple and source-specific jobs",
+      "description": "Recent web and software developer jobs with complete original descriptions (text and HTML), locations, posting dates and source links. Filter by keywords, location, remote, job type and posting age. Only verified postings; repeats are suppressed. No login or API key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "web-search-scraper",
+      "actorId": "Jima07w7QhOtcSmRW",
+      "url": "https://apify.com/nomad-agent/web-search-scraper",
+      "title": "Job Search Scraper — 44 Sources, Full Descriptions",
+      "family": "Simple and source-specific jobs",
+      "description": "Search across public job boards using keywords, locations, work arrangement, employment type and posting age. Returns original descriptions and source links in simple job rows; no AI ranking or customer model key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "wellfound-scraper",
+      "actorId": "cLOYFtqDtZX8XV8Ip",
+      "url": "https://apify.com/nomad-agent/wellfound-scraper",
+      "title": "Wellfound (AngelList) Startup Jobs Scraper",
+      "family": "Simple and source-specific jobs",
+      "description": "Recent Wellfound (AngelList) jobs with complete original descriptions (text and HTML), locations, posting dates and source links. Filter by keywords, location, remote, job type and posting age. Only verified postings; repeats are suppressed. No login or API key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "workable-jobs-scraper",
+      "actorId": "C78dXd0fXEwXnVp3d",
+      "url": "https://apify.com/nomad-agent/workable-jobs-scraper",
+      "title": "Workable Jobs Scraper — Recent Jobs, Full Descriptions",
+      "family": "Simple and source-specific jobs",
+      "description": "Recent Workable jobs with complete original descriptions (text and HTML), locations, posting dates and source links. Filter by keywords, location, remote, job type and posting age. Only verified postings; repeats are suppressed. No login or API key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "wttj-scraper",
+      "actorId": "KxVBFTH16XqrsEZfj",
+      "url": "https://apify.com/nomad-agent/wttj-scraper",
+      "title": "Welcome to the Jungle (WTTJ) Jobs Scraper — No Login",
+      "family": "Simple and source-specific jobs",
+      "description": "Recent Welcome to the Jungle jobs with complete original descriptions (text and HTML), locations, posting dates and source links. Filter by keywords, location, remote, job type and posting age. Only verified postings; repeats are suppressed. No login or API key.",
+      "deprecated": false
+    },
+    {
+      "owner": "nomad-agent",
+      "slug": "ycombinator-was-scraper",
+      "actorId": "1JDUBKElJkIKoCkgG",
+      "url": "https://apify.com/nomad-agent/ycombinator-was-scraper",
+      "title": "Y Combinator Jobs Scraper — Work at a Startup",
+      "family": "Simple and source-specific jobs",
+      "description": "Recent Y Combinator Work at a Startup jobs with complete original descriptions (text and HTML), locations, posting dates and source links. Filter by keywords, location, remote, job type and posting age. Only verified postings; repeats are suppressed. No login or API key.",
+      "deprecated": false
+    }
+  ]
+}
