@@ -437,3 +437,5 @@ or [try the live bot](https://t.me/job_search_everyday_bot) and tell a friend.
 ### UK case-law data
 
 [UK Case Law Scraper](https://apify.com/nomad-agent/uk-case-law-scraper) searches The National Archives' Find Case Law judgments by court, party, judge, citation and date, with optional full text and legislation references. See the [full guide and examples](docs/uk-case-law-scraper.md) or use the [agent setup skill](.agents/skills/public-apify-actors/SKILL.md).
+
+[**Bluesky Scraper**](https://apify.com/nomad-agent/bluesky-scraper) extracts public posts, profiles, threads, feeds, followers and following through the AT Protocol API. Search accepts a query with author, language, domain, hashtag and date filters; empty API input uses the documented `#ai` example. It returns source data without built-in AI analysis. See the [full guide and examples](docs/bluesky-scraper.md) and [agent setup skill](.agents/skills/public-apify-actors/SKILL.md). Select `latest` and inspect actual post records rather than counting diagnostic rows.
