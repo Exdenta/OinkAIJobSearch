@@ -12,3 +12,5 @@ Choose an exact endpoint from the [public Actor directory](public-actors.md). Ea
 Simple job rows retain source descriptions and source-supplied facts. Normalized job rows use `nomad-agent-job-v1`; fit scores use a separate result format. `null` means unknown, while the meaning of an empty list depends on the documented field. Remote work does not imply worldwide eligibility: read the original description.
 
 Use the [generic Actor skill](../.agents/skills/public-apify-actors/SKILL.md) for bounded API calls and result inspection. Do not silently broaden filters or clear repeat history to force results.
+
+See [Actor version updates for 4 October 2026](releases/2026-10-04-version-releases.md) for published versions and the limits of their execution evidence.
