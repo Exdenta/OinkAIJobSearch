@@ -18,7 +18,8 @@
 [Self-host](#setup-self-hosting) ·
 [API access](#the-scrapers-as-an-api) ·
 [Oink website](https://oinkjobsearch.com/) ·
-[Job Atlas tools](https://jobatlas.dev/)
+[Job Atlas tools](https://jobatlas.dev/) ·
+[All public APIs](https://jobatlas.dev/actors/directory)
 
 </div>
 
