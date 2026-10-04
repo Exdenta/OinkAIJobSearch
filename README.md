@@ -436,3 +436,8 @@ Required Notice: Copyright Lex Sherman
 or [try the live bot](https://t.me/job_search_everyday_bot) and tell a friend.
 
 </div>
+
+
+### SPAC filings on SEC EDGAR
+
+[SPAC Redemptions Scraper](https://apify.com/nomad-agent/spac-redemptions-scraper) follows SPAC IPO, merger, vote and shareholder-redemption filings. The [full guide](docs/actors/spac-redemptions-scraper.md) includes date filters, output examples and a setup skill. Financial values stay unavailable when the filing does not establish them.
