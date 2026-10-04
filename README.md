@@ -418,6 +418,8 @@ Each Actor page shows example results, filters, and the current price.
 
 [Airbnb Scraper](https://apify.com/nomad-agent/airbnb-scraper) returns structured listings with location, date, guest and price filters. Detail mode adds descriptions, availability and optional reviews. See the [full guide and examples](docs/airbnb-scraper.md) or use the [agent setup skill](.agents/skills/public-apify-actors/SKILL.md).
 
+[UK Case Law Scraper](https://apify.com/nomad-agent/uk-case-law-scraper) searches The National Archives' Find Case Law judgments by court, party, judge, citation and date, with optional full text and legislation references. See the [full guide and examples](docs/uk-case-law-scraper.md) or use the [agent setup skill](.agents/skills/public-apify-actors/SKILL.md).
+
 ## Security notes
 
 - `.env` contains your bot token — gitignored, don't commit it.
