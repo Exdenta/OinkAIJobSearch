@@ -16,7 +16,7 @@ Use this guide for Actor setup, API calls, result inspection and repeatable expo
 Example first call for a simple job reader (confirm its current schema first):
 
 ```json
-{"schemaVersion":"nomad-agent-simple-inventory-search-v2","maxItems":3,"postedWithin":"any","dedupe":{"enabled":false}}
+{"schemaVersion":"nomad-agent-simple-inventory-search-v2","maxItems":3,"postedWithin":"any","dedupe":{"enabled":false,"key":""}}
 ```
 
 Normalized readers use their own input and nested job output. Existing LinkedIn, EURAXESS, YC and scorer skills provide richer source-specific setup. Prefer their maintained examples when targeting those products.
