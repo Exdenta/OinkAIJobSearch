@@ -18,4 +18,4 @@ Read the maintained [public Actor setup guide](../../.agents/skills/public-apify
 
 [Source repository](https://github.com/Exdenta/OinkAIJobSearch) · [Current Actor documentation](https://apify.com/nomad-agent/ptab-trials-scraper)
 
-When dryRun is enabled, example rows are demonstration data and do not prove USPTO retrieval.
+The hosted default input enables `dryRun` and returns labelled demonstration data, which does not prove USPTO retrieval. For an authorized live search, explicitly set `dryRun: false` and supply a valid USPTO Open Data Portal API key.

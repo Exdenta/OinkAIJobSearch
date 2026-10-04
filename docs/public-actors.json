@@ -390,7 +390,7 @@
       "url": "https://apify.com/nomad-agent/ptab-trials-scraper",
       "title": "PTAB Trials Scraper — USPTO IPR/PGR Tracker + Webhook Alerts",
       "family": "Public records",
-      "description": "Retrieve USPTO PTAB proceedings, parties, status, dates and institution or final-written decisions. Supports webhook snapshots; requires a USPTO Open Data Portal API key.",
+      "description": "Retrieve USPTO PTAB proceedings, parties, status, dates and institution or final-written decisions. Supports webhook snapshots. Live mode requires a USPTO Open Data Portal API key; the default preview returns labelled samples.",
       "deprecated": false
     },
     {
@@ -520,7 +520,7 @@
       "url": "https://apify.com/nomad-agent/newsletter-sponsors-scraper",
       "title": "Newsletter Sponsor Finder — InboxReads Directory Scraper",
       "family": "Search, marketing and data tools",
-      "description": "Find InboxReads newsletters open to sponsorship, cross-promotion or sale. Includes topics, cadence, audience geography, ad-platform signals and published sponsor contacts.",
+      "description": "Find InboxReads newsletters open to sponsorship, cross-promotion or sale. Includes topics, cadence, audience geography, ad-platform and public sponsorship-contact route signals.",
       "deprecated": false
     },
     {

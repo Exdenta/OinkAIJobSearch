@@ -72,7 +72,7 @@ Simple job Actors return source facts; normalized job Actors use the nested `nom
 
 | Actor | What it provides |
 | --- | --- |
-| [nomad-agent/ptab-trials-scraper](https://apify.com/nomad-agent/ptab-trials-scraper) | Retrieve USPTO PTAB proceedings, parties, status, dates and institution or final-written decisions. Supports webhook snapshots; requires a USPTO Open Data Portal API key. |
+| [nomad-agent/ptab-trials-scraper](https://apify.com/nomad-agent/ptab-trials-scraper) | Retrieve USPTO PTAB proceedings, parties, status, dates and institution or final-written decisions. Supports webhook snapshots. Live mode requires a USPTO Open Data Portal API key; the default preview returns labelled samples. |
 | [nomad-agent/spac-redemptions-scraper](https://apify.com/nomad-agent/spac-redemptions-scraper) | Retrieve SEC EDGAR SPAC filings, merger communications, meeting dates and reported redemption figures. Missing financial values remain unavailable. |
 | [nomad-agent/uk-case-law-scraper](https://apify.com/nomad-agent/uk-case-law-scraper) | Search The National Archives Find Case Law judgments by court, party, judge, date and citation. Returns links with optional judgment text and legislation references. |
 | [nomad-agent/uk-nhs-ods-providers-scraper](https://apify.com/nomad-agent/uk-nhs-ods-providers-scraper) | Search the NHS ODS provider directory by name, postcode or provider type. Returns ODS codes, addresses and published phone numbers. |
@@ -95,7 +95,7 @@ Simple job Actors return source facts; normalized job Actors use the nested `nom
 | --- | --- |
 | [nomad-agent/bluesky-scraper](https://apify.com/nomad-agent/bluesky-scraper) | Search Bluesky posts and retrieve account feeds, reply threads, custom feeds, profiles and followers with engagement and media fields. No login required. |
 | [nomad-agent/google-play-aso-scraper](https://apify.com/nomad-agent/google-play-aso-scraper) | Track Google Play keyword rankings and retrieve app details, reviews, ratings, charts, related apps and permissions across countries. Popularity, install and revenue figures are estimates. |
-| [nomad-agent/newsletter-sponsors-scraper](https://apify.com/nomad-agent/newsletter-sponsors-scraper) | Find InboxReads newsletters open to sponsorship, cross-promotion or sale. Includes topics, cadence, audience geography, ad-platform signals and published sponsor contacts. |
+| [nomad-agent/newsletter-sponsors-scraper](https://apify.com/nomad-agent/newsletter-sponsors-scraper) | Find InboxReads newsletters open to sponsorship, cross-promotion or sale. Includes topics, cadence, audience geography, ad-platform and public sponsorship-contact route signals. |
 | [nomad-agent/openai-vector-store-safe-sync](https://apify.com/nomad-agent/openai-vector-store-safe-sync) | Sync selected Apify Dataset fields to an existing OpenAI Vector Store. Supports preview and resumable updates; requires destination access and writes only when explicitly configured. |
 | [nomad-agent/serp-multi-engine-scraper](https://apify.com/nomad-agent/serp-multi-engine-scraper) | Search Bing, DuckDuckGo, Baidu and Yahoo with region, language, device and pagination controls. Returns result rank, title, URL, snippet, page and search engine. |
 
