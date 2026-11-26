@@ -350,9 +350,9 @@ async function performRun(run, trigger) {
   let message = "Collection finished.";
   try {
     const config = normalizeConfig(await receiverRequest("/v1/config", settings, run));
-    for (const [index, source] of SOURCE_NAMES.entries()) {
+    for (const [index, source] of run.sources.entries()) {
       // Split the remaining time evenly; time a source leaves unused rolls over.
-      const share = (run.deadline - Date.now()) / (SOURCE_NAMES.length - index);
+      const share = (run.deadline - Date.now()) / (run.sources.length - index);
       await collectSource(source, config, settings, run, Date.now() + share);
     }
   } catch (error) {
@@ -375,9 +375,9 @@ async function performRun(run, trigger) {
   }
 }
 
-function startRun(trigger) {
+function startRun(trigger, sources = SOURCE_NAMES) {
   if (activeRun) return false;
-  const run = { id: crypto.randomUUID(), controller: new AbortController(), deadline: Date.now() + MAX_RUN_MS, pauses: {}, done: null };
+  const run = { id: crypto.randomUUID(), controller: new AbortController(), deadline: Date.now() + MAX_RUN_MS, pauses: {}, done: null, sources };
   activeRun = run;
   run.done = performRun(run, trigger).catch(async (error) => {
     await chrome.storage.local.set({ runStatus: { running: false, lastFinishedAt: new Date().toISOString(), message: errorText(error) } });
@@ -437,7 +437,9 @@ async function applyMessage(message) {
   if (message.type === "runNow") {
     const { settings } = await chrome.storage.local.get("settings");
     if (!normalizeSettings(settings).enabled) throw new Error("Save enabled collection with a valid receiver token first.");
-    return { started: startRun("manual"), state: await publicState() };
+    if (message.source !== undefined && !SOURCE_NAMES.includes(message.source)) throw new Error("Unknown source.");
+    const sources = message.source === undefined ? SOURCE_NAMES : [message.source];
+    return { started: startRun("manual", sources), state: await publicState() };
   }
   throw new Error("Unknown options request.");
 }

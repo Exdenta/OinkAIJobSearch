@@ -17,6 +17,9 @@ function updateControls() {
   for (const button of document.querySelectorAll("button[data-source]")) {
     button.disabled = busy || !state?.sourceStatus?.[button.dataset.source]?.paused;
   }
+  for (const button of document.querySelectorAll("button[data-run-source]")) {
+    button.disabled = element("run-now").disabled || Boolean(state?.sourceStatus?.[button.dataset.runSource]?.paused);
+  }
 }
 
 function formatDate(value) {
@@ -61,7 +64,16 @@ function render(next, populateForm = false) {
       render(response.state);
       feedback(`${label} resumed. Use Run now or wait for the scheduled collection.`);
     }));
-    card.append(heading, message, details, resume);
+    const runOne = document.createElement("button");
+    runOne.type = "button";
+    runOne.dataset.runSource = source;
+    runOne.textContent = `Run ${label} now`;
+    runOne.addEventListener("click", () => perform(async () => {
+      const response = await request({ type: "runNow", source });
+      render(response.state);
+      feedback(response.started ? `${label} collection started.` : "A collection run is already active.");
+    }));
+    card.append(heading, message, details, resume, runOne);
     container.append(card);
   }
   updateControls();

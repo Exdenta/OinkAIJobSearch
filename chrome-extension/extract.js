@@ -20,6 +20,11 @@ export function collectRenderedPosts(source, options = {}) {
   if (visibleOutsidePosts('iframe[src*="captcha" i], iframe[title*="challenge" i], #captcha, #px-captcha, #challenge-running, #challenge-form, .cf-challenge, input[name*="captcha" i], [data-testid*="captcha" i], form[action*="challenge" i]').length) {
     return result("CAPTCHA or browser challenge: resolve it manually, then explicitly resume this source.");
   }
+  // X collection only ever opens /search; any other path means X redirected the
+  // tab (e.g. logged-out users go to /i/jf/onboarding/web?mode=login).
+  if (source === "x_twitter" && location.pathname !== "/search") {
+    return result(`X redirected the search to ${location.pathname.slice(0, 80)}: sign in to x.com in this Chrome profile, then explicitly resume this source.`);
+  }
   if (/^\/(?:login|account\/login|i\/flow\/login)(?:\/|$)/i.test(location.pathname)
       || visibleOutsidePosts('input[type="password"], [data-testid="LoginForm_Login_Button"]').length) {
     return result("Login is required: sign in manually, then explicitly resume this source.");
