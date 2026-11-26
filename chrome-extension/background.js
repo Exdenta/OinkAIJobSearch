@@ -267,7 +267,9 @@ async function collectPage(source, url, config, run, accumulated, options = {}) 
   }
 }
 
-async function collectSource(source, config, settings, run) {
+// `budgetEnd` is this source's share of the run, so an earlier source (Reddit's
+// per-post detail pages) cannot consume the whole run and starve later ones.
+async function collectSource(source, config, settings, run, budgetEnd = run.deadline) {
   checkRun(run);
   const stored = await chrome.storage.local.get("sourceStatus");
   const pages = sourcePages(source, config);
@@ -286,6 +288,7 @@ async function collectSource(source, config, settings, run) {
     for (const url of pages) {
       checkRun(run);
       if (posts.size >= config.max_per_source) break;
+      if (url !== pages[0] && Date.now() + MAX_PAGE_MS >= budgetEnd) break;
       try {
         pause = await collectPage(source, url, config, run, posts);
       } catch (error) {
@@ -302,7 +305,7 @@ async function collectSource(source, config, settings, run) {
       // window for detail and another for submitting observations before expiry.
       for (const post of posts.values()) {
         if (post.text) continue;
-        if (Date.now() + MAX_PAGE_MS * 2 >= run.deadline) break;
+        if (Date.now() + MAX_PAGE_MS * 2 >= budgetEnd) break;
         try {
           pause = await collectPage(source, post.url, config, run, posts, { detailPostId: post.id });
         } catch (error) {
@@ -347,7 +350,11 @@ async function performRun(run, trigger) {
   let message = "Collection finished.";
   try {
     const config = normalizeConfig(await receiverRequest("/v1/config", settings, run));
-    for (const source of SOURCE_NAMES) await collectSource(source, config, settings, run);
+    for (const [index, source] of SOURCE_NAMES.entries()) {
+      // Split the remaining time evenly; time a source leaves unused rolls over.
+      const share = (run.deadline - Date.now()) / (SOURCE_NAMES.length - index);
+      await collectSource(source, config, settings, run, Date.now() + share);
+    }
   } catch (error) {
     message = errorText(error);
     if (!run.controller.signal.aborted) {
